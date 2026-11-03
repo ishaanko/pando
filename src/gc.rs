@@ -110,6 +110,11 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
     Ok(report)
 }
 
+/// Every pack something live needs (what `verify` checks and `backup` must copy).
+pub fn live_packs(meta: &Meta) -> anyhow::Result<HashSet<Oid>> {
+    Ok(Live::compute(meta)?.packs)
+}
+
 /// What is reachable from the refs.
 struct Live {
     packs: HashSet<Oid>,

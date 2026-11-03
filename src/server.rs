@@ -196,30 +196,7 @@ impl Server {
 
     /// Every repository on disk, sorted by name.
     pub fn list_repos(&self) -> anyhow::Result<Vec<String>> {
-        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
-            for entry in std::fs::read_dir(dir)? {
-                let path = entry?.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                match rel.strip_suffix(".git") {
-                    Some(name) if path.join("meta.db").exists() => out.push(name.to_string()),
-                    _ => walk(root, &path, out)?,
-                }
-            }
-            Ok(())
-        }
-        let root = self.cfg.data.join("repos");
-        let mut out = Vec::new();
-        walk(&root, &root, &mut out)?;
-        out.retain(|n| valid_repo_name(n));
-        out.sort();
-        Ok(out)
+        repo_names(&self.cfg.data)
     }
 
     /// Take a repository out of service: wait for metadata work in flight, mark it
@@ -372,6 +349,36 @@ async fn collector(repo: Arc<Repo>, every: Duration, grace: Duration) {
             Err(e) => tracing::error!(repo = %repo.name, "gc panicked: {e}"),
         }
     }
+}
+
+/// Every repository under a data directory, sorted by name.
+pub fn repo_names(data: &Path) -> anyhow::Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            match rel.strip_suffix(".git") {
+                Some(name) if path.join("meta.db").exists() => out.push(name.to_string()),
+                _ => walk(root, &path, out)?,
+            }
+        }
+        Ok(())
+    }
+    let root = data.join("repos");
+    let mut out = Vec::new();
+    if root.exists() {
+        walk(&root, &root, &mut out)?;
+    }
+    out.retain(|n| valid_repo_name(n));
+    out.sort();
+    Ok(out)
 }
 
 /// Repository names: one or more `/`-separated segments of `[A-Za-z0-9._-]`, none

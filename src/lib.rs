@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod backup;
 pub mod compact;
 pub mod express;
 pub mod gc;

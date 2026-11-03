@@ -5,7 +5,8 @@
 //! serve from local disk, and on a miss fill from the origin (the blob store, or an
 //! upstream Pando/Express over HTTP). Concurrent misses for one pack are coalesced
 //! into a single origin read. Pando spreads packs across Express nodes with
-//! rendezvous hashing, so each node caches a stable slice of the pack space.
+//! rendezvous hashing, so each node caches a stable slice of the pack space. With a
+//! size limit, the least recently served packs are evicted after each fill.
 
 use crate::auth::UrlSigner;
 use crate::object::Oid;
@@ -43,6 +44,8 @@ pub struct Express {
     cache: Option<PathBuf>,
     fills: Mutex<HashMap<Oid, Arc<tokio::sync::Mutex<()>>>>,
     signer: Option<UrlSigner>,
+    /// Cache size limit in bytes.
+    max_bytes: Option<u64>,
 }
 
 impl Express {
@@ -61,7 +64,43 @@ impl Express {
             cache,
             fills: Mutex::new(HashMap::new()),
             signer,
+            max_bytes: None,
         })
+    }
+
+    /// Keep the cache under `bytes`, evicting the least recently served packs.
+    pub fn with_max_size(mut self, bytes: u64) -> Express {
+        self.max_bytes = Some(bytes);
+        self
+    }
+
+    /// Delete the least recently served packs until the cache fits, sparing `keep`.
+    fn evict(&self, dir: &std::path::Path, keep: &std::path::Path) -> std::io::Result<()> {
+        let Some(max) = self.max_bytes else {
+            return Ok(());
+        };
+        let mut packs = Vec::new();
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "pack") {
+                let m = entry.metadata()?;
+                total += m.len();
+                packs.push((m.modified()?, m.len(), path));
+            }
+        }
+        packs.sort();
+        for (_, len, path) in packs {
+            if total <= max {
+                break;
+            }
+            if path != keep && std::fs::remove_file(&path).is_ok() {
+                tracing::info!(path = %path.display(), "evicted");
+                total -= len;
+            }
+        }
+        Ok(())
     }
 
     /// A local path holding the pack, filling the cache if needed.
@@ -79,6 +118,10 @@ impl Express {
         };
         let path = dir.join(format!("{hash}.pack"));
         if path.exists() {
+            // Served recently: the last to be evicted.
+            if let Ok(f) = std::fs::File::open(&path) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
             return Ok(Some(path));
         }
         let gate = self.fills.lock().unwrap().entry(hash).or_default().clone();
@@ -89,7 +132,11 @@ impl Express {
             self.fill(repo, hash, query, &path).await
         };
         self.fills.lock().unwrap().remove(&hash);
-        Ok(filled?.then_some(path))
+        let filled = filled?;
+        if filled && let Err(e) = self.evict(dir, &path) {
+            tracing::warn!("cache eviction failed: {e}");
+        }
+        Ok(filled.then_some(path))
     }
 
     /// Copy one pack from the origin into the cache, verifying its trailer hash.

@@ -2063,3 +2063,142 @@ fn admin_api_manages_repositories() {
         .unwrap();
     assert!(pushes >= 4, "{metrics}");
 }
+
+#[test]
+fn backups_restore_into_a_working_server() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..6 {
+        commit(&a, "f", &format!("v{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    s.compact();
+    git(&a, &["checkout", "-qb", "topic"]);
+    commit(&a, "t", "1");
+    git(&a, &["push", "-q", "origin", "topic"]);
+    git(
+        &a,
+        &["push", "-q", &format!("{}/other.git", s.base), "main"],
+    );
+    std::fs::create_dir_all(s.dir.path().join("data/hooks")).unwrap();
+    std::fs::write(s.dir.path().join("data/hooks/post-receive"), "#!/bin/sh\n").unwrap();
+
+    let backup = s.path("backup");
+    let b = pando::backup::backup(&s.dir.path().join("data"), &backup).unwrap();
+    assert_eq!(b.repos, 2);
+    assert!(backup.join("hooks/post-receive").exists());
+    // Pushes after the snapshot do not disturb it.
+    commit(&a, "t", "2");
+    git(&a, &["push", "-q", "origin", "topic"]);
+
+    let restored = s.path("restored");
+    pando::backup::restore(&backup, &restored).unwrap();
+    assert!(
+        pando::backup::restore(&backup, &restored).is_err(),
+        "restored over data"
+    );
+    let (listener, url) = bind();
+    let mut cfg = Config::new(&restored, &url);
+    cfg.compact_every = None;
+    cfg.gc_every = None;
+    serve_in_background(listener, pando::server::Server::new(cfg).unwrap().router());
+    let c = s.path("c");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            &format!("{url}/repo.git"),
+            c.to_str().unwrap(),
+        ],
+    );
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "origin/topic"), 7);
+    assert_eq!(count(&c, "HEAD"), 6);
+    git(
+        &c,
+        &["push", "-q", "origin", "HEAD:refs/heads/after-restore"],
+    );
+
+    // verify notices a missing pack.
+    assert!(pando::backup::verify(&backup, true).unwrap().is_empty());
+    let packs = backup.join("repos/repo.git/blobs/packs");
+    let victim = std::fs::read_dir(&packs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "pack"))
+        .unwrap();
+    std::fs::remove_file(&victim).unwrap();
+    let problems = pando::backup::verify(&backup, false).unwrap();
+    assert!(!problems.is_empty());
+}
+
+#[test]
+fn express_cache_evicts_least_recently_served_packs() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    for i in 0..4 {
+        commit(&a, "f", &format!("{i}").repeat(5000));
+        git(&a, &["push", "-q", &s.url, "main"]);
+    }
+    let repo = s.repo();
+    let packs: Vec<Oid> = (1..=4)
+        .map(|i| {
+            repo.meta
+                .lock()
+                .unwrap()
+                .trunk_version(i)
+                .unwrap()
+                .unwrap()
+                .pack
+                .unwrap()
+        })
+        .collect();
+    let size = |p: &Oid| std::fs::metadata(repo.store.pack_path(p)).unwrap().len();
+    // Room for the two largest packs, not three.
+    let mut sizes: Vec<u64> = packs.iter().map(size).collect();
+    sizes.sort();
+    let limit = sizes[3] + sizes[2];
+    let cache = s.path("cache");
+    let origin = Origin::Remote {
+        base: s.base.clone(),
+        client: pando::http_client(),
+    };
+    let express = Express::new(origin, Some(cache.clone()), None)
+        .unwrap()
+        .with_max_size(limit);
+    let (listener, node) = bind();
+    serve_in_background(listener, express::router(Arc::new(express)));
+    let get = |p: &Oid| {
+        let (code, _) = http("GET", &format!("{node}/repo.git/pack/{p}.pack"), None);
+        assert_eq!(code, 200);
+    };
+    let cached = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".pack"))
+            .collect();
+        v.sort();
+        v
+    };
+    let total = || -> u64 {
+        std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    for p in &packs {
+        get(p);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(total() <= limit, "cache over its limit: {:?}", cached());
+    }
+    // The most recently served pack stays, and an evicted one is filled again.
+    assert!(cached().contains(&format!("{}.pack", packs[3])));
+    assert!(!cached().contains(&format!("{}.pack", packs[0])));
+    get(&packs[0]);
+    assert!(cached().contains(&format!("{}.pack", packs[0])));
+}

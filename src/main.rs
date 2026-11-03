@@ -70,6 +70,30 @@ enum Cmd {
         #[arg(long, env = "PANDO_WEBHOOK_SECRET")]
         webhook_secret: Option<String>,
     },
+    /// Copy a data directory (consistent while the server runs).
+    Backup {
+        #[arg(long, default_value = "./pando-data")]
+        data: PathBuf,
+        /// Where to write the backup (must not exist or be empty).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Turn a backup into a new data directory, and verify it.
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+        /// The new data directory (must not exist or be empty).
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Check that every pack the metadata needs is present.
+    Verify {
+        #[arg(long, default_value = "./pando-data")]
+        data: PathBuf,
+        /// Also check every pack's checksum and index.
+        #[arg(long)]
+        full: bool,
+    },
     /// Serve packs from a local cache, filling from an origin Pando or Express node.
     Express {
         #[arg(long, default_value = "127.0.0.1:8081")]
@@ -78,6 +102,9 @@ enum Cmd {
         origin: String,
         #[arg(long, default_value = "./express-cache")]
         cache: PathBuf,
+        /// Evict least recently served packs to stay under this size (e.g. 50G).
+        #[arg(long, value_parser = parse_size)]
+        cache_max_size: Option<u64>,
         /// Require pack URLs signed with this secret (the origin's --url-secret).
         #[arg(long, env = "PANDO_URL_SECRET")]
         url_secret: Option<String>,
@@ -148,10 +175,34 @@ async fn main() -> anyhow::Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await?;
         }
+        Cmd::Backup { data, out } => {
+            let s = pando::backup::backup(&data, &out)?;
+            println!(
+                "backed up {} repositories ({} packs) to {}",
+                s.repos,
+                s.packs,
+                out.display()
+            );
+        }
+        Cmd::Restore { from, data } => {
+            let s = pando::backup::restore(&from, &data)?;
+            println!("restored {} repositories into {}", s.repos, data.display());
+        }
+        Cmd::Verify { data, full } => {
+            let problems = pando::backup::verify(&data, full)?;
+            for p in &problems {
+                println!("{p}");
+            }
+            if !problems.is_empty() {
+                anyhow::bail!("{} problem(s)", problems.len());
+            }
+            println!("ok");
+        }
         Cmd::Express {
             listen,
             origin,
             cache,
+            cache_max_size,
             url_secret,
         } => {
             let origin = Origin::Remote {
@@ -159,7 +210,11 @@ async fn main() -> anyhow::Result<()> {
                 client: pando::http_client(),
             };
             let signer = url_secret.map(|s| UrlSigner::new(s.as_bytes()));
-            let router = express::router(Arc::new(Express::new(origin, Some(cache), signer)?));
+            let mut express = Express::new(origin, Some(cache), signer)?;
+            if let Some(max) = cache_max_size {
+                express = express.with_max_size(max);
+            }
+            let router = express::router(Arc::new(express));
             let listener = tokio::net::TcpListener::bind(&listen).await?.tap_io(|tcp| {
                 let _ = tcp.set_nodelay(true);
             });
@@ -170,6 +225,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `500M`, `50G`, `1T`, or plain bytes.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let scale: u64 = match unit.trim().to_ascii_uppercase().trim_end_matches('B') {
+        "" => 1,
+        "K" => 1 << 10,
+        "M" => 1 << 20,
+        "G" => 1 << 30,
+        "T" => 1 << 40,
+        _ => return Err(format!("unknown size unit in {s:?}")),
+    };
+    num.parse::<u64>()
+        .map(|n| n.saturating_mul(scale))
+        .map_err(|_| format!("bad size {s:?}"))
 }
 
 /// Resolves on SIGINT or SIGTERM. In-flight pushes and fetches finish first; a push
