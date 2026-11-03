@@ -12,5 +12,6 @@ pub mod pktline;
 pub mod planner;
 pub mod receive;
 pub mod server;
+pub mod ssh;
 pub mod store;
 pub mod upload;

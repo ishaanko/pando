@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(about = "A Git server built on immutable packs and per-ref versions")]
+#[command(
+    about = "A Git server built on immutable packs and per-ref versions",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -16,13 +19,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve repositories over Git smart HTTP.
+    /// Serve repositories over Git smart HTTP (and SSH with --ssh-listen).
     Serve {
         /// Where repositories are stored (one directory per repository).
         #[arg(long, default_value = "./pando-data")]
         data: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
+        /// Also serve Git over SSH on this address (e.g. 0.0.0.0:2222).
+        #[arg(long)]
+        ssh_listen: Option<String>,
         /// URL clients use to reach this server (used in packfile URIs).
         #[arg(long)]
         public_url: Option<String>,
@@ -32,8 +38,8 @@ enum Cmd {
         /// Which refs pushers see.
         #[arg(long, value_enum, default_value = "all")]
         advertise: Advertise,
-        /// Token file (`<name> <token> <read|write>` per line). Without it, anyone who
-        /// can reach the server can read and push.
+        /// Auth file: `<name> <token or ssh public key> <read|write|admin> [repos]` per
+        /// line. Without it, anyone who can reach the server can read and push.
         #[arg(long)]
         auth_file: Option<PathBuf>,
         /// With --auth-file, allow fetches without a token.
@@ -76,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve {
             data,
             listen,
+            ssh_listen,
             public_url,
             trunk,
             advertise,
@@ -100,7 +107,17 @@ async fn main() -> anyhow::Result<()> {
             cfg.express = express;
             cfg.compact_every = Some(Duration::from_secs(compact_interval));
             cfg.url_secret = url_secret;
-            let router = Server::new(cfg)?.router();
+            let server = Server::new(cfg)?;
+            let router = server.router();
+            if let Some(addr) = ssh_listen {
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                tracing::info!("ssh on {addr}");
+                tokio::spawn(async move {
+                    if let Err(e) = pando::ssh::serve(server, listener).await {
+                        tracing::error!("ssh server stopped: {e:#}");
+                    }
+                });
+            }
             let listener = tokio::net::TcpListener::bind(&listen).await?.tap_io(|tcp| {
                 let _ = tcp.set_nodelay(true);
             });

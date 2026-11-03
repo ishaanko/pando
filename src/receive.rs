@@ -15,7 +15,7 @@ use crate::store::{BlobStore, map_file};
 use axum::extract::Request;
 use axum::response::Response;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
 const ANCESTRY_WALK_LIMIT: usize = 100_000;
@@ -24,44 +24,50 @@ const MAX_PUSH_BYTES: u64 = 2 << 30;
 
 /// The ref advertisement for pushers, plus `.have` lines for older trunk tips at
 /// exponentially spaced distances, so even a stale client finds a base it has.
+pub fn advertisement(server: &Server, meta: &Meta) -> anyhow::Result<Vec<u8>> {
+    let caps = format!(
+        "report-status delete-refs side-band-64k quiet atomic ofs-delta push-options no-thin \
+         object-format=sha1 agent={AGENT}"
+    );
+    let mut out = Vec::new();
+    let mut refs: Vec<Version> = match server.cfg.advertise {
+        Advertise::All => meta.refs(&[])?,
+        Advertise::Trunk => meta.trunk_head()?.into_iter().collect(),
+    };
+    if refs.is_empty() {
+        pktline::line(
+            &mut out,
+            format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO),
+        );
+    }
+    for (i, v) in refs.drain(..).enumerate() {
+        let caps = if i == 0 {
+            format!("\0{caps}")
+        } else {
+            String::new()
+        };
+        pktline::line(&mut out, format!("{} {}{caps}\n", v.tip, v.refname));
+    }
+    if let Some(head) = meta.trunk_head()? {
+        let mut back = 1;
+        while back < head.seq {
+            if let Some(v) = meta.trunk_version(head.seq - back)? {
+                pktline::line(&mut out, format!("{} .have\n", v.tip));
+            }
+            back *= 2;
+        }
+    }
+    pktline::flush(&mut out);
+    Ok(out)
+}
+
+/// `GET info/refs?service=git-receive-pack`.
 pub async fn advertise(server: Arc<Server>, repo: Arc<Repo>) -> anyhow::Result<Response> {
     let out = blocking(move || {
-        let meta = repo.meta.lock().unwrap();
-        let caps = format!(
-            "report-status delete-refs side-band-64k quiet atomic ofs-delta push-options no-thin \
-             object-format=sha1 agent={AGENT}"
-        );
         let mut out = Vec::new();
         pktline::line(&mut out, "# service=git-receive-pack\n");
         pktline::flush(&mut out);
-        let mut refs: Vec<Version> = match server.cfg.advertise {
-            Advertise::All => meta.refs(&[])?,
-            Advertise::Trunk => meta.trunk_head()?.into_iter().collect(),
-        };
-        if refs.is_empty() {
-            pktline::line(
-                &mut out,
-                format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO),
-            );
-        }
-        for (i, v) in refs.drain(..).enumerate() {
-            let caps = if i == 0 {
-                format!("\0{caps}")
-            } else {
-                String::new()
-            };
-            pktline::line(&mut out, format!("{} {}{caps}\n", v.tip, v.refname));
-        }
-        if let Some(head) = meta.trunk_head()? {
-            let mut back = 1;
-            while back < head.seq {
-                if let Some(v) = meta.trunk_version(head.seq - back)? {
-                    pktline::line(&mut out, format!("{} .have\n", v.tip));
-                }
-                back *= 2;
-            }
-        }
-        pktline::flush(&mut out);
+        out.extend(advertisement(&server, &repo.meta.lock().unwrap())?);
         Ok(out)
     })
     .await?;
@@ -71,14 +77,17 @@ pub async fn advertise(server: Arc<Server>, repo: Arc<Repo>) -> anyhow::Result<R
     ))
 }
 
+/// `POST git-receive-pack`. `user` is the authenticated pusher, if any.
 pub async fn handle(
     server: Arc<Server>,
     repo: Arc<Repo>,
+    user: Option<String>,
     req: Request,
 ) -> anyhow::Result<Response> {
     let open_body = body_reader(req);
     let report = blocking(move || {
-        let (report, trunk_moved) = push(&server, &repo, open_body())?;
+        let mut body = open_body();
+        let (report, trunk_moved) = push(&server, &repo, user.as_deref(), &mut body, false)?;
         if trunk_moved {
             repo.compact.notify_one();
         }
@@ -91,6 +100,25 @@ pub async fn handle(
     ))
 }
 
+/// A whole receive-pack conversation over a byte stream (SSH).
+pub fn serve_stream(
+    server: &Server,
+    repo: &Repo,
+    user: Option<&str>,
+    r: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    out.write_all(&advertisement(server, &repo.meta.lock().unwrap())?)?;
+    out.flush()?;
+    let (report, trunk_moved) = push(server, repo, user, r, true)?;
+    out.write_all(&report)?;
+    out.flush()?;
+    if trunk_moved {
+        repo.compact.notify_one();
+    }
+    Ok(())
+}
+
 struct Command {
     old: Oid,
     new: Oid,
@@ -98,15 +126,19 @@ struct Command {
 }
 
 /// Read commands and the pack, apply ref updates, and build the status report.
-/// Returns the report and whether trunk moved.
+/// Returns the report and whether trunk moved. A `delimited` pack is read up to its
+/// trailer rather than to the end of input (the connection stays open over SSH).
 fn push(
     server: &Server,
     repo: &Repo,
-    mut r: Box<dyn BufRead + Send>,
+    user: Option<&str>,
+    r: &mut dyn BufRead,
+    delimited: bool,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
+    let _ = user;
     let mut commands = Vec::new();
     let mut caps = HashSet::new();
-    while let Some(Packet::Data(line)) = pktline::read(&mut r)? {
+    while let Some(Packet::Data(line)) = pktline::read(r)? {
         let line = String::from_utf8_lossy(&line);
         let line = line.trim_end_matches('\n');
         if line.starts_with("shallow ") {
@@ -135,7 +167,7 @@ fn push(
         });
     }
     let options = if caps.contains("push-options") {
-        pktline::read_section(&mut r)?.0
+        pktline::read_section(r)?.0
     } else {
         Vec::new()
     };
@@ -144,7 +176,7 @@ fn push(
     let mut unpack: Result<(), String> = Ok(());
     let mut parsed: Option<ParsedPack> = None;
     if commands.iter().any(|c| !c.new.is_zero()) {
-        match receive_pack_data(&repo.store, &mut r) {
+        match receive_pack_data(&repo.store, r, delimited) {
             Ok(p) => parsed = Some(p),
             Err(e) => unpack = Err(format!("{e}")),
         }
@@ -246,7 +278,11 @@ fn choose_trunk<'a>(preferred: &str, commands: &'a [Command]) -> Option<&'a str>
 }
 
 /// Stream the pack into staging, decode it once, and publish it to blob storage.
-fn receive_pack_data(store: &BlobStore, r: &mut dyn Read) -> anyhow::Result<ParsedPack> {
+fn receive_pack_data(
+    store: &BlobStore,
+    r: &mut dyn BufRead,
+    delimited: bool,
+) -> anyhow::Result<ParsedPack> {
     /// Removes the staging file on every exit path, panics included.
     struct Staged(std::path::PathBuf);
     impl Drop for Staged {
@@ -256,7 +292,9 @@ fn receive_pack_data(store: &BlobStore, r: &mut dyn Read) -> anyhow::Result<Pars
     }
     let staged = Staged(store.staging_path());
     let mut file = std::fs::File::create(&staged.0)?;
-    if io::copy(&mut r.take(MAX_PUSH_BYTES + 1), &mut file)? > MAX_PUSH_BYTES {
+    if delimited {
+        pack::copy_stream(r, &mut file, MAX_PUSH_BYTES)?;
+    } else if io::copy(&mut r.take(MAX_PUSH_BYTES + 1), &mut file)? > MAX_PUSH_BYTES {
         anyhow::bail!("pack larger than {MAX_PUSH_BYTES} bytes");
     }
     drop(file);

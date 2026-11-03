@@ -1,60 +1,148 @@
-//! Token authentication over HTTP Basic (what git's credential helpers speak) or Bearer.
+//! Who may do what: tokens over HTTP Basic (what git's credential helpers speak) or
+//! Bearer, and public keys over SSH.
 //!
-//! The token file has one entry per line: `<name> <token> <read|write>`. With HTTP
-//! Basic, the token goes in the password field and the username is ignored.
+//! The auth file has one entry per line:
+//!
+//! ```text
+//! # name   credential              access  [repositories]
+//! ishaan   tok_3f9a...             admin
+//! ishaan   ssh-ed25519 AAAAC3...   write
+//! ci       tok_77c1...             read    team/*,docs
+//! ```
+//!
+//! The credential is a token or an OpenSSH public key (a pasted `.pub` line, comment
+//! included, works). Access is `read`, `write` (push,
+//! including creating repositories), or `admin` (also the admin API). The optional last
+//! field limits the entry to repositories matching comma-separated patterns, where `*`
+//! matches any run of characters. With HTTP Basic, the token goes in the password field
+//! and the username is ignored.
 
 use axum::http::{HeaderMap, header};
 use base64::Engine;
+use russh::keys::PublicKey;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
     Read,
     Write,
+    Admin,
 }
 
-struct Token {
-    name: String,
-    secret: String,
-    access: Access,
+enum Credential {
+    Token(String),
+    Key(Box<PublicKey>),
+}
+
+/// One entry of the auth file.
+pub struct Identity {
+    pub name: String,
+    pub access: Access,
+    /// Repository patterns; empty means every repository.
+    repos: Vec<String>,
+    credential: Credential,
+}
+
+impl Identity {
+    /// Whether this identity may act on `repo` with at least `need`.
+    pub fn allows(&self, repo: &str, need: Access) -> bool {
+        self.access >= need && self.can_see(repo)
+    }
+
+    /// Whether `repo` is within this identity's repositories at all.
+    pub fn can_see(&self, repo: &str) -> bool {
+        self.repos.is_empty() || self.repos.iter().any(|p| glob(p, repo))
+    }
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+fn glob(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, rest)) => {
+            let Some(name) = name.strip_prefix(head) else {
+                return false;
+            };
+            (0..=name.len())
+                .filter(|&i| name.is_char_boundary(i))
+                .any(|i| glob(rest, &name[i..]))
+        }
+    }
 }
 
 pub struct Auth {
-    tokens: Vec<Token>,
+    identities: Vec<Identity>,
 }
 
 impl Auth {
     pub fn load(path: &Path) -> anyhow::Result<Auth> {
-        let mut tokens = Vec::new();
-        for (n, line) in std::fs::read_to_string(path)?.lines().enumerate() {
+        Auth::parse(&std::fs::read_to_string(path)?)
+            .map_err(|(n, e)| anyhow::anyhow!("{}:{n}: {e}", path.display()))
+    }
+
+    /// Parse auth file contents. Errors carry the 1-based line number.
+    pub fn parse(text: &str) -> Result<Auth, (usize, String)> {
+        let mut identities = Vec::new();
+        for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let [name, secret, access] = fields[..] else {
-                anyhow::bail!(
-                    "{}:{}: expected `<name> <token> <read|write>`",
-                    path.display(),
-                    n + 1
-                );
+            let fail = |e: String| (n + 1, e);
+            let is_key = fields
+                .get(1)
+                .is_some_and(|f| ["ssh-", "ecdsa-", "sk-"].iter().any(|p| f.starts_with(p)));
+            let (credential, rest) = if is_key {
+                let [_, kind, data, rest @ ..] = &fields[..] else {
+                    return Err(fail("expected `<name> <key-type> <key> <access>`".into()));
+                };
+                let key = PublicKey::from_openssh(&format!("{kind} {data}"))
+                    .map_err(|e| fail(format!("bad public key: {e}")))?;
+                // A pasted .pub line may carry a comment before the access level.
+                let access_at = rest
+                    .iter()
+                    .rposition(|f| ["read", "write", "admin"].contains(f))
+                    .filter(|&i| i + 2 >= rest.len())
+                    .unwrap_or(0);
+                (Credential::Key(Box::new(key)), &rest[access_at..])
+            } else {
+                let [_, token, rest @ ..] = &fields[..] else {
+                    return Err(fail("expected `<name> <token> <access>`".into()));
+                };
+                (Credential::Token(token.to_string()), rest)
+            };
+            let (access, repos) = match rest {
+                [access] => (*access, ""),
+                [access, repos] => (*access, *repos),
+                _ => {
+                    return Err(fail(
+                        "expected `<access> [repositories]` after the credential".into(),
+                    ));
+                }
             };
             let access = match access {
                 "read" => Access::Read,
                 "write" => Access::Write,
-                other => anyhow::bail!("{}:{}: unknown access {other:?}", path.display(), n + 1),
+                "admin" => Access::Admin,
+                other => return Err(fail(format!("unknown access {other:?}"))),
             };
-            tokens.push(Token {
-                name: name.into(),
-                secret: secret.into(),
+            identities.push(Identity {
+                name: fields[0].into(),
                 access,
+                repos: repos
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(String::from)
+                    .collect(),
+                credential,
             });
         }
-        Ok(Auth { tokens })
+        Ok(Auth { identities })
     }
 
-    /// The caller's name and access, if the request carries a known token.
-    pub fn check(&self, headers: &HeaderMap) -> Option<(&str, Access)> {
+    /// The identity behind a request's token, if it carries a known one.
+    pub fn check(&self, headers: &HeaderMap) -> Option<&Identity> {
         let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
         let secret = if let Some(b64) = value.strip_prefix("Basic ") {
             let decoded = base64::engine::general_purpose::STANDARD
@@ -70,10 +158,18 @@ impl Auth {
         } else {
             value.strip_prefix("Bearer ")?.trim().to_string()
         };
-        self.tokens
-            .iter()
-            .find(|t| constant_time_eq(t.secret.as_bytes(), secret.as_bytes()))
-            .map(|t| (t.name.as_str(), t.access))
+        self.identities.iter().find(|i| match &i.credential {
+            Credential::Token(t) => constant_time_eq(t.as_bytes(), secret.as_bytes()),
+            Credential::Key(_) => false,
+        })
+    }
+
+    /// The identity a public key belongs to.
+    pub fn check_key(&self, key: &PublicKey) -> Option<&Identity> {
+        self.identities.iter().find(|i| match &i.credential {
+            Credential::Key(k) => k.key_data() == key.key_data(),
+            Credential::Token(_) => false,
+        })
     }
 }
 
@@ -158,6 +254,27 @@ fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_file_entries_scope_access() {
+        let auth = Auth::parse(
+            "# comment\n\
+             me tok1 admin\n\
+             me ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGpBGs2XPDlcI6sJYkTyLe5bfHgGoN0VD7O4OVgoLbmZ laptop write\n\
+             ci tok2 read team/*,docs\n",
+        )
+        .unwrap();
+        let ci = &auth.identities[2];
+        assert!(ci.allows("team/app", Access::Read));
+        assert!(ci.allows("docs", Access::Read));
+        assert!(!ci.allows("team/app", Access::Write));
+        assert!(!ci.allows("other", Access::Read));
+        assert!(!ci.allows("docs2", Access::Read));
+        assert_eq!(auth.identities[1].access, Access::Write);
+        assert!(auth.identities[0].allows("anything/at/all", Access::Admin));
+        assert!(Auth::parse("me tok1 owner\n").is_err());
+        assert!(Auth::parse("me ssh-ed25519 notbase64 write\n").is_err());
+    }
 
     #[test]
     fn hmac_matches_rfc_2202() {

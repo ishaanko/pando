@@ -135,12 +135,49 @@ impl Server {
         }
     }
 
+    /// Check a request's credentials for `need` on `repo`. Returns the caller's name
+    /// (`None` when auth is off or for anonymous public reads).
+    pub fn authorize(
+        &self,
+        headers: &axum::http::HeaderMap,
+        repo: &str,
+        need: Access,
+    ) -> Result<Option<String>, Denied> {
+        let Some(auth) = &self.cfg.auth else {
+            return Ok(None);
+        };
+        match auth.check(headers) {
+            Some(id) if id.allows(repo, need) => Ok(Some(id.name.clone())),
+            Some(id) if id.can_see(repo) => {
+                tracing::warn!(who = id.name, repo, ?need, "denied: insufficient access");
+                Err(Denied::Forbidden(format!(
+                    "{} cannot {} {repo}",
+                    id.name,
+                    match need {
+                        Access::Read => "read",
+                        Access::Write => "push to",
+                        Access::Admin => "administer",
+                    }
+                )))
+            }
+            Some(id) => {
+                tracing::warn!(who = id.name, repo, "denied: repository not in scope");
+                Err(Denied::Forbidden(format!(
+                    "{} cannot access {repo}",
+                    id.name
+                )))
+            }
+            None if need == Access::Read && self.cfg.public_read => Ok(None),
+            None => Err(Denied::Unauthenticated),
+        }
+    }
+
     /// An existing repository.
     pub fn repo(&self, name: &str) -> anyhow::Result<Option<Arc<Repo>>> {
         self.open_repo(name, false)
     }
 
-    fn open_repo(&self, name: &str, create: bool) -> anyhow::Result<Option<Arc<Repo>>> {
+    pub fn open_repo(&self, name: &str, create: bool) -> anyhow::Result<Option<Arc<Repo>>> {
         if !valid_repo_name(name) {
             return Ok(None);
         }
@@ -167,6 +204,26 @@ impl Server {
         }
         repos.insert(name.to_string(), repo.clone());
         Ok(Some(repo))
+    }
+}
+
+/// Why a request was refused.
+pub enum Denied {
+    /// No valid credentials (HTTP 401, which makes git prompt for them).
+    Unauthenticated,
+    Forbidden(String),
+}
+
+impl IntoResponse for Denied {
+    fn into_response(self) -> Response {
+        match self {
+            Denied::Unauthenticated => Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::WWW_AUTHENTICATE, "Basic realm=\"pando\"")
+                .body(Body::from("authentication required\n"))
+                .unwrap(),
+            Denied::Forbidden(msg) => (StatusCode::FORBIDDEN, format!("{msg}\n")).into_response(),
+        }
     }
 }
 
@@ -231,7 +288,8 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
                 .cfg
                 .auth
                 .as_ref()
-                .is_some_and(|a| a.check(req.headers()).is_some());
+                .and_then(|a| a.check(req.headers()))
+                .is_some_and(|i| i.allows(repo, Access::Read));
         if !allowed {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -257,24 +315,11 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
         _ => return (StatusCode::FORBIDDEN, "unsupported service\n").into_response(),
     };
 
-    if let Some(auth) = &server.cfg.auth {
-        let need = if push { Access::Write } else { Access::Read };
-        match auth.check(req.headers()) {
-            Some((_, have)) if have >= need => {}
-            Some((who, _)) => {
-                tracing::warn!(who, repo = name, "denied: read-only token tried to push");
-                return (StatusCode::FORBIDDEN, "this token cannot push\n").into_response();
-            }
-            None if !push && server.cfg.public_read => {}
-            None => {
-                return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(header::WWW_AUTHENTICATE, "Basic realm=\"pando\"")
-                    .body(Body::from("authentication required\n"))
-                    .unwrap();
-            }
-        }
-    }
+    let need = if push { Access::Write } else { Access::Read };
+    let user = match server.authorize(req.headers(), name, need) {
+        Ok(user) => user,
+        Err(denied) => return denied.into_response(),
+    };
 
     let repo = match server.open_repo(name, push) {
         Ok(Some(r)) => r,
@@ -285,7 +330,7 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
         Endpoint::InfoRefs if push => receive::advertise(server.clone(), repo).await,
         Endpoint::InfoRefs => upload::advertise(repo, req.headers()).await,
         Endpoint::UploadPack => upload::handle(server.clone(), repo, req).await,
-        Endpoint::ReceivePack => receive::handle(server.clone(), repo, req).await,
+        Endpoint::ReceivePack => receive::handle(server.clone(), repo, user, req).await,
     };
     result.unwrap_or_else(|e| internal_error(&path, e))
 }

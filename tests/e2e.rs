@@ -1584,3 +1584,187 @@ fn default_branch_can_change() {
     assert_eq!(count(&c, "origin/next"), 7);
     assert_eq!(count(&c, "origin/main"), 4);
 }
+
+/// Serve SSH for `server` on a random port. Returns the base URL.
+fn start_ssh(server: &Arc<pando::server::Server>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = server.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            pando::ssh::serve(server, listener).await.unwrap();
+        });
+    });
+    format!("ssh://git@127.0.0.1:{port}")
+}
+
+/// A fresh SSH key. Returns its public key line and a GIT_SSH_COMMAND using it.
+fn ssh_key(dir: &Path, name: &str) -> (String, String) {
+    let path = dir.join(name);
+    let ok = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let public = std::fs::read_to_string(path.with_extension("pub")).unwrap();
+    let command = format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        path.display()
+    );
+    (public.trim().to_string(), command)
+}
+
+fn git_ssh(dir: &Path, ssh: &str, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_SSH_COMMAND", ssh)
+        .output()
+        .unwrap()
+}
+
+#[track_caller]
+fn git_ssh_ok(dir: &Path, ssh: &str, args: &[&str]) -> String {
+    let out = git_ssh(dir, ssh, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn ssh_clones_fetches_and_pushes_with_keys() {
+    let keys = TempDir::new().unwrap();
+    let (writer, as_writer) = ssh_key(keys.path(), "writer");
+    let (reader, as_reader) = ssh_key(keys.path(), "reader");
+    let (scoped, as_scoped) = ssh_key(keys.path(), "scoped");
+    let (_, as_stranger) = ssh_key(keys.path(), "stranger");
+    let auth = format!("w {writer} write\nr {reader} read\nx {scoped} write other/*\n");
+    let s = Server::start_configured(|cfg| {
+        cfg.auth = Some(pando::auth::Auth::parse(&auth).unwrap());
+    });
+    let base = start_ssh(&s.server);
+    let url = format!("{base}/team/app.git");
+
+    // Push a history with a large incompressible file, so the pack spans many
+    // SSH packets and has to be delimited by its own trailer.
+    let a = s.path("a");
+    init(&a);
+    let noise: Vec<u8> = (0..400_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(a.join("noise.bin"), &noise).unwrap();
+    git(&a, &["add", "noise.bin"]);
+    for i in 0..5 {
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["tag", "-am", "release", "v1"]);
+    git_ssh_ok(&a, &as_writer, &["push", "-q", &url, "main", "v1"]);
+
+    // Clone over v2 and v0, shallow and partial.
+    for proto in ["2", "0"] {
+        let v = format!("protocol.version={proto}");
+        let c = s.path(&format!("c{proto}"));
+        git_ssh_ok(
+            s.dir.path(),
+            &as_reader,
+            &["-c", &v, "clone", "-q", &url, c.to_str().unwrap()],
+        );
+        git(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "HEAD"), 5);
+        assert_eq!(std::fs::read(c.join("noise.bin")).unwrap(), noise);
+        let sh = s.path(&format!("sh{proto}"));
+        git_ssh_ok(
+            s.dir.path(),
+            &as_reader,
+            &[
+                "-c",
+                &v,
+                "clone",
+                "-q",
+                "--depth",
+                "2",
+                &url,
+                sh.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(count(&sh, "HEAD"), 2);
+        let pc = s.path(&format!("pc{proto}"));
+        git_ssh_ok(
+            s.dir.path(),
+            &as_reader,
+            &[
+                "-c",
+                &v,
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                &url,
+                pc.to_str().unwrap(),
+            ],
+        );
+        git_ssh_ok(&pc, &as_reader, &["-c", &v, "log", "-p", "-q"]);
+        git(&pc, &["fsck", "--no-progress"]);
+    }
+
+    // The writer pushes more, force-pushes a branch, and deletes it.
+    commit(&a, "f", "more");
+    git_ssh_ok(&a, &as_writer, &["push", "-q", &url, "main"]);
+    git(&a, &["checkout", "-qb", "topic"]);
+    commit(&a, "t", "1");
+    git_ssh_ok(&a, &as_writer, &["push", "-q", &url, "topic"]);
+    git(&a, &["commit", "-q", "--amend", "-m", "amended"]);
+    git_ssh_ok(&a, &as_writer, &["push", "-qf", &url, "topic"]);
+    let c = s.path("c2");
+    git_ssh_ok(&c, &as_reader, &["fetch", "-q", "origin"]);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "origin/topic"), 7);
+    git_ssh_ok(&a, &as_writer, &["push", "-q", &url, "--delete", "topic"]);
+    git_ssh_ok(&c, &as_reader, &["fetch", "-q", "--prune", "origin"]);
+    assert!(!git(&c, &["branch", "-r"]).contains("topic"));
+
+    // Access control.
+    commit(&c, "f", "from reader");
+    let out = git_ssh(
+        &c,
+        &as_reader,
+        &["push", "-q", "origin", "HEAD:refs/heads/r"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("r cannot push to team/app"));
+    let out = git_ssh(
+        &c,
+        &as_scoped,
+        &["push", "-q", "origin", "HEAD:refs/heads/x"],
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("x cannot push to team/app"));
+    git_ssh_ok(
+        &c,
+        &as_scoped,
+        &[
+            "push",
+            "-q",
+            &format!("{base}/other/thing.git"),
+            "HEAD:main",
+        ],
+    );
+    let out = git_ssh(&c, &as_stranger, &["ls-remote", &url]);
+    assert!(!out.status.success());
+    let out = git_ssh(
+        &c,
+        &as_reader,
+        &["ls-remote", &format!("{base}/missing.git")],
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+}
