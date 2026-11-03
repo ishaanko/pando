@@ -96,7 +96,9 @@ async fn main() -> anyhow::Result<()> {
                 let _ = tcp.set_nodelay(true);
             });
             tracing::info!("pando serving {} on {listen}", data.display());
-            axum::serve(listener, router).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown())
+                .await?;
         }
         Cmd::Express {
             listen,
@@ -112,8 +114,28 @@ async fn main() -> anyhow::Result<()> {
                 let _ = tcp.set_nodelay(true);
             });
             tracing::info!("express serving on {listen}");
-            axum::serve(listener, router).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown())
+                .await?;
         }
     }
     Ok(())
+}
+
+/// Resolves on SIGINT or SIGTERM. In-flight pushes and fetches finish first; a push
+/// that has not reached its metadata transaction leaves at most an unreferenced pack.
+async fn shutdown() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+    tracing::info!("shutting down");
 }

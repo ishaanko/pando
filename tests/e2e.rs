@@ -691,7 +691,8 @@ fn decoder_matches_git_on_deep_delta_chains() {
         .filter_map(|l| Oid::from_hex(&l[..40]))
         .chain(Oid::from_hex(&git(repo, &["rev-parse", "t"])))
         .collect();
-    assert_eq!(parsed.oids, expected);
+    let got: std::collections::HashSet<Oid> = parsed.entries.iter().map(|e| e.oid).collect();
+    assert_eq!(got, expected);
     assert!(
         parsed.external_refs().is_empty(),
         "a full pack references nothing outside itself"

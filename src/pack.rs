@@ -55,20 +55,74 @@ pub struct ParsedPack {
     /// packfile-uris protocol line carries it, so it doubles as our blob key.
     pub hash: Oid,
     pub entries: Vec<IdxEntry>,
-    /// Every object id in the pack.
-    pub oids: HashSet<Oid>,
     /// Every commit in the pack with its parents.
     pub commits: HashMap<Oid, Vec<Oid>>,
     /// Every annotated tag in the pack with the object it points at.
     pub tags: HashMap<Oid, Oid>,
-    /// Outgoing references of every commit (tree + parents), tree (entries, minus
-    /// submodule links) and tag (target). Blobs have none.
-    pub refs: HashMap<Oid, Vec<Oid>>,
+    graph: Graph,
+}
+
+/// Outgoing references of every commit (tree + parents), tree (entries, minus
+/// submodule links) and tag (target), with ids interned as `u32` and all edges in one
+/// array. Real histories have tens of millions of tree entries; at 4 bytes each with
+/// no per-object allocation, a large import stays in hundreds of megabytes.
+#[derive(Default)]
+struct Graph {
+    ids: Vec<Oid>,
+    index: HashMap<Oid, u32>,
+    in_pack: Vec<bool>,
+    /// `edges[start..start + len]` for each node.
+    spans: Vec<(u32, u32)>,
+    edges: Vec<u32>,
+}
+
+impl Graph {
+    fn intern(&mut self, oid: Oid) -> u32 {
+        if let Some(&i) = self.index.get(&oid) {
+            return i;
+        }
+        let i = self.ids.len() as u32;
+        self.ids.push(oid);
+        self.in_pack.push(false);
+        self.spans.push((0, 0));
+        self.index.insert(oid, i);
+        i
+    }
+
+    fn add_object(&mut self, oid: Oid) {
+        let i = self.intern(oid);
+        self.in_pack[i as usize] = true;
+    }
+
+    fn set_refs(&mut self, oid: Oid, refs: &[Oid]) {
+        let i = self.intern(oid) as usize;
+        let start = self.edges.len() as u32;
+        for r in refs {
+            let r = self.intern(*r);
+            self.edges.push(r);
+        }
+        self.spans[i] = (start, refs.len() as u32);
+    }
+
+    fn refs(&self, i: u32) -> &[u32] {
+        let (start, len) = self.spans[i as usize];
+        &self.edges[start as usize..(start + len) as usize]
+    }
+
+    fn refs_of(&self, oid: &Oid) -> Vec<Oid> {
+        self.index
+            .get(oid)
+            .map(|&i| self.refs(i).iter().map(|&r| self.ids[r as usize]).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl ParsedPack {
     pub fn contains(&self, oid: &Oid) -> bool {
-        self.oids.contains(oid)
+        self.graph
+            .index
+            .get(oid)
+            .is_some_and(|&i| self.graph.in_pack[i as usize])
     }
 
     /// Follow a chain of annotated tags in this pack to the first non-tag object.
@@ -101,30 +155,36 @@ impl ParsedPack {
     }
 
     /// Objects in this pack reachable from `tips` without leaving the pack.
-    pub fn reachable_objects(&self, tips: impl IntoIterator<Item = Oid>) -> HashSet<Oid> {
-        let mut seen = HashSet::new();
-        let mut stack: Vec<Oid> = tips.into_iter().filter(|t| self.contains(t)).collect();
-        while let Some(oid) = stack.pop() {
-            if !seen.insert(oid) {
+    pub fn reachable_objects(&self, tips: impl IntoIterator<Item = Oid>) -> Vec<Oid> {
+        let g = &self.graph;
+        let mut seen = vec![false; g.ids.len()];
+        let mut stack: Vec<u32> = tips
+            .into_iter()
+            .filter_map(|t| g.index.get(&t).copied())
+            .collect();
+        let mut out = Vec::new();
+        while let Some(i) = stack.pop() {
+            if seen[i as usize] || !g.in_pack[i as usize] {
                 continue;
             }
-            for r in self.refs.get(&oid).into_iter().flatten() {
-                if self.contains(r) && !seen.contains(r) {
-                    stack.push(*r);
-                }
-            }
+            seen[i as usize] = true;
+            out.push(g.ids[i as usize]);
+            stack.extend(g.refs(i).iter().filter(|&&r| !seen[r as usize]));
         }
-        seen
+        out
     }
 
     /// Objects referenced from inside the pack but not contained in it. Together with
     /// the pack itself, these must already exist for the pack to be complete.
-    pub fn external_refs(&self) -> HashSet<Oid> {
-        self.refs
-            .values()
-            .flatten()
-            .filter(|r| !self.contains(r))
-            .copied()
+    pub fn external_refs(&self) -> Vec<Oid> {
+        let g = &self.graph;
+        let mut referenced = vec![false; g.ids.len()];
+        for &r in &g.edges {
+            referenced[r as usize] = true;
+        }
+        (0..g.ids.len())
+            .filter(|&i| referenced[i] && !g.in_pack[i])
+            .map(|i| g.ids[i])
             .collect()
     }
 }
@@ -283,7 +343,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     }
     let mut raws: Vec<Raw> = Vec::with_capacity(count.min(MAX_PREALLOC / 64));
     let mut resolved: Vec<Option<(Kind, Oid)>> = Vec::with_capacity(raws.capacity());
-    let mut refs = HashMap::new();
+    let mut graph = Graph::default();
     let mut budget = MIN_INFLATED_BUDGET.max(buf.len().saturating_mul(INFLATE_RATIO));
 
     // Pass 1: find object boundaries; hash whole objects while streaming them.
@@ -309,7 +369,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
                 })?;
                 let oid = Oid(sha.finalize().into());
                 if let Some(data) = keep {
-                    refs.insert(oid, object_refs(kind, &data)?);
+                    graph.set_refs(oid, &object_refs(kind, &data)?);
                 }
                 resolved.push(Some((kind, oid)));
                 used
@@ -379,7 +439,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             budget = budget.checked_sub(data.len()).ok_or(PackError::TooLarge)?;
             let oid = Oid::for_object(kind, &data);
             if kind != Kind::Blob {
-                refs.insert(oid, object_refs(kind, &data)?);
+                graph.set_refs(oid, &object_refs(kind, &data)?);
             }
             resolved[k] = Some((kind, oid));
             let kids = take_children(k, &oid);
@@ -395,7 +455,6 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     }
 
     let mut entries = Vec::with_capacity(raws.len());
-    let mut oids = HashSet::with_capacity(raws.len());
     let mut commits = HashMap::new();
     let mut tags = HashMap::new();
     for (r, res) in raws.iter().zip(&resolved) {
@@ -404,14 +463,14 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             offset: r.offset,
             oid,
         });
-        oids.insert(oid);
+        graph.add_object(oid);
         match kind {
             // Commit refs are [tree, parents...]; tag refs are [target].
             Kind::Commit => {
-                commits.insert(oid, refs[&oid][1..].to_vec());
+                commits.insert(oid, graph.refs_of(&oid)[1..].to_vec());
             }
             Kind::Tag => {
-                tags.insert(oid, refs[&oid][0]);
+                tags.insert(oid, graph.refs_of(&oid)[0]);
             }
             _ => {}
         }
@@ -419,10 +478,9 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     Ok(ParsedPack {
         hash,
         entries,
-        oids,
         commits,
         tags,
-        refs,
+        graph,
     })
 }
 
