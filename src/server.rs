@@ -45,7 +45,9 @@ async fn dispatch(State(app): State<Arc<App>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let result = match (req.method().clone(), path.as_str()) {
-        (Method::GET, p) if p.ends_with("/info/refs") => advertise(app, &query, req.headers()).await,
+        (Method::GET, p) if p.ends_with("/info/refs") => {
+            advertise(app, &query, req.headers()).await
+        }
         (Method::POST, p) if p.ends_with("/git-upload-pack") => upload_pack(app, req).await,
         (Method::POST, p) if p.ends_with("/git-receive-pack") => receive_pack(app, req).await,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -64,7 +66,9 @@ fn git_response(content_type: &str, body: impl Into<Body>) -> Response {
         .unwrap()
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
     tokio::task::spawn_blocking(f).await?
 }
 
@@ -72,7 +76,10 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Sen
 // Advertisements
 
 async fn advertise(app: Arc<App>, query: &str, headers: &HeaderMap) -> anyhow::Result<Response> {
-    let service = query.split('&').find_map(|kv| kv.strip_prefix("service=")).unwrap_or("");
+    let service = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("service="))
+        .unwrap_or("");
     let v2 = headers
         .get("git-protocol")
         .and_then(|v| v.to_str().ok())
@@ -94,14 +101,20 @@ async fn advertise(app: Arc<App>, query: &str, headers: &HeaderMap) -> anyhow::R
         "git-upload-pack" => {
             pktline::line(&mut out, "# service=git-upload-pack\n");
             pktline::flush(&mut out);
-            pktline::line(&mut out, "ERR pando serves fetches over Git protocol v2 only (git >= 2.26)");
+            pktline::line(
+                &mut out,
+                "ERR pando serves fetches over Git protocol v2 only (git >= 2.26)",
+            );
         }
         "git-receive-pack" => {
             out = blocking(move || receive_advertisement(&app.meta.lock().unwrap())).await?;
         }
         _ => return Ok((StatusCode::FORBIDDEN, "unsupported service\n").into_response()),
     }
-    Ok(git_response(&format!("application/x-{service}-advertisement"), out))
+    Ok(git_response(
+        &format!("application/x-{service}-advertisement"),
+        out,
+    ))
 }
 
 /// The push advertisement: trunk, then `.have` lines for trunk tips at exponentially
@@ -125,21 +138,31 @@ fn receive_advertisement(meta: &Meta) -> anyhow::Result<Vec<u8>> {
                 back *= 2;
             }
         }
-        None => pktline::line(&mut out, format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO)),
+        None => pktline::line(
+            &mut out,
+            format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO),
+        ),
     }
     pktline::flush(&mut out);
     Ok(out)
 }
 
 /// Wrap a request body as a blocking reader, gunzipping if the client compressed it.
-fn body_reader(req: Request) -> Box<dyn BufRead + Send> {
-    let gzip = req.headers().get(header::CONTENT_ENCODING).is_some_and(|v| v == "gzip");
+/// The returned opener must run on a blocking thread: the gzip decoder reads its
+/// header as soon as it is built, and the bridge cannot block an async worker.
+fn body_reader(req: Request) -> impl FnOnce() -> Box<dyn BufRead + Send> + Send {
+    let gzip = req
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|v| v == "gzip");
     let stream = req.into_body().into_data_stream().map_err(io::Error::other);
     let sync = SyncIoBridge::new(StreamReader::new(stream));
-    if gzip {
-        Box::new(BufReader::new(flate2::read::GzDecoder::new(sync)))
-    } else {
-        Box::new(BufReader::new(sync))
+    move || -> Box<dyn BufRead + Send> {
+        if gzip {
+            Box::new(BufReader::new(flate2::read::GzDecoder::new(sync)))
+        } else {
+            Box::new(BufReader::new(sync))
+        }
     }
 }
 
@@ -147,10 +170,11 @@ fn body_reader(req: Request) -> Box<dyn BufRead + Send> {
 // Fetch (protocol v2)
 
 async fn upload_pack(app: Arc<App>, req: Request) -> anyhow::Result<Response> {
-    let mut body = body_reader(req);
+    let open_body = body_reader(req);
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
     // Run the command on a blocking thread and stream whatever it writes.
     tokio::task::spawn_blocking(move || {
+        let mut body = open_body();
         let mut out = ChannelWriter { tx: tx.clone() };
         if let Err(e) = serve_v2_command(&app, &mut body, &mut out) {
             tracing::error!("upload-pack: {e:#}");
@@ -159,8 +183,13 @@ async fn upload_pack(app: Arc<App>, req: Request) -> anyhow::Result<Response> {
             let _ = tx.blocking_send(Ok(err.into()));
         }
     });
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-    Ok(git_response("application/x-git-upload-pack-result", Body::from_stream(stream)))
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Ok(git_response(
+        "application/x-git-upload-pack-result",
+        Body::from_stream(stream),
+    ))
 }
 
 /// Forwards writes to an HTTP response body.
@@ -182,7 +211,11 @@ impl Write for ChannelWriter {
 
 fn serve_v2_command(app: &App, r: &mut dyn BufRead, out: &mut dyn Write) -> anyhow::Result<()> {
     let (head, _) = pktline::read_section(r)?;
-    let command = head.iter().find_map(|l| l.strip_prefix("command=")).unwrap_or("").to_string();
+    let command = head
+        .iter()
+        .find_map(|l| l.strip_prefix("command="))
+        .unwrap_or("")
+        .to_string();
     let (args, _) = pktline::read_section(r)?;
     match command.as_str() {
         "ls-refs" => out.write_all(&ls_refs(&app.meta.lock().unwrap(), &args)?)?,
@@ -197,11 +230,19 @@ fn ls_refs(meta: &Meta, args: &[String]) -> anyhow::Result<Vec<u8>> {
     let symrefs = args.iter().any(|a| a == "symrefs");
     let peel = args.iter().any(|a| a == "peel");
     let unborn = args.iter().any(|a| a == "unborn");
-    let prefixes: Vec<String> = args.iter().filter_map(|a| a.strip_prefix("ref-prefix ")).map(String::from).collect();
+    let prefixes: Vec<String> = args
+        .iter()
+        .filter_map(|a| a.strip_prefix("ref-prefix "))
+        .map(String::from)
+        .collect();
     let wants_head = prefixes.is_empty() || prefixes.iter().any(|p| "HEAD".starts_with(p.as_str()));
     let mut out = Vec::new();
     if wants_head {
-        let symref = if symrefs { format!(" symref-target:{}", meta.trunk) } else { String::new() };
+        let symref = if symrefs {
+            format!(" symref-target:{}", meta.trunk)
+        } else {
+            String::new()
+        };
         match meta.trunk_head()? {
             Some(v) => pktline::line(&mut out, format!("{} HEAD{symref}\n", v.tip)),
             None if unborn => pktline::line(&mut out, format!("unborn HEAD{symref}\n")),
@@ -220,7 +261,12 @@ fn ls_refs(meta: &Meta, args: &[String]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> {
-    let oids = |prefix: &str| -> Vec<Oid> { args.iter().filter_map(|a| a.strip_prefix(prefix)).filter_map(Oid::from_hex).collect() };
+    let oids = |prefix: &str| -> Vec<Oid> {
+        args.iter()
+            .filter_map(|a| a.strip_prefix(prefix))
+            .filter_map(Oid::from_hex)
+            .collect()
+    };
     let wants = oids("want ");
     let haves = oids("have ");
     let done = args.iter().any(|a| a == "done");
@@ -236,7 +282,14 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
         Err(PlanError::NotOurRef(oid)) => anyhow::bail!("upload-pack: not our ref {oid}"),
         Err(e) => return Err(e.into()),
     };
-    tracing::info!(wants = wants.len(), haves = haves.len(), have = plan.trunk_have, want = plan.trunk_want, packs = plan.packs.len(), "fetch");
+    tracing::info!(
+        wants = wants.len(),
+        haves = haves.len(),
+        have = plan.trunk_have,
+        want = plan.trunk_want,
+        packs = plan.packs.len(),
+        "fetch"
+    );
 
     let mut head = Vec::new();
     if !done {
@@ -261,7 +314,11 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
 
     let use_uris = !app.express.is_empty()
         && !plan.packs.is_empty()
-        && app.express.iter().all(|base| uri_protocols.iter().any(|p| base.starts_with(&format!("{p}://"))));
+        && app.express.iter().all(|base| {
+            uri_protocols
+                .iter()
+                .any(|p| base.starts_with(&format!("{p}://")))
+        });
     if use_uris {
         pktline::line(&mut head, "packfile-uris\n");
         for hash in &plan.packs {
@@ -272,8 +329,17 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
     }
     pktline::line(&mut head, "packfile\n");
     if progress {
-        let how = if use_uris { "as packfile URIs" } else { "inline" };
-        let msg = format!("pando: trunk {}..{}, {} pack(s) {how}\n", plan.trunk_have, plan.trunk_want, plan.packs.len());
+        let how = if use_uris {
+            "as packfile URIs"
+        } else {
+            "inline"
+        };
+        let msg = format!(
+            "pando: trunk {}..{}, {} pack(s) {how}\n",
+            plan.trunk_have,
+            plan.trunk_want,
+            plan.packs.len()
+        );
         pktline::sideband(&mut head, 2, msg.as_bytes());
     }
     out.write_all(&head)?;
@@ -294,18 +360,29 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
 
 /// The packfile section body: an empty pack (URIs carry the data), one stored pack
 /// copied as-is, or several spliced into one.
-fn send_pack_data(app: &App, packs: &[Oid], use_uris: bool, out: &mut dyn Write) -> anyhow::Result<()> {
+fn send_pack_data(
+    app: &App,
+    packs: &[Oid],
+    use_uris: bool,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
     let mut data = SidebandWriter::new(out);
     if use_uris || packs.is_empty() {
         data.write_all(&pack::empty_pack())?;
     } else if let [single] = packs {
-        io::copy(&mut std::fs::File::open(app.store.pack_path(single))?, &mut data)?;
+        io::copy(
+            &mut std::fs::File::open(app.store.pack_path(single))?,
+            &mut data,
+        )?;
     } else {
         let loaded: Vec<(Vec<u8>, Vec<pack::IdxEntry>)> = packs
             .iter()
             .map(|h| Ok((app.store.read_pack(h)?, app.store.read_idx(h)?)))
             .collect::<io::Result<_>>()?;
-        let parts: Vec<(&[u8], &[pack::IdxEntry])> = loaded.iter().map(|(b, i)| (b.as_slice(), i.as_slice())).collect();
+        let parts: Vec<(&[u8], &[pack::IdxEntry])> = loaded
+            .iter()
+            .map(|(b, i)| (b.as_slice(), i.as_slice()))
+            .collect();
         pack::concat(&parts, &mut data)?;
     }
     data.into_inner()?;
@@ -316,16 +393,19 @@ fn send_pack_data(app: &App, packs: &[Oid], use_uris: bool, out: &mut dyn Write)
 // Push (receive-pack)
 
 async fn receive_pack(app: Arc<App>, req: Request) -> anyhow::Result<Response> {
-    let body = body_reader(req);
+    let open_body = body_reader(req);
     let report = blocking(move || {
-        let (report, trunk_moved) = handle_push(&app, body)?;
+        let (report, trunk_moved) = handle_push(&app, open_body())?;
         if trunk_moved {
             app.compact.notify_one();
         }
         Ok(report)
     })
     .await?;
-    Ok(git_response("application/x-git-receive-pack-result", report))
+    Ok(git_response(
+        "application/x-git-receive-pack-result",
+        report,
+    ))
 }
 
 struct Command {
@@ -348,7 +428,12 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
             continue;
         }
         let (cmd, cap_str) = line.split_once('\0').unwrap_or((line, ""));
-        caps.extend(cap_str.split(' ').filter(|c| !c.is_empty()).map(String::from));
+        caps.extend(
+            cap_str
+                .split(' ')
+                .filter(|c| !c.is_empty())
+                .map(String::from),
+        );
         let mut parts = cmd.splitn(3, ' ');
         let (Some(old), Some(new), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
             anyhow::bail!("malformed push command {cmd:?}");
@@ -356,9 +441,17 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
         let (Some(old), Some(new)) = (Oid::from_hex(old), Oid::from_hex(new)) else {
             anyhow::bail!("malformed push command {cmd:?}");
         };
-        commands.push(Command { old, new, refname: name.to_string() });
+        commands.push(Command {
+            old,
+            new,
+            refname: name.to_string(),
+        });
     }
-    let options = if caps.contains("push-options") { pktline::read_section(&mut r)?.0 } else { Vec::new() };
+    let options = if caps.contains("push-options") {
+        pktline::read_section(&mut r)?.0
+    } else {
+        Vec::new()
+    };
     let force = options.iter().any(|o| o == "force");
 
     let statuses: Vec<Result<(), String>>;
@@ -373,13 +466,19 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
     let mut trunk_moved = false;
     if let Err(e) = &unpack {
         tracing::warn!("push rejected: {e}");
-        statuses = commands.iter().map(|_| Err("unpacker error".to_string())).collect();
+        statuses = commands
+            .iter()
+            .map(|_| Err("unpacker error".to_string()))
+            .collect();
     } else {
         let mut meta = app.meta.lock().unwrap();
         match plan_updates(&meta, &commands, parsed.as_ref(), force) {
             Err(e) => {
                 unpack = Err(e);
-                statuses = commands.iter().map(|_| Err("unpacker error".to_string())).collect();
+                statuses = commands
+                    .iter()
+                    .map(|_| Err("unpacker error".to_string()))
+                    .collect();
             }
             Ok(planned) => {
                 // Trunk only claims the commits its new tip reaches. Other pushed commits
@@ -396,7 +495,13 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                 if atomic && planned.iter().any(Result::is_err) {
                     statuses = planned
                         .iter()
-                        .map(|p| Err(p.as_ref().err().cloned().unwrap_or_else(|| "atomic push failed".into())))
+                        .map(|p| {
+                            Err(p
+                                .as_ref()
+                                .err()
+                                .cloned()
+                                .unwrap_or_else(|| "atomic push failed".into()))
+                        })
                         .collect();
                 } else {
                     let updates: Vec<Option<RefUpdate>> = planned
@@ -409,7 +514,10 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                                 expect: plan.expect,
                                 new: (!c.new.is_zero()).then(|| NewVersion {
                                     tip: c.new,
-                                    pack: parsed.as_ref().filter(|p| !p.entries.is_empty()).map(|p| p.hash),
+                                    pack: parsed
+                                        .as_ref()
+                                        .filter(|p| !p.entries.is_empty())
+                                        .map(|p| p.hash),
                                     trunk_dep: plan.trunk_dep,
                                     peeled: parsed.as_ref().and_then(|p| p.peel(&c.new)),
                                     commits,
@@ -419,7 +527,10 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                         .collect();
                     statuses = apply_updates(&mut meta, &updates, &planned, atomic)?;
                 }
-                trunk_moved = commands.iter().zip(&statuses).any(|(c, s)| s.is_ok() && meta.is_trunk(&c.refname));
+                trunk_moved = commands
+                    .iter()
+                    .zip(&statuses)
+                    .any(|(c, s)| s.is_ok() && meta.is_trunk(&c.refname));
             }
         }
     }
@@ -495,7 +606,11 @@ fn plan_updates(
     let trunk = meta.trunk_head().map_err(db)?;
     let t = trunk.as_ref().map_or(0, |v| v.seq);
     let in_trunk = |oid: &Oid| -> Result<bool, String> {
-        Ok(meta.commit(oid).map_err(db)?.and_then(|c| c.trunk_seq).is_some_and(|s| s <= t))
+        Ok(meta
+            .commit(oid)
+            .map_err(db)?
+            .and_then(|c| c.trunk_seq)
+            .is_some_and(|s| s <= t))
     };
 
     // Commit-level connectivity: anything a pushed commit points at outside the pack
@@ -504,13 +619,17 @@ fn plan_updates(
         for parents in p.commits.values() {
             for parent in parents {
                 if !p.commits.contains_key(parent) && !in_trunk(parent)? {
-                    return Err(format!("missing objects: parent {parent} is not in the pack or on trunk"));
+                    return Err(format!(
+                        "missing objects: parent {parent} is not in the pack or on trunk"
+                    ));
                 }
             }
         }
         for target in p.tags.values() {
             if !p.contains(target) && !in_trunk(target)? {
-                return Err(format!("missing objects: tag target {target} is not in the pack or on trunk"));
+                return Err(format!(
+                    "missing objects: tag target {target} is not in the pack or on trunk"
+                ));
             }
         }
     }
@@ -522,7 +641,11 @@ fn plan_updates(
                 return Err("invalid ref name".into());
             }
             let is_trunk = meta.is_trunk(&c.refname);
-            let current = if is_trunk { trunk.clone() } else { meta.current(&c.refname).map_err(db)? };
+            let current = if is_trunk {
+                trunk.clone()
+            } else {
+                meta.current(&c.refname).map_err(db)?
+            };
             let expect = current.as_ref().map(|v| v.id);
             if c.new.is_zero() {
                 if is_trunk {
@@ -534,11 +657,17 @@ fn plan_updates(
                 {
                     return Err("stale info".into());
                 }
-                return Ok(PlannedUpdate { expect, trunk_dep: 0 });
+                return Ok(PlannedUpdate {
+                    expect,
+                    trunk_dep: 0,
+                });
             }
             let in_pack = pack.is_some_and(|p| p.contains(&c.new));
             if !in_pack && !in_trunk(&c.new)? {
-                return Err(format!("missing objects: {} is not in the pack or on trunk", c.new));
+                return Err(format!(
+                    "missing objects: {} is not in the pack or on trunk",
+                    c.new
+                ));
             }
             if is_trunk {
                 if let Some(cur) = &current {
@@ -556,13 +685,19 @@ fn plan_updates(
                 if !c.old.is_zero() && c.old != cur.tip {
                     return Err("stale info".into());
                 }
-                if !force && cur.tip != c.new && !is_ancestor(meta, pack, cur, &c.new).map_err(db)? {
+                if !force
+                    && cur.tip != c.new
+                    && !is_ancestor(meta, pack, cur, &c.new).map_err(db)?
+                {
                     return Err("non-fast-forward (use git push -o force to overwrite)".into());
                 }
             } else if !c.old.is_zero() {
                 return Err("stale info".into());
             }
-            Ok(PlannedUpdate { expect, trunk_dep: t })
+            Ok(PlannedUpdate {
+                expect,
+                trunk_dep: t,
+            })
         })());
     }
     Ok(out)
@@ -595,9 +730,15 @@ fn apply_updates(
 /// Is the current tip of a ref an ancestor of `new`? Walks pushed commits first, then
 /// the commit index. Trunk commits are not expanded when they cannot lead to the
 /// answer, so a non-fast-forward check does not crawl all of history.
-fn is_ancestor(meta: &Meta, pack: Option<&ParsedPack>, current: &Version, new: &Oid) -> rusqlite::Result<bool> {
+fn is_ancestor(
+    meta: &Meta,
+    pack: Option<&ParsedPack>,
+    current: &Version,
+    new: &Oid,
+) -> rusqlite::Result<bool> {
     let target = current.tip;
-    let target_on_trunk = meta.is_trunk(&current.refname) || meta.commit(&target)?.and_then(|c| c.trunk_seq).is_some();
+    let target_on_trunk = meta.is_trunk(&current.refname)
+        || meta.commit(&target)?.and_then(|c| c.trunk_seq).is_some();
     let target_is_trunk_head = meta.is_trunk(&current.refname);
     let mut seen = HashSet::from([*new]);
     let mut queue = VecDeque::from([*new]);
@@ -609,7 +750,9 @@ fn is_ancestor(meta: &Meta, pack: Option<&ParsedPack>, current: &Version, new: &
         let parents = match pack.and_then(|p| p.commits.get(&oid)) {
             Some(ps) => ps.clone(),
             None => {
-                let Some(row) = meta.commit(&oid)? else { continue };
+                let Some(row) = meta.commit(&oid)? else {
+                    continue;
+                };
                 // Every trunk commit is reachable from the trunk head, so the head
                 // cannot be strictly behind one; nor can a commit that is not on trunk.
                 if row.trunk_seq.is_some() && (target_is_trunk_head || !target_on_trunk) {
@@ -638,7 +781,9 @@ fn valid_refname(name: &str) -> bool {
         && !name.contains("..")
         && !name.contains("//")
         && !name.contains("@{")
-        && !name.bytes().any(|b| b < 0x20 || b == 0x7f || b" ~^:?*[\\".contains(&b))
+        && !name
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b" ~^:?*[\\".contains(&b))
 }
 
 // ---------------------------------------------------------------------------------
@@ -648,17 +793,33 @@ fn valid_refname(name: &str) -> bool {
 /// process always serves `/pack/` from its blob store, acting as the origin for
 /// Express nodes. Packfile URIs point at `express_nodes`, or at `public_url` when
 /// none are given.
-pub fn open(data: &std::path::Path, trunk: &str, public_url: &str, express_nodes: Vec<String>) -> anyhow::Result<(Arc<App>, Router)> {
+pub fn open(
+    data: &std::path::Path,
+    trunk: &str,
+    public_url: &str,
+    express_nodes: Vec<String>,
+) -> anyhow::Result<(Arc<App>, Router)> {
     std::fs::create_dir_all(data)?;
     let store = Arc::new(BlobStore::open(data.join("blobs"))?);
     let meta = Meta::open(data.join("meta.db"), trunk)?;
     let express = match express_nodes.is_empty() {
         true => vec![public_url.trim_end_matches('/').to_string()],
-        false => express_nodes.iter().map(|n| n.trim_end_matches('/').to_string()).collect(),
+        false => express_nodes
+            .iter()
+            .map(|n| n.trim_end_matches('/').to_string())
+            .collect(),
     };
-    let app = Arc::new(App { meta: Mutex::new(meta), store: store.clone(), express, compact: Notify::new() });
+    let app = Arc::new(App {
+        meta: Mutex::new(meta),
+        store: store.clone(),
+        express,
+        compact: Notify::new(),
+    });
     let origin = Arc::new(Express::new(express::Origin::Local(store), None)?);
-    Ok((app.clone(), express::router(origin).merge(Router::new().fallback(dispatch).with_state(app))))
+    Ok((
+        app.clone(),
+        express::router(origin).merge(Router::new().fallback(dispatch).with_state(app)),
+    ))
 }
 
 /// Run compaction after trunk moves, and at least every `interval`.
@@ -667,7 +828,8 @@ pub fn spawn_compactor(app: Arc<App>, interval: std::time::Duration) {
         loop {
             let _ = tokio::time::timeout(interval, app.compact.notified()).await;
             let a = app.clone();
-            match tokio::task::spawn_blocking(move || crate::compact::run(&a.meta, &a.store)).await {
+            match tokio::task::spawn_blocking(move || crate::compact::run(&a.meta, &a.store)).await
+            {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::error!("compaction failed: {e:#}"),
                 Err(e) => tracing::error!("compaction panicked: {e}"),

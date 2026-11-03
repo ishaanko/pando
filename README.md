@@ -15,14 +15,19 @@ git clone http://127.0.0.1:8080/repo.git
 
 ## Benchmark
 
-128 agents each pushing 5 times to their own branch, while trunk keeps moving and
-readers keep fetching. 16-core machine, `git` client time included.
+256 agents each push 5 times to their own branch while trunk keeps moving and readers
+keep fetching. Same workload against stock `git http-backend` on a bare repository.
+16-core machine, `git` client time included.
 
-| Operation | Count | p50 | p90 | p99 |
-| --- | --- | --- | --- | --- |
-| Side-branch push | 640 | 158 ms | 235 ms | 319 ms |
-| Trunk push | 160 | 13 ms | 14 ms | 121 ms |
-| Trunk fetch | 320 | 59 ms | 136 ms | 295 ms |
+| | git http-backend | pando |
+| --- | --- | --- |
+| Side-branch push p50 | 1056 ms | 336 ms |
+| Side-branch push p99 | 2073 ms | 628 ms |
+| Trunk push p50 | 39 ms | 13 ms |
+| Trunk push p99 | 609 ms | 129 ms |
+| Trunk fetch p50 | 18 ms | 13 ms |
+| Trunk fetch p99 | 699 ms | 428 ms |
+| Throughput | 76 pushes/s | 201 pushes/s |
 
-800 pushes in 7.4 s, none rejected. Reproduce with
-`cargo run --release --example swarm -- 128 5`.
+Reproduce with `cargo run --release --example swarm -- git 256 5` and
+`cargo run --release --example swarm -- pando 256 5`.

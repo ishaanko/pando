@@ -1,5 +1,6 @@
 //! End-to-end tests: a real `git` client against an in-process Pando server.
 
+use axum::serve::ListenerExt;
 use pando::express::{self, Express, Origin};
 use pando::object::Oid;
 use pando::planner;
@@ -27,7 +28,14 @@ fn serve_in_background(listener: std::net::TcpListener, router: axum::Router) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener.tap_io(|tcp| {
+                    let _ = tcp.set_nodelay(true);
+                }),
+                router,
+            )
+            .await
+            .unwrap();
         });
     });
 }
@@ -44,17 +52,28 @@ impl Server {
         let (listener, url) = bind();
         let nodes: Vec<_> = (0..n).map(|_| bind()).collect();
         let urls = nodes.iter().map(|(_, u)| u.clone()).collect();
-        let (app, router) = pando::server::open(&dir.path().join("data"), "refs/heads/main", &url, urls).unwrap();
+        let (app, router) =
+            pando::server::open(&dir.path().join("data"), "refs/heads/main", &url, urls).unwrap();
         serve_in_background(listener, router);
         let mut caches = Vec::new();
         for (i, (listener, _)) in nodes.into_iter().enumerate() {
             let cache = dir.path().join(format!("express-{i}"));
-            let origin = Origin::Remote { base: url.clone(), client: reqwest::Client::new() };
+            let origin = Origin::Remote {
+                base: url.clone(),
+                client: reqwest::Client::new(),
+            };
             let express = Express::new(origin, Some(cache.clone())).unwrap();
             serve_in_background(listener, express::router(Arc::new(express)));
             caches.push(cache);
         }
-        (Server { url: format!("{url}/repo.git"), app, dir }, caches)
+        (
+            Server {
+                url: format!("{url}/repo.git"),
+                app,
+                dir,
+            },
+            caches,
+        )
     }
 
     /// A fresh working directory for a client.
@@ -68,18 +87,41 @@ impl Server {
 
     /// Number of objects in the pack behind a ref's current version.
     fn pack_objects(&self, refname: &str) -> usize {
-        let v = self.app.meta.lock().unwrap().current(refname).unwrap().unwrap();
-        v.pack.map_or(0, |p| self.app.store.read_idx(&p).unwrap().len())
+        let v = self
+            .app
+            .meta
+            .lock()
+            .unwrap()
+            .current(refname)
+            .unwrap()
+            .unwrap();
+        v.pack
+            .map_or(0, |p| self.app.store.read_idx(&p).unwrap().len())
     }
 
     fn trunk_seq(&self) -> u64 {
-        self.app.meta.lock().unwrap().trunk_head().unwrap().map_or(0, |v| v.seq)
+        self.app
+            .meta
+            .lock()
+            .unwrap()
+            .trunk_head()
+            .unwrap()
+            .map_or(0, |v| v.seq)
     }
 }
 
 fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main", "-c", "protocol.version=2"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "protocol.version=2",
+        ])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -92,7 +134,11 @@ fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
 #[track_caller]
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = git_cmd(dir, args);
-    assert!(out.status.success(), "git {args:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -132,7 +178,11 @@ fn downloaded_pack_names(repo: &Path) -> Vec<String> {
     std::fs::read_dir(repo.join(".git/objects/pack"))
         .unwrap()
         .filter_map(|e| e.unwrap().file_name().into_string().ok())
-        .filter_map(|n| n.strip_prefix("pack-")?.strip_suffix(".pack").map(String::from))
+        .filter_map(|n| {
+            n.strip_prefix("pack-")?
+                .strip_suffix(".pack")
+                .map(String::from)
+        })
         .collect()
 }
 
@@ -148,11 +198,26 @@ fn push_then_clone_and_fetch_inline_and_by_uri() {
     let inline = clone(&s, "inline", false);
     let by_uri = clone(&s, "by-uri", true);
     for repo in [&inline, &by_uri] {
-        assert_eq!(git(repo, &["rev-parse", "HEAD"]), git(&a, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            git(repo, &["rev-parse", "HEAD"]),
+            git(&a, &["rev-parse", "HEAD"])
+        );
         git(repo, &["fsck", "--strict"]);
     }
-    let trunk_pack = s.app.meta.lock().unwrap().trunk_head().unwrap().unwrap().pack.unwrap();
-    assert!(downloaded_pack_names(&by_uri).contains(&trunk_pack.hex()), "URI clone should keep the stored pack");
+    let trunk_pack = s
+        .app
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_head()
+        .unwrap()
+        .unwrap()
+        .pack
+        .unwrap();
+    assert!(
+        downloaded_pack_names(&by_uri).contains(&trunk_pack.hex()),
+        "URI clone should keep the stored pack"
+    );
 
     // Advance trunk, then fetch incrementally both ways.
     git(&a, &["remote", "add", "origin", &s.url]);
@@ -161,15 +226,29 @@ fn push_then_clone_and_fetch_inline_and_by_uri() {
         git(&a, &["push", "-q", "origin", "main"]);
     }
     git(&inline, &["pull", "-q", "--ff-only"]);
-    git(&by_uri, &["-c", "fetch.uriprotocols=http", "pull", "-q", "--ff-only"]);
+    git(
+        &by_uri,
+        &["-c", "fetch.uriprotocols=http", "pull", "-q", "--ff-only"],
+    );
     for repo in [&inline, &by_uri] {
-        assert_eq!(git(repo, &["rev-parse", "HEAD"]), git(&a, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            git(repo, &["rev-parse", "HEAD"]),
+            git(&a, &["rev-parse", "HEAD"])
+        );
         git(repo, &["fsck", "--strict"]);
     }
     // The incremental fetch sent only the three new trunk packs.
     let m = s.app.meta.lock().unwrap();
-    let plan = planner::plan(&m, &[m.trunk_head().unwrap().unwrap().tip], &[m.trunk_version(1).unwrap().unwrap().tip]).unwrap();
-    assert_eq!((plan.trunk_have, plan.trunk_want, plan.packs.len()), (1, 4, 3));
+    let plan = planner::plan(
+        &m,
+        &[m.trunk_head().unwrap().unwrap().tip],
+        &[m.trunk_version(1).unwrap().unwrap().tip],
+    )
+    .unwrap();
+    assert_eq!(
+        (plan.trunk_have, plan.trunk_want, plan.packs.len()),
+        (1, 4, 3)
+    );
 }
 
 #[test]
@@ -188,22 +267,50 @@ fn side_branch_packs_depend_only_on_trunk() {
     // trunk even though the client never saw v5.
     let stale = s.path("stale");
     init(&stale);
-    let v3 = s.app.meta.lock().unwrap().trunk_version(3).unwrap().unwrap().tip;
-    git(&stale, &["fetch", "-q", &s.url, &format!("{v3}:refs/heads/old")]);
+    let v3 = s
+        .app
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(3)
+        .unwrap()
+        .unwrap()
+        .tip;
+    git(
+        &stale,
+        &["fetch", "-q", &s.url, &format!("{v3}:refs/heads/old")],
+    );
     git(&stale, &["checkout", "-qb", "topic", "old"]);
     commit(&stale, "topic", "x");
     git(&stale, &["push", "-q", &s.url, "topic"]);
-    assert_eq!(s.pack_objects("refs/heads/topic"), 3, "commit + tree + blob, nothing from trunk");
+    assert_eq!(
+        s.pack_objects("refs/heads/topic"),
+        3,
+        "commit + tree + blob, nothing from trunk"
+    );
 
-    let topic = s.app.meta.lock().unwrap().current("refs/heads/topic").unwrap().unwrap();
-    assert_eq!(topic.trunk_dep, 5, "pack is recorded against the trunk version at push time");
+    let topic = s
+        .app
+        .meta
+        .lock()
+        .unwrap()
+        .current("refs/heads/topic")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        topic.trunk_dep, 5,
+        "pack is recorded against the trunk version at push time"
+    );
 
     // A reader that wants only the topic gets its pack plus trunk up to its dependency.
     let reader = s.path("reader");
     init(&reader);
     git(&reader, &["fetch", "-q", &s.url, "topic:topic"]);
     git(&reader, &["fsck", "--strict"]);
-    assert_eq!(git(&reader, &["rev-parse", "topic"]), git(&stale, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git(&reader, &["rev-parse", "topic"]),
+        git(&stale, &["rev-parse", "HEAD"])
+    );
 }
 
 #[test]
@@ -221,7 +328,10 @@ fn per_ref_ordering_and_conflicts() {
     commit(&b, "b", "1");
     git(&a, &["push", "-q", "origin", "main"]);
     let err = git_fails(&b, &["push", "origin", "main"]);
-    assert!(err.contains("fetch first") || err.contains("rejected"), "{err}");
+    assert!(
+        err.contains("fetch first") || err.contains("rejected"),
+        "{err}"
+    );
 
     // Side branch: same ref, divergent commits. First wins; second needs -o force.
     git(&a, &["checkout", "-qb", "topic"]);
@@ -283,9 +393,20 @@ fn compaction_keeps_catch_up_fetches_small() {
     }
     assert_eq!(s.trunk_seq(), 20);
     let behind = clone(&s, "behind", false); // will be moved back to trunk v3 below
-    let v3 = s.app.meta.lock().unwrap().trunk_version(3).unwrap().unwrap().tip;
+    let v3 = s
+        .app
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(3)
+        .unwrap()
+        .unwrap()
+        .tip;
     git(&behind, &["reset", "-q", "--hard", &v3.hex()]);
-    git(&behind, &["update-ref", "refs/remotes/origin/main", &v3.hex()]);
+    git(
+        &behind,
+        &["update-ref", "refs/remotes/origin/main", &v3.hex()],
+    );
 
     // 20 versions: five L1 covers and one L2 cover.
     assert_eq!(s.compact(), 6);
@@ -301,11 +422,20 @@ fn compaction_keeps_catch_up_fetches_small() {
     for uris in [false, true] {
         let fresh = clone(&s, if uris { "fresh-uri" } else { "fresh" }, uris);
         git(&fresh, &["fsck", "--strict"]);
-        assert_eq!(git(&fresh, &["rev-parse", "HEAD"]), git(&a, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            git(&fresh, &["rev-parse", "HEAD"]),
+            git(&a, &["rev-parse", "HEAD"])
+        );
     }
-    git(&behind, &["-c", "fetch.uriprotocols=http", "pull", "-q", "--ff-only"]);
+    git(
+        &behind,
+        &["-c", "fetch.uriprotocols=http", "pull", "-q", "--ff-only"],
+    );
     git(&behind, &["fsck", "--strict"]);
-    assert_eq!(git(&behind, &["rev-parse", "HEAD"]), git(&a, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git(&behind, &["rev-parse", "HEAD"]),
+        git(&a, &["rev-parse", "HEAD"])
+    );
 }
 
 #[test]
@@ -339,22 +469,55 @@ fn express_nodes_cache_packs_and_resume_ranges() {
     // Every trunk pack was served by exactly one node, chosen by rendezvous hashing.
     let cached: Vec<Vec<String>> = caches
         .iter()
-        .map(|c| std::fs::read_dir(c).map(|d| d.map(|e| e.unwrap().file_name().into_string().unwrap()).collect()).unwrap_or_default())
+        .map(|c| {
+            std::fs::read_dir(c)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().into_string().unwrap())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
         .collect();
-    let packs: Vec<Oid> = (1..=6).filter_map(|i| s.app.meta.lock().unwrap().trunk_version(i).unwrap().unwrap().pack).collect();
+    let packs: Vec<Oid> = (1..=6)
+        .filter_map(|i| {
+            s.app
+                .meta
+                .lock()
+                .unwrap()
+                .trunk_version(i)
+                .unwrap()
+                .unwrap()
+                .pack
+        })
+        .collect();
     let nodes: Vec<String> = s.app.express.clone();
     for p in &packs {
-        let owner = nodes.iter().position(|n| n == express::pick_node(&nodes, p)).unwrap();
-        assert!(cached[owner].contains(&format!("{p}.pack")), "{p} should be cached on node {owner}");
+        let owner = nodes
+            .iter()
+            .position(|n| n == express::pick_node(&nodes, p))
+            .unwrap();
+        assert!(
+            cached[owner].contains(&format!("{p}.pack")),
+            "{p} should be cached on node {owner}"
+        );
         assert!(!cached[1 - owner].contains(&format!("{p}.pack")));
     }
 
     // Range requests let an interrupted download resume.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let full = std::fs::read(s.app.store.pack_path(&packs[0])).unwrap();
-    let url = format!("{}/pack/{}.pack", express::pick_node(&nodes, &packs[0]), packs[0]);
+    let url = format!(
+        "{}/pack/{}.pack",
+        express::pick_node(&nodes, &packs[0]),
+        packs[0]
+    );
     let tail = rt.block_on(async {
-        let r = reqwest::Client::new().get(&url).header("Range", "bytes=10-").send().await.unwrap();
+        let r = reqwest::Client::new()
+            .get(&url)
+            .header("Range", "bytes=10-")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 206);
         r.bytes().await.unwrap()
     });
@@ -374,13 +537,31 @@ fn side_commits_pushed_with_trunk_stay_off_trunk() {
     commit(&a, "f", "trunk");
     // One push, one pack, two refs.
     git(&a, &["push", "-q", &s.url, "main", "feature"]);
-    let row = s.app.meta.lock().unwrap().commit(&Oid::from_hex(&f1).unwrap()).unwrap().unwrap();
-    assert_eq!(row.trunk_seq, None, "feature commits are not reachable from trunk");
+    let row = s
+        .app
+        .meta
+        .lock()
+        .unwrap()
+        .commit(&Oid::from_hex(&f1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.trunk_seq, None,
+        "feature commits are not reachable from trunk"
+    );
 
     // A client that already has trunk (from elsewhere) fetches a side commit by SHA.
     let b = s.path("b");
     init(&b);
-    git(&b, &["fetch", "-q", a.to_str().unwrap(), "main:refs/heads/elsewhere"]);
+    git(
+        &b,
+        &[
+            "fetch",
+            "-q",
+            a.to_str().unwrap(),
+            "main:refs/heads/elsewhere",
+        ],
+    );
     git(&b, &["fetch", "-q", &s.url, &f1]);
     git(&b, &["cat-file", "-e", &format!("{f1}^{{commit}}")]);
     git(&b, &["fsck", "--strict"]);
@@ -398,11 +579,48 @@ fn shallow_clones_can_push() {
         git(&a, &["push", "-q", "origin", "main"]);
     }
     let shallow = s.path("shallow");
-    git(s.dir.path(), &["clone", "-q", "--depth", "1", &format!("file://{}", a.display()), shallow.to_str().unwrap()]);
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", a.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
     git(&shallow, &["remote", "set-url", "origin", &s.url]);
     commit(&shallow, "f", "from shallow");
     git(&shallow, &["push", "-q", "origin", "HEAD:main"]);
     let full = clone(&s, "full", false);
     git(&full, &["fsck", "--strict"]);
-    assert_eq!(git(&full, &["rev-parse", "HEAD"]), git(&shallow, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git(&full, &["rev-parse", "HEAD"]),
+        git(&shallow, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn clone_with_many_branches_sends_gzipped_request() {
+    // Git gzips fetch requests over 1 KiB; 40 wants is well past that.
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "base");
+    let mut args = vec![
+        "push".to_string(),
+        "-q".into(),
+        s.url.clone(),
+        "main".into(),
+    ];
+    for i in 0..40 {
+        git(&a, &["checkout", "-qb", &format!("b{i}"), "main"]);
+        commit(&a, "f", &i.to_string());
+        args.push(format!("b{i}"));
+    }
+    git(&a, &args.iter().map(String::as_str).collect::<Vec<_>>());
+    let b = clone(&s, "b", false);
+    assert_eq!(git(&b, &["branch", "-r"]).lines().count(), 42); // 40 + main + HEAD
+    git(&b, &["fsck", "--strict"]);
 }

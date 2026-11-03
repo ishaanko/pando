@@ -82,7 +82,8 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
                     p.trunk_want = p.trunk_want.max(seq);
                     continue;
                 }
-                meta.version(row.version)?.ok_or(PlanError::NotOurRef(*want))?
+                meta.version(row.version)?
+                    .ok_or(PlanError::NotOurRef(*want))?
             }
         };
         if meta.is_trunk(&version.refname) {
@@ -125,7 +126,9 @@ fn tips_reachable_from(meta: &Meta, have: &Oid) -> Result<(bool, Vec<Version>), 
         let hit_trunk = versions.iter().any(|v| meta.is_trunk(&v.refname));
         known |= !versions.is_empty();
         tips.extend(versions);
-        let Some(row) = meta.commit(&oid)? else { continue };
+        let Some(row) = meta.commit(&oid)? else {
+            continue;
+        };
         known = true;
         if hit_trunk {
             continue;
@@ -147,14 +150,18 @@ pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<Vec<Oid>, PlanEr
     'outer: while at < want {
         for level in (1..=MAX_LEVEL).rev() {
             let s = span(level);
-            if at.is_multiple_of(s) && at + s <= want
-                && let Some(pack) = meta.cover(level, at + 1)? {
-                    packs.extend(pack);
-                    at += s;
-                    continue 'outer;
-                }
+            if at.is_multiple_of(s)
+                && at + s <= want
+                && let Some(pack) = meta.cover(level, at + 1)?
+            {
+                packs.extend(pack);
+                at += s;
+                continue 'outer;
+            }
         }
-        let v = meta.trunk_version(at + 1)?.ok_or_else(|| PlanError::NotOurRef(Oid::ZERO))?;
+        let v = meta
+            .trunk_version(at + 1)?
+            .ok_or_else(|| PlanError::NotOurRef(Oid::ZERO))?;
         packs.extend(v.pack);
         at += 1;
     }

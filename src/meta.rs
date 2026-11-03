@@ -71,7 +71,9 @@ const VERSION_COLS: &str = "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.pe
 
 fn oid_col(row: &Row, i: usize) -> rusqlite::Result<Oid> {
     let s: String = row.get(i)?;
-    Oid::from_hex(&s).ok_or_else(|| rusqlite::Error::InvalidColumnType(i, "oid".into(), rusqlite::types::Type::Text))
+    Oid::from_hex(&s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(i, "oid".into(), rusqlite::types::Type::Text)
+    })
 }
 
 fn opt_oid_col(row: &Row, i: usize) -> rusqlite::Result<Option<Oid>> {
@@ -126,7 +128,10 @@ impl Meta {
                PRIMARY KEY (level, start)
              );",
         )?;
-        Ok(Meta { conn, trunk: trunk.to_string() })
+        Ok(Meta {
+            conn,
+            trunk: trunk.to_string(),
+        })
     }
 
     pub fn is_trunk(&self, refname: &str) -> bool {
@@ -183,14 +188,19 @@ impl Meta {
     }
 
     pub fn versions_with_tip(&self, tip: &Oid) -> rusqlite::Result<Vec<Version>> {
-        let mut stmt =
-            self.conn.prepare_cached(&format!("SELECT {VERSION_COLS} FROM versions v WHERE v.tip = ?1 ORDER BY v.id"))?;
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {VERSION_COLS} FROM versions v WHERE v.tip = ?1 ORDER BY v.id"
+        ))?;
         stmt.query_map([tip.hex()], version_row)?.collect()
     }
 
     pub fn version(&self, id: i64) -> rusqlite::Result<Option<Version>> {
         self.conn
-            .query_row(&format!("SELECT {VERSION_COLS} FROM versions v WHERE v.id = ?1"), [id], version_row)
+            .query_row(
+                &format!("SELECT {VERSION_COLS} FROM versions v WHERE v.id = ?1"),
+                [id],
+                version_row,
+            )
             .optional()
     }
 
@@ -202,7 +212,10 @@ impl Meta {
                 Ok(CommitRow {
                     version: row.get(0)?,
                     trunk_seq: row.get(1)?,
-                    parents: parents.split_whitespace().filter_map(Oid::from_hex).collect(),
+                    parents: parents
+                        .split_whitespace()
+                        .filter_map(Oid::from_hex)
+                        .collect(),
                 })
             })
             .optional()
@@ -212,12 +225,22 @@ impl Meta {
     /// pointer, append the new version, and index its commits. All-or-nothing: if any
     /// pointer moved since the caller looked, nothing is written and the reason is
     /// returned.
-    pub fn update_all(&mut self, updates: &[&RefUpdate]) -> rusqlite::Result<Result<Vec<Option<Version>>, String>> {
-        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    pub fn update_all(
+        &mut self,
+        updates: &[&RefUpdate],
+    ) -> rusqlite::Result<Result<Vec<Option<Version>>, String>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut out = Vec::with_capacity(updates.len());
         for u in updates {
-            let current: Option<i64> =
-                tx.query_row("SELECT version FROM refs WHERE name = ?1", [u.refname], |r| r.get(0)).optional()?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM refs WHERE name = ?1",
+                    [u.refname],
+                    |r| r.get(0),
+                )
+                .optional()?;
             if current != u.expect {
                 return Ok(Err("ref moved during push (retry)".into()));
             }
@@ -280,7 +303,11 @@ impl Meta {
     }
 
     pub fn last_cover_start(&self, level: u32) -> rusqlite::Result<Option<u64>> {
-        self.conn.query_row("SELECT MAX(start) FROM covers WHERE level = ?1", [level], |r| r.get(0))
+        self.conn.query_row(
+            "SELECT MAX(start) FROM covers WHERE level = ?1",
+            [level],
+            |r| r.get(0),
+        )
     }
 
     pub fn put_cover(&self, level: u32, start: u64, pack: Option<Oid>) -> rusqlite::Result<()> {

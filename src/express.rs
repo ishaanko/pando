@@ -28,7 +28,10 @@ pub enum Origin {
     /// Read packs straight from a blob store on this machine.
     Local(Arc<BlobStore>),
     /// Fill from another node's `/pack/` endpoint.
-    Remote { base: String, client: reqwest::Client },
+    Remote {
+        base: String,
+        client: reqwest::Client,
+    },
 }
 
 pub struct Express {
@@ -43,7 +46,11 @@ impl Express {
         if let Some(dir) = &cache {
             std::fs::create_dir_all(dir)?;
         }
-        Ok(Express { origin, cache, fills: Mutex::new(HashMap::new()) })
+        Ok(Express {
+            origin,
+            cache,
+            fills: Mutex::new(HashMap::new()),
+        })
     }
 
     /// A local path holding the pack, filling the cache if needed.
@@ -60,7 +67,11 @@ impl Express {
         }
         let gate = self.fills.lock().unwrap().entry(hash).or_default().clone();
         let _guard = gate.lock().await;
-        let filled = if path.exists() { Ok(true) } else { self.fill(hash, &path).await };
+        let filled = if path.exists() {
+            Ok(true)
+        } else {
+            self.fill(hash, &path).await
+        };
         self.fills.lock().unwrap().remove(&hash);
         Ok(filled?.then_some(path))
     }
@@ -84,12 +95,17 @@ impl Express {
         };
         match &self.origin {
             Origin::Local(store) => {
-                let Ok(bytes) = tokio::fs::read(store.pack_path(&hash)).await else { return Ok(false) };
+                let Ok(bytes) = tokio::fs::read(store.pack_path(&hash)).await else {
+                    return Ok(false);
+                };
                 put(&bytes, &mut sha);
                 file.write_all(&bytes).await?;
             }
             Origin::Remote { base, client } => {
-                let resp = client.get(format!("{base}/pack/{hash}.pack")).send().await?;
+                let resp = client
+                    .get(format!("{base}/pack/{hash}.pack"))
+                    .send()
+                    .await?;
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(false);
                 }
@@ -111,12 +127,18 @@ impl Express {
 }
 
 pub fn router(express: Arc<Express>) -> Router {
-    Router::new().route("/pack/{file}", get(get_pack)).with_state(express)
+    Router::new()
+        .route("/pack/{file}", get(get_pack))
+        .with_state(express)
 }
 
 /// GET /pack/<hash>.pack, with `Range: bytes=N-` support so interrupted downloads
 /// can resume.
-async fn get_pack(State(x): State<Arc<Express>>, Path(file): Path<String>, headers: HeaderMap) -> Response {
+async fn get_pack(
+    State(x): State<Arc<Express>>,
+    Path(file): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let Some(hash) = file.strip_suffix(".pack").and_then(Oid::from_hex) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -155,12 +177,17 @@ async fn serve_file(path: PathBuf, headers: &HeaderMap) -> std::io::Result<Respo
         file.seek(SeekFrom::Start(start)).await?;
         resp = resp
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_RANGE, format!("bytes {start}-{}/{len}", len - 1))
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{}/{len}", len - 1),
+            )
             .header(header::CONTENT_LENGTH, len - start);
     } else {
         resp = resp.header(header::CONTENT_LENGTH, len);
     }
-    Ok(resp.body(Body::from_stream(ReaderStream::new(file))).unwrap())
+    Ok(resp
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap())
 }
 
 /// Rendezvous (highest random weight) hashing: the node that scores highest for a

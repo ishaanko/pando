@@ -55,7 +55,12 @@ pub fn read<R: BufRead + ?Sized>(r: &mut R) -> io::Result<Option<Packet>> {
         0 => Packet::Flush,
         1 => Packet::Delim,
         2 => Packet::ResponseEnd,
-        3 => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad pkt-line length 3")),
+        3 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad pkt-line length 3",
+            ));
+        }
         n => {
             let mut buf = vec![0u8; n - 4];
             r.read_exact(&mut buf)?;
@@ -90,7 +95,10 @@ pub struct SidebandWriter<W: Write> {
 
 impl<W: Write> SidebandWriter<W> {
     pub fn new(inner: W) -> Self {
-        SidebandWriter { inner, buf: Vec::with_capacity(MAX_PAYLOAD) }
+        SidebandWriter {
+            inner,
+            buf: Vec::with_capacity(MAX_PAYLOAD),
+        }
     }
 
     pub fn into_inner(mut self) -> io::Result<W> {

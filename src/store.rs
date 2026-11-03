@@ -19,13 +19,18 @@ impl BlobStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("tmp"))?;
-        Ok(BlobStore { root, staged: AtomicU64::new(0) })
+        Ok(BlobStore {
+            root,
+            staged: AtomicU64::new(0),
+        })
     }
 
     /// A fresh path to stream an incoming pack into before it is validated.
     pub fn staging_path(&self) -> PathBuf {
         let n = self.staged.fetch_add(1, Ordering::Relaxed);
-        self.root.join("tmp").join(format!("incoming-{}-{n}", std::process::id()))
+        self.root
+            .join("tmp")
+            .join(format!("incoming-{}-{n}", std::process::id()))
     }
 
     pub fn pack_path(&self, hash: &Oid) -> PathBuf {

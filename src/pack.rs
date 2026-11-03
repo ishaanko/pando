@@ -84,7 +84,9 @@ impl ParsedPack {
         let mut stack = vec![start];
         let mut out = Vec::new();
         while let Some(oid) = stack.pop() {
-            let Some(parents) = self.commits.get(&oid) else { continue };
+            let Some(parents) = self.commits.get(&oid) else {
+                continue;
+            };
             out.push((oid, parents.clone()));
             stack.extend(parents.iter().filter(|p| seen.insert(**p)));
         }
@@ -108,7 +110,11 @@ enum Base {
 
 fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
     let mut pos = offset;
-    let byte = |pos: usize| buf.get(pos).copied().ok_or_else(|| bad("truncated object header"));
+    let byte = |pos: usize| {
+        buf.get(pos)
+            .copied()
+            .ok_or_else(|| bad("truncated object header"))
+    };
     let mut c = byte(pos)?;
     pos += 1;
     let code = (c >> 4) & 7;
@@ -117,7 +123,9 @@ fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
     while c & 0x80 != 0 {
         c = byte(pos)?;
         pos += 1;
-        size |= ((c & 0x7f) as usize).checked_shl(shift).ok_or_else(|| bad("size overflow"))?;
+        size |= ((c & 0x7f) as usize)
+            .checked_shl(shift)
+            .ok_or_else(|| bad("size overflow"))?;
         shift += 7;
     }
     let base = match code {
@@ -135,7 +143,12 @@ fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
         1..=4 => Base::None,
         _ => return Err(bad(format!("unknown object type {code}"))),
     };
-    Ok(Header { code, size, len: pos - offset, base })
+    Ok(Header {
+        code,
+        size,
+        len: pos - offset,
+        base,
+    })
 }
 
 /// Inflate one zlib stream that must produce exactly `size` bytes. Returns the data and
@@ -155,7 +168,9 @@ fn inflate(input: &[u8], size: usize) -> Result<(Vec<u8>, usize), PackError> {
         match status {
             Status::StreamEnd => break,
             _ if out.len() > size => return Err(bad("object larger than its header")),
-            _ if (z.total_in(), z.total_out()) == before => return Err(bad("truncated zlib stream")),
+            _ if (z.total_in(), z.total_out()) == before => {
+                return Err(bad("truncated zlib stream"));
+            }
             _ => out.reserve((size + 1 - out.len()).min(MAX_PREALLOC)),
         }
     }
@@ -201,7 +216,12 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
         let h = read_header(body, pos)?;
         budget = budget.checked_sub(h.size).ok_or(PackError::TooLarge)?;
         let (data, used) = inflate(&body[pos + h.len..], h.size)?;
-        raws.push(Raw { offset: pos as u64, kind: Kind::from_code(h.code), base: h.base, data });
+        raws.push(Raw {
+            offset: pos as u64,
+            kind: Kind::from_code(h.code),
+            base: h.base,
+            data,
+        });
         pos += h.len + used;
     }
     if pos != body_end {
@@ -209,7 +229,11 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     }
 
     // Pass 2: resolve deltas breadth-first from their bases.
-    let by_offset: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, r)| (r.offset, i)).collect();
+    let by_offset: HashMap<u64, usize> = raws
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.offset, i))
+        .collect();
     let mut children_by_index: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut children_by_oid: HashMap<Oid, Vec<usize>> = HashMap::new();
     let mut resolved: Vec<Option<(Kind, Oid)>> = vec![None; raws.len()];
@@ -223,7 +247,9 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
                 queue.push(i);
             }
             Base::Offset(off) => {
-                let base = *by_offset.get(&off).ok_or_else(|| bad("delta base offset is not an object"))?;
+                let base = *by_offset
+                    .get(&off)
+                    .ok_or_else(|| bad("delta base offset is not an object"))?;
                 children_by_index.entry(base).or_default().push(i);
             }
             Base::Oid(oid) => children_by_oid.entry(oid).or_default().push(i),
@@ -260,19 +286,30 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     let mut tags = HashMap::new();
     for (i, r) in raws.iter().enumerate() {
         let (kind, oid) = resolved[i].unwrap();
-        entries.push(IdxEntry { offset: r.offset, oid });
+        entries.push(IdxEntry {
+            offset: r.offset,
+            oid,
+        });
         let data = full[i].as_deref().unwrap();
         match kind {
             Kind::Commit => {
                 commits.insert(oid, commit_parents(data));
             }
             Kind::Tag => {
-                tags.insert(oid, tag_target(data).ok_or_else(|| bad("tag without object line"))?);
+                tags.insert(
+                    oid,
+                    tag_target(data).ok_or_else(|| bad("tag without object line"))?,
+                );
             }
             _ => {}
         }
     }
-    Ok(ParsedPack { hash, entries, commits, tags })
+    Ok(ParsedPack {
+        hash,
+        entries,
+        commits,
+        tags,
+    })
 }
 
 /// Apply a Git delta (copy/insert instruction stream) to `base`.
@@ -281,9 +318,13 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
     let varint = |pos: &mut usize| -> Result<usize, PackError> {
         let (mut v, mut shift) = (0usize, 0);
         loop {
-            let c = *delta.get(*pos).ok_or_else(|| bad("truncated delta header"))?;
+            let c = *delta
+                .get(*pos)
+                .ok_or_else(|| bad("truncated delta header"))?;
             *pos += 1;
-            v |= ((c & 0x7f) as usize).checked_shl(shift).ok_or_else(|| bad("delta size overflow"))?;
+            v |= ((c & 0x7f) as usize)
+                .checked_shl(shift)
+                .ok_or_else(|| bad("delta size overflow"))?;
             shift += 7;
             if c & 0x80 == 0 {
                 return Ok(v);
@@ -319,13 +360,17 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
                 0 => 0x10000,
                 n => n,
             };
-            let src = base.get(off..off + len).ok_or_else(|| bad("delta copy out of range"))?;
+            let src = base
+                .get(off..off + len)
+                .ok_or_else(|| bad("delta copy out of range"))?;
             if out.len() + len > dst_len {
                 return Err(bad("delta result larger than declared"));
             }
             out.extend_from_slice(src);
         } else if cmd != 0 {
-            let lit = delta.get(pos..pos + cmd as usize).ok_or_else(|| bad("truncated insert"))?;
+            let lit = delta
+                .get(pos..pos + cmd as usize)
+                .ok_or_else(|| bad("truncated insert"))?;
             out.extend_from_slice(lit);
             pos += cmd as usize;
         } else {
@@ -361,7 +406,9 @@ pub fn decode_idx(buf: &[u8]) -> io::Result<Vec<IdxEntry>> {
         return Err(invalid());
     }
     Ok(body
-        .as_chunks::<28>().0.iter()
+        .as_chunks::<28>()
+        .0
+        .iter()
         .map(|c| IdxEntry {
             offset: u64::from_be_bytes(c[..8].try_into().unwrap()),
             oid: Oid::from_slice(&c[8..]).unwrap(),
@@ -379,7 +426,11 @@ pub struct HashingWriter<W: Write> {
 
 impl<W: Write> HashingWriter<W> {
     pub fn new(inner: W) -> Self {
-        HashingWriter { inner, sha: Sha1::new(), written: 0 }
+        HashingWriter {
+            inner,
+            sha: Sha1::new(),
+            written: 0,
+        }
     }
 
     /// Write the trailer and return the pack hash plus the inner writer.
@@ -453,7 +504,10 @@ pub fn empty_pack() -> Vec<u8> {
 /// against the base's new position (which is always earlier, since input order is
 /// preserved); ref deltas and whole objects are copied byte for byte. Used for
 /// compaction covers and for inline fetch responses to clients without packfile-uris.
-pub fn concat<W: Write>(packs: &[(&[u8], &[IdxEntry])], out: W) -> io::Result<(Oid, Vec<IdxEntry>, W)> {
+pub fn concat<W: Write>(
+    packs: &[(&[u8], &[IdxEntry])],
+    out: W,
+) -> io::Result<(Oid, Vec<IdxEntry>, W)> {
     let mut seen = HashSet::new();
     let keep: Vec<Vec<bool>> = packs
         .iter()
@@ -481,7 +535,9 @@ pub fn concat<W: Write>(packs: &[(&[u8], &[IdxEntry])], out: W) -> io::Result<(O
             head.clear();
             match h.base {
                 Base::Offset(base_off) => {
-                    let base_oid = oid_at.get(&base_off).ok_or_else(|| io::Error::other("dangling ofs-delta"))?;
+                    let base_oid = oid_at
+                        .get(&base_off)
+                        .ok_or_else(|| io::Error::other("dangling ofs-delta"))?;
                     let base_new = new_offset[base_oid];
                     encode_type_size(OFS_DELTA, h.size as u64, &mut head);
                     encode_ofs(here - base_new, &mut head);
@@ -491,7 +547,10 @@ pub fn concat<W: Write>(packs: &[(&[u8], &[IdxEntry])], out: W) -> io::Result<(O
             w.write_all(&head)?;
             w.write_all(data)?;
             new_offset.insert(e.oid, here);
-            entries.push(IdxEntry { offset: here, oid: e.oid });
+            entries.push(IdxEntry {
+                offset: here,
+                oid: e.oid,
+            });
         }
     }
     let (hash, inner) = w.finish()?;
