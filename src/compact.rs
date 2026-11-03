@@ -3,7 +3,8 @@
 //! Every trunk push leaves an L0 pack. Once `FANOUT` consecutive, aligned L0 packs
 //! exist, they are spliced into one L1 cover; `FANOUT` L1 covers make an L2, and so on
 //! up to `MAX_LEVEL`. Lower levels are never deleted: every level stays servable, and
-//! the planner picks whichever mix covers a client's range in the fewest packs.
+//! the planner picks whichever mix covers a client's range in the fewest packs. Covers
+//! are only built inside the current trunk epoch.
 
 use crate::meta::{Cover, Meta};
 use crate::object::Oid;
@@ -15,16 +16,22 @@ use std::sync::Mutex;
 /// Build every cover that can be built right now. Returns how many were written.
 /// Metadata is locked only for short reads and writes; splicing happens outside.
 pub fn run(meta: &Mutex<Meta>, store: &BlobStore) -> anyhow::Result<usize> {
-    let head = meta.lock().unwrap().trunk_head()?.map_or(0, |v| v.seq);
+    let (head, epoch) = {
+        let m = meta.lock().unwrap();
+        (m.trunk_head()?.map_or(0, |v| v.seq), m.epoch_start)
+    };
     let mut written = 0;
     for level in 1..=MAX_LEVEL {
         let s = span(level);
         let sub = span(level - 1);
+        // Covers stay inside the current epoch: the first aligned start at or after it.
+        let first = (epoch - 1).div_ceil(s) * s + 1;
         let mut start = meta
             .lock()
             .unwrap()
             .last_cover_start(level)?
-            .map_or(1, |last| last + s);
+            .map_or(1, |last| last + s)
+            .max(first);
         while start + s - 1 <= head {
             let mut parts = Vec::new();
             let mut side = Vec::new();

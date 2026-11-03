@@ -1344,3 +1344,116 @@ fn pack_urls_are_signed_when_auth_is_on() {
         401
     );
 }
+
+#[test]
+fn force_pushing_trunk_starts_a_new_epoch() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..6 {
+        commit(&a, "f", &format!("v{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    s.compact();
+    // A branch that depends on trunk position 3.
+    git(&a, &["checkout", "-qb", "feature", "HEAD~3"]);
+    commit(&a, "g", "feature");
+    git(&a, &["push", "-q", "origin", "feature"]);
+    git(&a, &["checkout", "-q", "main"]);
+    let b = clone(&s, "b", false);
+    let old_tip = git(&a, &["rev-parse", "HEAD"]);
+
+    // Drop the last two commits and replace them.
+    git(&a, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&a, "f", "rewritten");
+    git_fails(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["push", "-qf", "origin", "main"]);
+    let epoch = s.repo().meta.lock().unwrap().epoch_start;
+    assert_eq!(epoch, 7);
+
+    for (name, uris) in [("c1", false), ("c2", true)] {
+        let c = clone(&s, name, uris);
+        git(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "HEAD"), 5);
+        assert_eq!(count(&c, "origin/feature"), 4);
+    }
+    // An old clone sees the forced update.
+    git(&b, &["fetch", "-q"]);
+    git(&b, &["fsck", "--no-progress"]);
+    assert_eq!(
+        git(&b, &["rev-parse", "origin/main"]),
+        git(&a, &["rev-parse", "HEAD"])
+    );
+
+    // Fast-forwards continue in the new epoch, and compaction stays inside it.
+    for i in 0..5 {
+        commit(&a, "f", &format!("after{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    s.compact();
+    let c = clone(&s, "c3", true);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "HEAD"), 10);
+    git(&b, &["fetch", "-q"]);
+    git(&b, &["fsck", "--no-progress"]);
+
+    // Force trunk back to the old tip without sending objects, then fast-forward it
+    // from a clone that still has the old history.
+    git(
+        &b,
+        &[
+            "push",
+            "-qf",
+            "origin",
+            &format!("{old_tip}:refs/heads/main"),
+        ],
+    );
+    git(&b, &["checkout", "-q", "--detach", &old_tip]);
+    commit(&b, "h", "on old tip");
+    git(&b, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    let c = clone(&s, "c4", false);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "HEAD"), 7);
+    git(&a, &["fetch", "-q"]);
+    git(&a, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn default_branch_can_change() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..3 {
+        commit(&a, "f", &format!("v{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    git(&a, &["checkout", "-qb", "next"]);
+    for i in 0..3 {
+        commit(&a, "n", &format!("n{i}"));
+        git(&a, &["push", "-q", "origin", "next"]);
+    }
+    let r = s.repo();
+    r.meta
+        .lock()
+        .unwrap()
+        .set_trunk("refs/heads/next")
+        .unwrap()
+        .unwrap();
+    let c = clone(&s, "c", true);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(git(&c, &["symbolic-ref", "HEAD"]), "refs/heads/next");
+    assert_eq!(count(&c, "HEAD"), 6);
+    assert_eq!(count(&c, "origin/main"), 3);
+    // Both keep working: next fast-forwards as trunk, main as a branch.
+    commit(&a, "n", "n3");
+    git(&a, &["push", "-q", "origin", "next"]);
+    git(&a, &["checkout", "-q", "main"]);
+    commit(&a, "f", "v3");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&c, &["fetch", "-q"]);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "origin/next"), 7);
+    assert_eq!(count(&c, "origin/main"), 4);
+}

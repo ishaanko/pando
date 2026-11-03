@@ -271,17 +271,20 @@ fn receive_pack_data(store: &BlobStore, r: &mut dyn Read) -> anyhow::Result<Pars
 struct PlannedUpdate {
     expect: Option<i64>,
     deps: Deps,
+    /// A trunk update that is not a fast-forward: trunk starts a new epoch.
+    rewrite: bool,
 }
 
 /// Where an object outside the pack lives, as a dependency.
 fn resolve(meta: &Meta, oid: &Oid) -> Result<Deps, String> {
     match meta.object(oid).map_err(db)? {
         Some(row) => Ok(match row.trunk_seq {
-            Some(seq) => Deps {
+            Some(seq) if meta.in_epoch(seq) => Deps {
                 trunk: seq,
                 packs: vec![],
             },
-            None => Deps {
+            // Off trunk, or on an earlier epoch's trunk: the pack that holds it.
+            _ => Deps {
                 trunk: 0,
                 packs: vec![row.pack],
             },
@@ -338,6 +341,7 @@ fn plan_updates(
                 return Ok(PlannedUpdate {
                     expect,
                     deps: Deps::default(),
+                    rewrite: false,
                 });
             }
 
@@ -361,14 +365,15 @@ fn plan_updates(
                     return Err(format!("conflicts with existing ref {other}"));
                 }
             }
+            let mut rewrite = false;
             if is_trunk {
                 if stale(&current) {
                     return Err("fetch first".into());
                 }
-                if let Some(cur) = &current
-                    && !is_ancestor(meta, pack, cur, &c.new).map_err(db)?
-                {
-                    return Err("non-fast-forward (trunk only moves forward)".into());
+                // A forced update (the client only sends one when forced) rewrites
+                // trunk history.
+                if let Some(cur) = &current {
+                    rewrite = !is_ancestor(meta, pack, cur, &c.new).map_err(db)?;
                 }
             } else if advertise == Advertise::All || current.is_none() {
                 if stale(&current) {
@@ -388,7 +393,11 @@ fn plan_updates(
                     return Err("non-fast-forward (use git push -o force to overwrite)".into());
                 }
             }
-            Ok(PlannedUpdate { expect, deps })
+            Ok(PlannedUpdate {
+                expect,
+                deps,
+                rewrite,
+            })
         })());
     }
     Ok((pack_deps, out))
@@ -471,6 +480,7 @@ fn apply(
                     peeled: *peeled,
                     reached,
                     reached_packs,
+                    rewrite: plan.rewrite,
                 }),
             })
         })

@@ -8,6 +8,8 @@
 //!   them is covered greedily with compaction covers (L4 down to L0), which is the
 //!   skip-list walk that keeps a catch-up fetch to O(log Δ) packs.
 //! - Any other ref version is one pack plus its trunk dependency.
+//! - After trunk is rewritten, positions from earlier epochs are served as every chain
+//!   version up to that position (see `meta.rs`).
 //!
 //! Packs may contain objects the client already has. That is the trade: the same
 //! bytes are served to every reader, so they can be cached like a CDN.
@@ -61,7 +63,7 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         p.common.push(*have);
         for v in tips {
             p.cut_found = true;
-            if meta.is_trunk(&v.refname) {
+            if v.on_trunk {
                 p.trunk_have = p.trunk_have.max(v.seq);
             } else {
                 had_versions.insert(v.id);
@@ -72,41 +74,50 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         }
     }
 
-    // Side packs still to include, and trunk coverage so far.
+    // Side packs still to include, and the trunk ranges they need: `trunk_want` in
+    // the current epoch, `old_want` for positions of earlier epochs.
     let mut work: Vec<Oid> = Vec::new();
+    let mut old_want = 0;
+    let need = |p: &mut Plan, old_want: &mut u64, trunk: u64| {
+        if meta.in_epoch(trunk) {
+            p.trunk_want = p.trunk_want.max(trunk);
+        } else {
+            *old_want = (*old_want).max(trunk);
+        }
+    };
     for want in wants {
         if have_set.contains(want) {
             continue;
         }
-        let version = match best_version(meta, meta.versions_with_tip(want)?) {
+        let version = match best_version(meta.versions_with_tip(want)?) {
             Some(v) => v,
             None => {
-                // Not a tip: an older commit. Serve whichever version stored it.
-                let row = meta.commit(want)?.ok_or(PlanError::NotOurRef(*want))?;
-                if let Some(seq) = row.trunk_seq {
-                    p.trunk_want = p.trunk_want.max(seq);
-                    continue;
+                // Not a tip: an older commit, or any other object. Serve whichever
+                // pack stored it.
+                let row = meta.object(want)?.ok_or(PlanError::NotOurRef(*want))?;
+                match row.trunk_seq {
+                    Some(seq) if meta.in_epoch(seq) => p.trunk_want = p.trunk_want.max(seq),
+                    // Its pack and that pack's dependencies.
+                    _ => work.push(row.pack),
                 }
-                // Stored but not reachable from trunk: its pack and that pack's
-                // dependencies, even if the pack belongs to a trunk version.
-                work.push(row.pack);
                 continue;
             }
         };
-        if meta.is_trunk(&version.refname) {
+        if version.on_trunk {
             p.trunk_want = p.trunk_want.max(version.seq);
         } else if !had_versions.contains(&version.id) {
-            p.trunk_want = p.trunk_want.max(version.deps.trunk);
+            need(&mut p, &mut old_want, version.deps.trunk);
             work.extend(version.pack);
             work.extend(version.deps.packs);
         }
     }
 
-    // Follow dependencies to a fixed point: side packs can raise the trunk range, and
+    // Follow dependencies to a fixed point: side packs can raise the trunk ranges, and
     // newly covered trunk versions can need side packs.
     let mut side = Vec::new();
     let mut seen = HashSet::new();
-    let mut covered = p.trunk_have;
+    let mut covered = p.trunk_have.max(meta.epoch_start - 1);
+    let mut old_covered = 0;
     loop {
         while let Some(pack) = work.pop() {
             if had_packs.contains(&pack) || !seen.insert(pack) {
@@ -114,29 +125,40 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
             }
             side.push(pack);
             if let Some(deps) = meta.pack_deps(&pack)? {
-                p.trunk_want = p.trunk_want.max(deps.trunk);
+                need(&mut p, &mut old_want, deps.trunk);
                 work.extend(deps.packs);
             }
         }
-        if p.trunk_want <= covered {
+        if p.trunk_want > covered {
+            if covered < meta.epoch_start {
+                // The epoch's first version may depend on earlier epochs.
+                if let Some(first) = meta.trunk_version(meta.epoch_start)? {
+                    need(&mut p, &mut old_want, first.deps.trunk);
+                }
+            }
+            let (packs, deps) = cover_trunk(meta, covered, p.trunk_want)?;
+            p.packs.extend(packs);
+            work.extend(deps);
+            covered = p.trunk_want;
+        } else if old_want > old_covered {
+            // Earlier epochs: everything up to the needed position, a superset.
+            let (packs, deps) = cover_trunk(meta, old_covered, old_want)?;
+            p.packs.extend(packs);
+            work.extend(deps);
+            old_covered = old_want;
+        } else {
             break;
         }
-        let (packs, deps) = cover_trunk(meta, covered, p.trunk_want)?;
-        p.packs.extend(packs);
-        work.extend(deps);
-        covered = p.trunk_want;
     }
-    for pack in side {
-        if !p.packs.contains(&pack) {
-            p.packs.push(pack);
-        }
-    }
+    p.packs.extend(side);
+    let mut unique = HashSet::new();
+    p.packs.retain(|pack| unique.insert(*pack));
     Ok(p)
 }
 
-/// Prefer a trunk version (no extra pack), otherwise the newest version.
-fn best_version(meta: &Meta, mut vs: Vec<Version>) -> Option<Version> {
-    if let Some(i) = vs.iter().position(|v| meta.is_trunk(&v.refname)) {
+/// Prefer a current trunk version (no extra pack), otherwise the newest version.
+fn best_version(mut vs: Vec<Version>) -> Option<Version> {
+    if let Some(i) = vs.iter().position(|v| v.on_trunk) {
         return Some(vs.swap_remove(i));
     }
     vs.pop()
@@ -144,7 +166,7 @@ fn best_version(meta: &Meta, mut vs: Vec<Version>) -> Option<Version> {
 
 /// Is `have` a commit we know, and which ref version tips does the client therefore
 /// have? Walks parents a bounded distance; reaching a trunk tip stops that path,
-/// since trunk tips imply every earlier trunk version.
+/// since trunk tips imply every earlier trunk version of their epoch.
 fn tips_reachable_from(meta: &Meta, have: &Oid) -> Result<(bool, Vec<Version>), PlanError> {
     let mut tips = Vec::new();
     let mut known = false;
@@ -152,7 +174,7 @@ fn tips_reachable_from(meta: &Meta, have: &Oid) -> Result<(bool, Vec<Version>), 
     let mut queue = VecDeque::from([*have]);
     while let Some(oid) = queue.pop_front() {
         let versions = meta.versions_with_tip(&oid)?;
-        let hit_trunk = versions.iter().any(|v| meta.is_trunk(&v.refname));
+        let hit_trunk = versions.iter().any(|v| v.on_trunk);
         known |= !versions.is_empty();
         tips.extend(versions);
         let Some(row) = meta.commit(&oid)? else {
