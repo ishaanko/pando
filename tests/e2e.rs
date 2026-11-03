@@ -1,5 +1,6 @@
 //! End-to-end tests: a real `git` client against an in-process Pando server.
 
+use pando::express::{self, Express, Origin};
 use pando::object::Oid;
 use pando::planner;
 use pando::server::App;
@@ -14,21 +15,46 @@ struct Server {
     dir: TempDir,
 }
 
+fn bind() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+fn serve_in_background(listener: std::net::TcpListener, router: axum::Router) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, router).await.unwrap();
+        });
+    });
+}
+
 impl Server {
     fn start() -> Server {
+        Server::start_with_express(0).0
+    }
+
+    /// Start Pando plus `n` Express nodes that fill their caches from Pando.
+    /// Returns the Express cache directories.
+    fn start_with_express(n: usize) -> (Server, Vec<PathBuf>) {
         let dir = TempDir::new().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let (app, router) = pando::server::open(&dir.path().join("data"), "refs/heads/main", &url, Vec::new()).unwrap();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                axum::serve(listener, router).await.unwrap();
-            });
-        });
-        Server { url: format!("{url}/repo.git"), app, dir }
+        let (listener, url) = bind();
+        let nodes: Vec<_> = (0..n).map(|_| bind()).collect();
+        let urls = nodes.iter().map(|(_, u)| u.clone()).collect();
+        let (app, router) = pando::server::open(&dir.path().join("data"), "refs/heads/main", &url, urls).unwrap();
+        serve_in_background(listener, router);
+        let mut caches = Vec::new();
+        for (i, (listener, _)) in nodes.into_iter().enumerate() {
+            let cache = dir.path().join(format!("express-{i}"));
+            let origin = Origin::Remote { base: url.clone(), client: reqwest::Client::new() };
+            let express = Express::new(origin, Some(cache.clone())).unwrap();
+            serve_in_background(listener, express::router(Arc::new(express)));
+            caches.push(cache);
+        }
+        (Server { url: format!("{url}/repo.git"), app, dir }, caches)
     }
 
     /// A fresh working directory for a client.
@@ -295,4 +321,42 @@ fn annotated_tags_are_peeled() {
     let b = clone(&s, "b", true);
     assert_eq!(git(&b, &["rev-parse", "v1^{commit}"]), head);
     assert!(Oid::from_hex(&git(&b, &["rev-parse", "v1"])).is_some());
+}
+
+#[test]
+fn express_nodes_cache_packs_and_resume_ranges() {
+    let (s, caches) = Server::start_with_express(2);
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..6 {
+        commit(&a, "f", &i.to_string());
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    let b = clone(&s, "b", true);
+    git(&b, &["fsck", "--strict"]);
+
+    // Every trunk pack was served by exactly one node, chosen by rendezvous hashing.
+    let cached: Vec<Vec<String>> = caches
+        .iter()
+        .map(|c| std::fs::read_dir(c).map(|d| d.map(|e| e.unwrap().file_name().into_string().unwrap()).collect()).unwrap_or_default())
+        .collect();
+    let packs: Vec<Oid> = (1..=6).filter_map(|i| s.app.meta.lock().unwrap().trunk_version(i).unwrap().unwrap().pack).collect();
+    let nodes: Vec<String> = s.app.express.clone();
+    for p in &packs {
+        let owner = nodes.iter().position(|n| n == express::pick_node(&nodes, p)).unwrap();
+        assert!(cached[owner].contains(&format!("{p}.pack")), "{p} should be cached on node {owner}");
+        assert!(!cached[1 - owner].contains(&format!("{p}.pack")));
+    }
+
+    // Range requests let an interrupted download resume.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let full = std::fs::read(s.app.store.pack_path(&packs[0])).unwrap();
+    let url = format!("{}/pack/{}.pack", express::pick_node(&nodes, &packs[0]), packs[0]);
+    let tail = rt.block_on(async {
+        let r = reqwest::Client::new().get(&url).header("Range", "bytes=10-").send().await.unwrap();
+        assert_eq!(r.status(), 206);
+        r.bytes().await.unwrap()
+    });
+    assert_eq!(&tail[..], &full[10..]);
 }

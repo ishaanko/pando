@@ -38,14 +38,6 @@ pub struct App {
     pub compact: Notify,
 }
 
-pub fn router(app: Arc<App>, embedded_express: Option<Arc<Express>>) -> Router {
-    let git = Router::new().fallback(dispatch).with_state(app);
-    match embedded_express {
-        Some(x) => express::router(x).merge(git),
-        None => git,
-    }
-}
-
 /// Route by path suffix so any repository path prefix works (`/repo.git/info/refs`).
 async fn dispatch(State(app): State<Arc<App>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
@@ -620,17 +612,21 @@ fn valid_refname(name: &str) -> bool {
 // ---------------------------------------------------------------------------------
 // Wiring
 
-/// Open the data directory (`meta.db` + `blobs/`) and build the HTTP router. With no
-/// external Express nodes, packs are served from this process at `public_url`.
+/// Open the data directory (`meta.db` + `blobs/`) and build the HTTP router. This
+/// process always serves `/pack/` from its blob store, acting as the origin for
+/// Express nodes. Packfile URIs point at `express_nodes`, or at `public_url` when
+/// none are given.
 pub fn open(data: &std::path::Path, trunk: &str, public_url: &str, express_nodes: Vec<String>) -> anyhow::Result<(Arc<App>, Router)> {
     std::fs::create_dir_all(data)?;
     let store = Arc::new(BlobStore::open(data.join("blobs"))?);
     let meta = Meta::open(data.join("meta.db"), trunk)?;
-    let embedded = express_nodes.is_empty();
-    let express = if embedded { vec![public_url.trim_end_matches('/').to_string()] } else { express_nodes };
+    let express = match express_nodes.is_empty() {
+        true => vec![public_url.trim_end_matches('/').to_string()],
+        false => express_nodes.iter().map(|n| n.trim_end_matches('/').to_string()).collect(),
+    };
     let app = Arc::new(App { meta: Mutex::new(meta), store: store.clone(), express, compact: Notify::new() });
-    let x = embedded.then(|| Express::new(express::Origin::Local(store), None)).transpose()?.map(Arc::new);
-    Ok((app.clone(), router(app, x)))
+    let origin = Arc::new(Express::new(express::Origin::Local(store), None)?);
+    Ok((app.clone(), express::router(origin).merge(Router::new().fallback(dispatch).with_state(app))))
 }
 
 /// Run compaction after trunk moves, and at least every `interval`.
