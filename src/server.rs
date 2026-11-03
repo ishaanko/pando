@@ -283,7 +283,7 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
     };
     let result = match endpoint {
         Endpoint::InfoRefs if push => receive::advertise(server.clone(), repo).await,
-        Endpoint::InfoRefs => Ok(upload::advertise(req.headers())),
+        Endpoint::InfoRefs => upload::advertise(repo, req.headers()).await,
         Endpoint::UploadPack => upload::handle(server.clone(), repo, req).await,
         Endpoint::ReceivePack => receive::handle(server.clone(), repo, req).await,
     };

@@ -954,25 +954,152 @@ fn shallow_clones_fetch_deepen_and_unshallow() {
     git(&full, &["fsck", "--strict"]);
 }
 
+/// Objects reachable from any ref that a partial clone does not have locally.
+fn missing_objects(repo: &Path) -> usize {
+    git(repo, &["rev-list", "--objects", "--all", "--missing=print"])
+        .lines()
+        .filter(|l| l.starts_with('?'))
+        .count()
+}
+
 #[test]
-fn partial_clone_falls_back_to_full() {
+fn partial_clones_fetch_missing_objects_on_demand() {
     let s = Server::start();
     let a = s.path("a");
     init(&a);
-    commit(&a, "f", "x");
-    git(&a, &["push", "-q", &s.url, "main"]);
-    let dest = s.path("partial");
-    git(
-        s.dir.path(),
-        &[
-            "clone",
-            "-q",
-            "--filter=blob:none",
-            &s.url,
-            dest.to_str().unwrap(),
-        ],
-    );
-    git(&dest, &["fsck", "--strict"]);
+    std::fs::create_dir_all(a.join("dir/sub")).unwrap();
+    for i in 0..4 {
+        std::fs::write(a.join("dir/g"), format!("g{i}")).unwrap();
+        std::fs::write(a.join("dir/sub/h"), format!("h{i}")).unwrap();
+        std::fs::write(a.join("big"), format!("{i}").repeat(100_000)).unwrap();
+        git(&a, &["add", "."]);
+        commit(&a, "f", &format!("v{i}"));
+        git(&a, &["push", "-q", &s.url, "main"]);
+    }
+    for proto in ["2", "0"] {
+        let v = ["-c", &format!("protocol.version={proto}")[..]].map(String::from);
+        let run = |dir: &Path, args: &[&str]| {
+            let mut all: Vec<&str> = v.iter().map(String::as_str).collect();
+            all.extend(args);
+            git(dir, &all)
+        };
+        let dest = |name: &str| s.path(&format!("{name}-v{proto}"));
+        let clone_filtered = |name: &str, filter: &str| {
+            let d = dest(name);
+            run(
+                s.dir.path(),
+                &[
+                    "clone",
+                    "-q",
+                    &format!("--filter={filter}"),
+                    &s.url,
+                    d.to_str().unwrap(),
+                ],
+            );
+            d
+        };
+
+        // blob:none: history arrives without old blobs, which come on demand.
+        let d = clone_filtered("none", "blob:none");
+        assert!(missing_objects(&d) > 0, "v{proto}: nothing was filtered");
+        run(&d, &["fsck", "--no-progress"]);
+        run(&d, &["log", "-p", "-q"]);
+        let root = git(&d, &["rev-list", "--max-parents=0", "HEAD"]);
+        run(&d, &["checkout", "-q", &root]);
+        assert_eq!(std::fs::read_to_string(d.join("dir/g")).unwrap(), "g0");
+        run(&d, &["checkout", "-q", "main"]);
+        // Fetching more into a partial clone, then filling in everything.
+        commit(&a, "f", &format!("more-v{proto}"));
+        git(&a, &["push", "-q", &s.url, "main"]);
+        run(&d, &["pull", "-q", "--ff-only"]);
+        run(&d, &["log", "-p", "--all", "-q"]);
+        for c in git(&d, &["rev-list", "--all"]).lines() {
+            run(&d, &["archive", "-o", "/dev/null", c]);
+        }
+        assert_eq!(missing_objects(&d), 0);
+        run(&d, &["fsck", "--no-progress"]);
+
+        // blob:limit: only the big blobs are left out.
+        let d = clone_filtered("limit", "blob:limit=1k");
+        let missing = git(&d, &["rev-list", "--objects", "--all", "--missing=print"]);
+        let missing: Vec<&str> = missing.lines().filter(|l| l.starts_with('?')).collect();
+        // The current big blob arrived with the checkout.
+        assert_eq!(missing.len(), 3, "v{proto}: {missing:?}");
+
+        // tree:0: commits only; trees and blobs arrive on checkout.
+        let d = clone_filtered("tree0", "tree:0");
+        run(&d, &["log", "-q"]);
+        let root = git(&d, &["rev-list", "--max-parents=0", "HEAD"]);
+        run(&d, &["checkout", "-q", &root]);
+        assert_eq!(std::fs::read_to_string(d.join("dir/sub/h")).unwrap(), "h0");
+        run(&d, &["fsck", "--no-progress"]);
+    }
+}
+
+#[test]
+fn protocol_v0_and_v1_clients_work() {
+    for proto in ["0", "1"] {
+        let s = Server::start();
+        let v = format!("protocol.version={proto}");
+        let run = |dir: &Path, args: &[&str]| {
+            let mut all = vec!["-c", v.as_str()];
+            all.extend(args);
+            git(dir, &all)
+        };
+        let a = s.path("a");
+        init(&a);
+        git(&a, &["remote", "add", "origin", &s.url]);
+        for i in 0..5 {
+            commit(&a, "f", &format!("v{i}"));
+        }
+        git(&a, &["tag", "-am", "release", "v1"]);
+        git(&a, &["checkout", "-qb", "topic"]);
+        commit(&a, "t", "topic");
+        git(&a, &["checkout", "-q", "main"]);
+        run(&a, &["push", "-q", "origin", "main", "topic", "v1"]);
+
+        let c = s.path("c");
+        run(s.dir.path(), &["clone", "-q", &s.url, c.to_str().unwrap()]);
+        run(&c, &["fsck", "--no-progress"]);
+        assert_eq!(git(&c, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(count(&c, "origin/topic"), 6);
+        assert_eq!(
+            git(&c, &["rev-parse", "v1^{commit}"]),
+            git(&a, &["rev-parse", "main"])
+        );
+        assert!(run(&c, &["ls-remote", "origin"]).contains("refs/tags/v1^{}"));
+
+        // Incremental fetch, with local commits the server has never seen so the
+        // negotiation takes several rounds.
+        for i in 0..40 {
+            commit(&c, "local", &format!("{i}"));
+        }
+        for i in 0..3 {
+            commit(&a, "f", &format!("w{i}"));
+        }
+        run(&a, &["push", "-q", "origin", "main"]);
+        run(&c, &["fetch", "-q"]);
+        run(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "origin/main"), 8);
+
+        // Shallow clones, deepening, and unshallowing.
+        let sh = s.path("shallow");
+        run(
+            s.dir.path(),
+            &["clone", "-q", "--depth", "1", &s.url, sh.to_str().unwrap()],
+        );
+        assert_eq!(count(&sh, "HEAD"), 1);
+        run(&sh, &["fetch", "-q", "--deepen", "2"]);
+        assert_eq!(count(&sh, "HEAD"), 3);
+        run(&sh, &["fetch", "-q", "--unshallow"]);
+        assert_eq!(count(&sh, "HEAD"), 8);
+        run(&sh, &["fsck", "--no-progress"]);
+
+        // Pushing from the clone (push is v0 in every git version).
+        run(&c, &["push", "-q", "origin", "HEAD:refs/heads/from-clone"]);
+        run(&a, &["fetch", "-q"]);
+        assert_eq!(count(&a, "origin/from-clone"), 45);
+    }
 }
 
 #[test]

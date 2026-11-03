@@ -9,7 +9,7 @@ use crate::object::{Kind, Oid, commit_parents, tag_target};
 use flate2::{Decompress, FlushDecompress, Status};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::rc::Rc;
 
 const OFS_DELTA: u8 = 6;
@@ -36,6 +36,8 @@ pub enum PackError {
     Thin(usize),
     #[error("pack exceeds size limits")]
     TooLarge,
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 fn bad(msg: impl Into<String>) -> PackError {
@@ -309,6 +311,73 @@ fn inflate_with(
         return Err(bad("object size does not match header"));
     }
     Ok(z.total_in() as usize)
+}
+
+/// Copy exactly one pack from a stream that may continue after it (SSH keeps the
+/// connection open for the status report). Objects are inflated only to find where
+/// each one ends; [`parse`] validates them afterwards. Fails past `limit` bytes.
+pub fn copy_stream(r: &mut dyn BufRead, w: &mut dyn Write, limit: u64) -> Result<u64, PackError> {
+    let mut copied = 0u64;
+    let take = |r: &mut dyn BufRead, n: usize| -> Result<Vec<u8>, PackError> {
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+    let mut emit = |w: &mut dyn Write, bytes: &[u8]| -> Result<(), PackError> {
+        copied += bytes.len() as u64;
+        if copied > limit {
+            return Err(PackError::TooLarge);
+        }
+        Ok(w.write_all(bytes)?)
+    };
+    let head = take(r, 12)?;
+    if &head[..4] != b"PACK" {
+        return Err(bad("missing PACK signature"));
+    }
+    let count = u32::from_be_bytes(head[8..12].try_into().unwrap());
+    emit(w, &head)?;
+    let mut scratch = vec![0u8; 64 << 10];
+    for _ in 0..count {
+        // Type and size, then the delta base if any.
+        let mut c = take(r, 1)?[0];
+        let code = (c >> 4) & 7;
+        emit(w, &[c])?;
+        while c & 0x80 != 0 {
+            c = take(r, 1)?[0];
+            emit(w, &[c])?;
+        }
+        match code {
+            OFS_DELTA => loop {
+                let b = take(r, 1)?[0];
+                emit(w, &[b])?;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            },
+            REF_DELTA => emit(w, &take(r, 20)?)?,
+            1..=4 => {}
+            _ => return Err(bad(format!("unknown object type {code}"))),
+        }
+        let mut z = Decompress::new(true);
+        loop {
+            let input = r.fill_buf()?;
+            if input.is_empty() {
+                return Err(bad("truncated zlib stream"));
+            }
+            let before = z.total_in();
+            let status = z
+                .decompress(input, &mut scratch, FlushDecompress::None)
+                .map_err(|e| bad(format!("zlib: {e}")))?;
+            let used = (z.total_in() - before) as usize;
+            emit(w, &input[..used])?;
+            r.consume(used);
+            if status == Status::StreamEnd {
+                break;
+            }
+        }
+    }
+    emit(w, &take(r, 20)?)?;
+    Ok(copied)
 }
 
 /// Decode a whole pack: verify the trailer, resolve deltas inside the pack, compute

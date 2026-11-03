@@ -91,13 +91,21 @@ pub fn read_section<R: BufRead + ?Sized>(r: &mut R) -> io::Result<(Vec<String>, 
 pub struct SidebandWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
+    /// Data bytes per packet (999 for the original `side-band`).
+    max: usize,
 }
 
 impl<W: Write> SidebandWriter<W> {
     pub fn new(inner: W) -> Self {
+        Self::with_limit(inner, MAX_PAYLOAD - 1)
+    }
+
+    pub fn with_limit(inner: W, max: usize) -> Self {
+        let max = max.clamp(1, MAX_PAYLOAD - 1);
         SidebandWriter {
             inner,
-            buf: Vec::with_capacity(MAX_PAYLOAD),
+            buf: Vec::with_capacity(max),
+            max,
         }
     }
 
@@ -109,10 +117,10 @@ impl<W: Write> SidebandWriter<W> {
 
 impl<W: Write> Write for SidebandWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let room = MAX_PAYLOAD - 1 - self.buf.len();
+        let room = self.max - self.buf.len();
         let n = data.len().min(room);
         self.buf.extend_from_slice(&data[..n]);
-        if self.buf.len() == MAX_PAYLOAD - 1 {
+        if self.buf.len() == self.max {
             self.flush()?;
         }
         Ok(n)
