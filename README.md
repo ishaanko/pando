@@ -44,7 +44,8 @@ Caddy). Release binaries, a Docker image and a systemd unit are described in
   `pando restore`, and `pando verify --full`.
 - **Monitoring**: `/healthz` and Prometheus `/metrics`.
 - **Disk**: unreachable packs (deleted branches, force-pushed history) are deleted
-  after an hour. Express cache nodes take `--cache-max-size`.
+  after an hour (`--gc-grace`). Until then, as on most Git hosts, their commits can
+  still be fetched by id. Express cache nodes take `--cache-max-size`.
 
 ## Compatibility
 

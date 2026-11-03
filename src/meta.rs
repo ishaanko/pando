@@ -486,17 +486,6 @@ impl Meta {
         Ok(peeled)
     }
 
-    /// Whether gc found a pack unreachable (it is kept for a while, but not served
-    /// to new requests by object id).
-    pub fn pack_dead(&self, pack: &Oid) -> rusqlite::Result<bool> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT dead_since IS NOT NULL FROM packs WHERE hash = ?1")?
-            .query_row([pack.hex()], |r| r.get(0))
-            .optional()?
-            .unwrap_or(false))
-    }
-
     /// Dependencies recorded for a stored pack.
     pub fn pack_deps(&self, pack: &Oid) -> rusqlite::Result<Option<Deps>> {
         self.conn
@@ -611,21 +600,6 @@ impl Meta {
                 "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
                 params![u.refname, id],
             )?;
-            // Packs gc marked dead that this version needs are live again.
-            let mut revive: Vec<Oid> = new.deps.packs.iter().copied().chain(new.pack).collect();
-            while let Some(p) = revive.pop() {
-                let deps: Option<String> = tx
-                    .prepare_cached(
-                        "UPDATE packs SET dead_since = NULL
-                         WHERE hash = ?1 AND dead_since IS NOT NULL RETURNING side_deps",
-                    )?
-                    .query_row([p.hex()], |r| r.get(0))
-                    .optional()?;
-                revive.extend(
-                    deps.iter()
-                        .flat_map(|d| d.split_whitespace().filter_map(Oid::from_hex)),
-                );
-            }
             if on_trunk && let Some(pack) = new.pack {
                 // Trunk now reaches these: they get a trunk position (and move to this
                 // pack, which holds them) unless an earlier version of this epoch had

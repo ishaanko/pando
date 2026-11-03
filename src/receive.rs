@@ -226,7 +226,6 @@ fn push(
     }
 
     let mut trunk_moved = false;
-    let mut rewrote = false;
     let statuses: Vec<Result<(), String>> = match (&unpack, declined) {
         (Err(_), _) => commands
             .iter()
@@ -276,10 +275,6 @@ fn push(
                         .iter()
                         .zip(&statuses)
                         .any(|(c, s)| s.is_ok() && meta.is_trunk(&c.refname));
-                    rewrote = planned
-                        .iter()
-                        .zip(&statuses)
-                        .any(|(p, s)| s.is_ok() && p.as_ref().is_ok_and(|p| p.rewrite));
                     statuses
                 }
             }
@@ -306,16 +301,6 @@ fn push(
             Err(e) => tracing::error!(repo = %repo.name, "post-receive: {e:#}"),
         }
         hooks::notify(server, &repo.name, user, &moved);
-    }
-    // History a deletion or trunk rewrite dropped stops being served by id now,
-    // rather than at the next gc.
-    let dropped = rewrote
-        || commands
-            .iter()
-            .zip(&statuses)
-            .any(|(c, s)| s.is_ok() && c.new.is_zero());
-    if dropped && let Err(e) = crate::gc::mark(repo) {
-        tracing::error!(repo = %repo.name, "marking unreachable packs: {e:#}");
     }
     metrics::PUSHES.inc();
     metrics::PUSH_TIME.observe(started.elapsed());

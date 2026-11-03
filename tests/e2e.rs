@@ -1822,10 +1822,9 @@ fn gc_deletes_unreachable_packs_and_keeps_everything_else_servable() {
     git(&a, &["push", "-q", "origin", "--delete", "doomed"]);
     assert!(stored_objects(&s).contains(&secret));
 
-    // The pushes already marked what they dropped; within the grace period nothing
-    // is deleted.
+    // Within the grace period, packs are only marked.
     let r = pando::gc::run(&repo, std::time::Duration::from_secs(3600)).unwrap();
-    assert!(r.marked == 0 && r.deleted == 0, "{r:?}");
+    assert!(r.marked > 0 && r.deleted == 0, "{r:?}");
     assert!(stored_objects(&s).contains(&secret));
     let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
     assert!(r.deleted > 0, "{r:?}");
@@ -2276,33 +2275,6 @@ fn combined_filters_and_trees_shared_across_depths() {
         git(&d, &["checkout", "-q", "main"]);
         git(&d, &["fsck", "--no-progress"]);
     }
-}
-
-#[test]
-fn deleted_history_is_not_served_by_id() {
-    let s = Server::start();
-    let a = s.path("a");
-    init(&a);
-    commit(&a, "f", "1");
-    git(&a, &["push", "-q", &s.url, "main"]);
-    git(&a, &["checkout", "-qb", "secret"]);
-    let secret = commit(&a, "key", "AWS_KEY=xyz");
-    git(&a, &["push", "-q", &s.url, "secret"]);
-    git(&a, &["push", "-q", &s.url, "--delete", "secret"]);
-    let c = clone(&s, "c", false);
-    let err = git_fails(&c, &["fetch", "-q", "origin", &secret]);
-    assert!(err.contains("not our ref"), "{err}");
-    // Force-pushed trunk history too.
-    git(&a, &["checkout", "-q", "main"]);
-    let dropped = commit(&a, "f", "2");
-    git(&a, &["push", "-q", &s.url, "main"]);
-    git(&a, &["reset", "-q", "--hard", "HEAD~1"]);
-    commit(&a, "f", "3");
-    git(&a, &["push", "-qf", &s.url, "main"]);
-    let err = git_fails(&c, &["fetch", "-q", "origin", &dropped]);
-    assert!(err.contains("not our ref"), "{err}");
-    git(&c, &["fetch", "-q", "origin"]);
-    git(&c, &["fsck", "--no-progress"]);
 }
 
 #[test]
