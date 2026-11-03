@@ -26,5 +26,3 @@ readers keep fetching. 16-core machine, `git` client time included.
 
 800 pushes in 7.4 s, none rejected. Reproduce with
 `cargo run --release --example swarm -- 128 5`.
-
-Design notes are in [docs/design.md](docs/design.md).

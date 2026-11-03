@@ -1,6 +1,4 @@
 //! Pando: a Git backend built around immutable packs and per-ref versions.
-//!
-//! See `docs/design.md` for how the pieces fit together.
 
 pub mod compact;
 pub mod express;
