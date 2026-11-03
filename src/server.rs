@@ -352,7 +352,7 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
     let options = if caps.contains("push-options") { pktline::read_section(&mut r)?.0 } else { Vec::new() };
     let force = options.iter().any(|o| o == "force");
 
-    let mut statuses: Vec<Result<(), String>> = Vec::new();
+    let statuses: Vec<Result<(), String>>;
     let mut unpack = Ok(());
     let mut parsed: Option<ParsedPack> = None;
     if commands.iter().any(|c| !c.new.is_zero()) {

@@ -234,7 +234,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
 /// Apply a Git delta (copy/insert instruction stream) to `base`.
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
     let mut pos = 0;
-    let mut varint = |pos: &mut usize| -> Result<usize, PackError> {
+    let varint = |pos: &mut usize| -> Result<usize, PackError> {
         let (mut v, mut shift) = (0usize, 0);
         loop {
             let c = *delta.get(*pos).ok_or_else(|| bad("truncated delta header"))?;
