@@ -100,7 +100,12 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         if have_set.contains(want) {
             continue;
         }
-        let version = match best_version(meta.versions_with_tip(want)?) {
+        // A version whose pack gc found dead is only reachable through a deleted or
+        // rewritten ref; the object index decides whether the commit is still ours.
+        let mut versions = meta.versions_with_tip(want)?;
+        versions
+            .retain(|v| v.on_trunk || !v.pack.is_some_and(|p| meta.pack_dead(&p).unwrap_or(false)));
+        let version = match best_version(versions) {
             Some(v) => v,
             None => {
                 // Not a tip: an older commit, or any other object. Serve whichever
@@ -119,12 +124,6 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         };
         if version.on_trunk {
             p.trunk_want = p.trunk_want.max(version.seq);
-        } else if version
-            .pack
-            .is_some_and(|pk| meta.pack_dead(&pk).unwrap_or(false))
-        {
-            // Only reachable through a deleted or rewritten ref.
-            return Err(PlanError::NotOurRef(*want));
         } else if !had_versions.contains(&version.id) {
             need(&mut p, &mut old_want, version.deps.trunk);
             work.extend(version.pack);

@@ -45,6 +45,7 @@ fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let mut report = Report::default();
     let mut doomed: Vec<Oid> = Vec::new();
+    let mut newly_dead: Vec<Oid> = Vec::new();
     {
         let mut meta = repo.meta.lock().unwrap();
         let live = Live::compute(&meta)?;
@@ -75,6 +76,7 @@ fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
                         Some(s) => *s,
                         None => {
                             report.marked += 1;
+                            newly_dead.push(*hash);
                             tx.execute(
                                 "UPDATE packs SET dead_since = ?1 WHERE hash = ?2",
                                 params![now, hash.hex()],
@@ -89,6 +91,8 @@ fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
             }
         }
         tx.commit()?;
+        // What is still reachable through other packs stays servable.
+        rehome(&mut meta, &repo.store, &live, &newly_dead)?;
         let Some(grace) = grace else {
             return Ok(report);
         };
@@ -241,18 +245,22 @@ pub fn drop_packs(meta: &mut Meta, store: &BlobStore, packs: &[Oid]) -> anyhow::
     forget(meta, store, &live, packs)
 }
 
-fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> anyhow::Result<()> {
-    let dead: HashSet<Oid> = doomed.iter().copied().collect();
-    let hexes: Vec<String> = doomed.iter().map(Oid::hex).collect();
-
-    // Objects indexed in doomed packs, and live packs that also hold them.
+/// Point index rows away from `packs` (dead ones) to live packs that hold the same
+/// objects, so anything still reachable keeps being served. Returns the objects no
+/// live pack holds.
+fn rehome(
+    meta: &mut Meta,
+    store: &BlobStore,
+    live: &Live,
+    packs: &[Oid],
+) -> anyhow::Result<HashSet<Oid>> {
     let mut orphans: HashSet<Oid> = HashSet::new();
     {
         let mut stmt = meta
             .conn
             .prepare_cached("SELECT oid FROM objects WHERE pack = ?1")?;
-        for h in &hexes {
-            for oid in stmt.query_map([h], |r| r.get::<_, String>(0))? {
+        for p in packs {
+            for oid in stmt.query_map([p.hex()], |r| r.get::<_, String>(0))? {
                 orphans.extend(Oid::from_hex(&oid?));
             }
         }
@@ -273,24 +281,35 @@ fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> an
             }
         }
     }
+    let tx = meta.conn.transaction()?;
+    for (oid, pack) in &home {
+        tx.execute(
+            "UPDATE objects SET pack = ?1, trunk_seq = NULL WHERE oid = ?2",
+            params![pack.hex(), oid.hex()],
+        )?;
+        // Commits remember the first pack that stored them.
+        tx.execute(
+            "UPDATE commits SET pack = ?1 WHERE oid = ?2",
+            params![pack.hex(), oid.hex()],
+        )?;
+    }
+    tx.commit()?;
+    orphans.retain(|o| !home.contains_key(o));
+    Ok(orphans)
+}
+
+fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> anyhow::Result<()> {
+    let dead: HashSet<Oid> = doomed.iter().copied().collect();
+    let hexes: Vec<String> = doomed.iter().map(Oid::hex).collect();
+    let orphans = rehome(meta, store, live, doomed)?;
 
     let tx = meta.conn.transaction()?;
     for oid in &orphans {
-        match home.get(oid) {
-            Some(pack) => {
-                tx.execute(
-                    "UPDATE objects SET pack = ?1, trunk_seq = NULL WHERE oid = ?2",
-                    params![pack.hex(), oid.hex()],
-                )?;
-            }
-            None => {
-                tx.execute("DELETE FROM objects WHERE oid = ?1", [oid.hex()])?;
-                tx.execute("DELETE FROM tags WHERE oid = ?1", [oid.hex()])?;
-            }
-        }
+        tx.execute("DELETE FROM objects WHERE oid = ?1", [oid.hex()])?;
+        tx.execute("DELETE FROM tags WHERE oid = ?1", [oid.hex()])?;
     }
-    // Commits remember the first pack that stored them; point them at wherever the
-    // object index says the commit lives now.
+    // Commits whose first pack is going: wherever the object index says they live
+    // now, if anywhere.
     for h in &hexes {
         let oids: Vec<String> = tx
             .prepare_cached("SELECT oid FROM commits WHERE pack = ?1")?
