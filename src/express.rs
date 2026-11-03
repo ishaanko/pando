@@ -60,16 +60,16 @@ impl Express {
         }
         let gate = self.fills.lock().unwrap().entry(hash).or_default().clone();
         let _guard = gate.lock().await;
-        if !path.exists() && !self.fill(hash, &path).await? {
-            return Ok(None);
-        }
+        let filled = if path.exists() { Ok(true) } else { self.fill(hash, &path).await };
         self.fills.lock().unwrap().remove(&hash);
-        Ok(Some(path))
+        Ok(filled?.then_some(path))
     }
 
     /// Copy one pack from the origin into the cache, verifying its trailer hash.
     async fn fill(&self, hash: Oid, dest: &std::path::Path) -> anyhow::Result<bool> {
-        let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
+        static FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("tmp-{}-{n}", std::process::id()));
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut sha = Sha1::new();
         let mut tail: Vec<u8> = Vec::new();

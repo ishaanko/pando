@@ -360,3 +360,49 @@ fn express_nodes_cache_packs_and_resume_ranges() {
     });
     assert_eq!(&tail[..], &full[10..]);
 }
+
+#[test]
+fn side_commits_pushed_with_trunk_stay_off_trunk() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    let base = commit(&a, "f", "base");
+    git(&a, &["checkout", "-qb", "feature"]);
+    let f1 = commit(&a, "feat", "1");
+    commit(&a, "feat", "2");
+    git(&a, &["checkout", "-q", "main"]);
+    commit(&a, "f", "trunk");
+    // One push, one pack, two refs.
+    git(&a, &["push", "-q", &s.url, "main", "feature"]);
+    let row = s.app.meta.lock().unwrap().commit(&Oid::from_hex(&f1).unwrap()).unwrap().unwrap();
+    assert_eq!(row.trunk_seq, None, "feature commits are not reachable from trunk");
+
+    // A client that already has trunk (from elsewhere) fetches a side commit by SHA.
+    let b = s.path("b");
+    init(&b);
+    git(&b, &["fetch", "-q", a.to_str().unwrap(), "main:refs/heads/elsewhere"]);
+    git(&b, &["fetch", "-q", &s.url, &f1]);
+    git(&b, &["cat-file", "-e", &format!("{f1}^{{commit}}")]);
+    git(&b, &["fsck", "--strict"]);
+    assert_eq!(git(&b, &["rev-parse", &format!("{f1}~1")]), base);
+}
+
+#[test]
+fn shallow_clones_can_push() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..3 {
+        commit(&a, "f", &i.to_string());
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    let shallow = s.path("shallow");
+    git(s.dir.path(), &["clone", "-q", "--depth", "1", &format!("file://{}", a.display()), shallow.to_str().unwrap()]);
+    git(&shallow, &["remote", "set-url", "origin", &s.url]);
+    commit(&shallow, "f", "from shallow");
+    git(&shallow, &["push", "-q", "origin", "HEAD:main"]);
+    let full = clone(&s, "full", false);
+    git(&full, &["fsck", "--strict"]);
+    assert_eq!(git(&full, &["rev-parse", "HEAD"]), git(&shallow, &["rev-parse", "HEAD"]));
+}

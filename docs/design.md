@@ -140,10 +140,15 @@ needs no invalidation:
 - **Metadata**: SQLite in WAL mode behind a mutex. The access pattern (single-key CAS,
   small transactions, point lookups) maps onto any horizontally scalable KV store. SQLite
   itself serializes writers.
-- **Validation**: the pack is fully decoded and its commit graph is checked against
-  trunk. Trees and blobs that the pack references but does not contain are not checked
-  object by object, which would need an object-level index.
+- **Validation**: the pack is fully decoded under size limits (512 MiB per object,
+  4 GiB inflated per pack, 2 GiB on the wire). Commit parents and tag targets missing
+  from the pack must already be on trunk. Commits only get a trunk position when the
+  new trunk tip reaches them, so a side branch pushed alongside trunk stays off trunk.
+  Trees and blobs that the pack references but does not contain are not checked one
+  by one, which would need an object-level index.
+- **Shallow clones** can push, since the same parents-on-trunk check covers them.
+  Pando does not serve shallow fetches.
 - **Memory**: a pushed pack is decoded in memory, and a multi-pack inline fetch loads
   its packs before splicing. Packfile-URI fetches stream from disk.
-- **Not implemented**: shallow and partial clone, `want-ref`, SHA-256, the migration
+- **Not implemented**: serving shallow or partial clones, `want-ref`, SHA-256, the migration
   proxy mode, and Express cache eviction.

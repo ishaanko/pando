@@ -14,6 +14,14 @@ use std::io::{self, Write};
 const OFS_DELTA: u8 = 6;
 const REF_DELTA: u8 = 7;
 
+/// Largest single object Pando will inflate.
+pub const MAX_OBJECT_SIZE: usize = 512 << 20;
+/// Largest total of inflated bytes (objects plus delta results) for one pack. Bounds
+/// zlib bombs and chains of deltas that each expand a few bytes into 64 KiB.
+pub const MAX_INFLATED_TOTAL: usize = 4 << 30;
+/// Never reserve more than this up front; vectors grow as real data arrives.
+const MAX_PREALLOC: usize = 1 << 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("malformed pack: {0}")]
@@ -22,6 +30,8 @@ pub enum PackError {
     Checksum,
     #[error("thin packs are not accepted ({0} deltas reference objects outside the pack)")]
     Thin(usize),
+    #[error("pack exceeds size limits")]
+    TooLarge,
 }
 
 fn bad(msg: impl Into<String>) -> PackError {
@@ -52,6 +62,33 @@ impl ParsedPack {
         self.commits.contains_key(oid)
             || self.tags.contains_key(oid)
             || self.entries.iter().any(|e| e.oid == *oid)
+    }
+
+    /// Follow a chain of annotated tags in this pack to the first non-tag object.
+    /// `None` if `oid` is not a tag here.
+    pub fn peel(&self, oid: &Oid) -> Option<Oid> {
+        let mut target = *self.tags.get(oid)?;
+        for _ in 0..64 {
+            match self.tags.get(&target) {
+                Some(next) => target = *next,
+                None => break,
+            }
+        }
+        Some(target)
+    }
+
+    /// Pushed commits reachable from `tip` (peeling tags), with their parents.
+    pub fn reachable_commits(&self, tip: &Oid) -> Vec<(Oid, Vec<Oid>)> {
+        let start = self.peel(tip).unwrap_or(*tip);
+        let mut seen = HashSet::from([start]);
+        let mut stack = vec![start];
+        let mut out = Vec::new();
+        while let Some(oid) = stack.pop() {
+            let Some(parents) = self.commits.get(&oid) else { continue };
+            out.push((oid, parents.clone()));
+            stack.extend(parents.iter().filter(|p| seen.insert(**p)));
+        }
+        out
     }
 }
 
@@ -104,8 +141,11 @@ fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
 /// Inflate one zlib stream that must produce exactly `size` bytes. Returns the data and
 /// how many compressed bytes the stream used.
 fn inflate(input: &[u8], size: usize) -> Result<(Vec<u8>, usize), PackError> {
+    if size > MAX_OBJECT_SIZE {
+        return Err(PackError::TooLarge);
+    }
     let mut z = Decompress::new(true);
-    let mut out = Vec::with_capacity(size + 1);
+    let mut out = Vec::with_capacity(size.min(MAX_PREALLOC) + 1);
     loop {
         let used = z.total_in() as usize;
         let before = (z.total_in(), z.total_out());
@@ -116,7 +156,7 @@ fn inflate(input: &[u8], size: usize) -> Result<(Vec<u8>, usize), PackError> {
             Status::StreamEnd => break,
             _ if out.len() > size => return Err(bad("object larger than its header")),
             _ if (z.total_in(), z.total_out()) == before => return Err(bad("truncated zlib stream")),
-            _ => out.reserve(64),
+            _ => out.reserve((size + 1 - out.len()).min(MAX_PREALLOC)),
         }
     }
     if out.len() != size {
@@ -150,14 +190,17 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
         base: Base,
         data: Vec<u8>,
     }
-    let mut raws = Vec::with_capacity(count.min(1 << 20));
+    let mut raws = Vec::with_capacity(count.min(MAX_PREALLOC / 64));
     let mut pos = 12;
+    let mut budget = MAX_INFLATED_TOTAL;
+    let body = &buf[..body_end];
     for _ in 0..count {
         if pos >= body_end {
             return Err(bad("pack ends before its object count"));
         }
-        let h = read_header(buf, pos)?;
-        let (data, used) = inflate(&buf[pos + h.len..body_end], h.size)?;
+        let h = read_header(body, pos)?;
+        budget = budget.checked_sub(h.size).ok_or(PackError::TooLarge)?;
+        let (data, used) = inflate(&body[pos + h.len..], h.size)?;
         raws.push(Raw { offset: pos as u64, kind: Kind::from_code(h.code), base: h.base, data });
         pos += h.len + used;
     }
@@ -201,6 +244,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             }
             let delta = bodies[k].take().unwrap();
             let data = apply_delta(full[i].as_ref().unwrap(), &delta)?;
+            budget = budget.checked_sub(data.len()).ok_or(PackError::TooLarge)?;
             resolved[k] = Some((kind, Oid::for_object(kind, &data)));
             full[k] = Some(data);
             queue.push(k);
@@ -251,7 +295,10 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
     if src_len != base.len() {
         return Err(bad("delta base size mismatch"));
     }
-    let mut out = Vec::with_capacity(dst_len);
+    if dst_len > MAX_OBJECT_SIZE {
+        return Err(PackError::TooLarge);
+    }
+    let mut out = Vec::with_capacity(dst_len.min(MAX_PREALLOC));
     while pos < delta.len() {
         let cmd = delta[pos];
         pos += 1;
@@ -273,6 +320,9 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
                 n => n,
             };
             let src = base.get(off..off + len).ok_or_else(|| bad("delta copy out of range"))?;
+            if out.len() + len > dst_len {
+                return Err(bad("delta result larger than declared"));
+            }
             out.extend_from_slice(src);
         } else if cmd != 0 {
             let lit = delta.get(pos..pos + cmd as usize).ok_or_else(|| bad("truncated insert"))?;
@@ -456,6 +506,34 @@ mod tests {
     fn empty_pack_parses() {
         let p = parse(&empty_pack()).unwrap();
         assert!(p.entries.is_empty());
+    }
+
+    /// A pack around `objects` with a correct header count and trailer.
+    fn wrap(count: u32, objects: &[u8]) -> Vec<u8> {
+        let mut w = HashingWriter::new(Vec::new());
+        w.write_all(b"PACK\0\0\0\x02").unwrap();
+        w.write_all(&count.to_be_bytes()).unwrap();
+        w.write_all(objects).unwrap();
+        w.finish().unwrap().1
+    }
+
+    #[test]
+    fn hostile_sizes_are_rejected_without_allocating() {
+        // A blob claiming to be 2^50 bytes.
+        let mut obj = Vec::new();
+        encode_type_size(3, 1 << 50, &mut obj);
+        obj.extend_from_slice(&[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        assert!(matches!(parse(&wrap(1, &obj)), Err(PackError::TooLarge)));
+
+        // A delta declaring a 2^50-byte result.
+        let delta = [0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert!(matches!(apply_delta(&[], &delta), Err(PackError::TooLarge)));
+
+        // A ref-delta header that runs into the trailer.
+        let mut obj = Vec::new();
+        encode_type_size(REF_DELTA, 5, &mut obj);
+        obj.extend_from_slice(&[1, 2, 3, 4, 5]);
+        assert!(parse(&wrap(1, &obj)).is_err());
     }
 
     #[test]

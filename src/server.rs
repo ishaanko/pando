@@ -28,6 +28,8 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 
 const AGENT: &str = concat!("pando/", env!("CARGO_PKG_VERSION"));
 const ANCESTRY_WALK_LIMIT: usize = 100_000;
+/// Largest pushed pack accepted.
+const MAX_PUSH_BYTES: u64 = 2 << 30;
 
 pub struct App {
     pub meta: Mutex<Meta>,
@@ -276,14 +278,30 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
     }
     out.write_all(&head)?;
 
-    let mut data = SidebandWriter::new(&mut *out);
-    if use_uris || plan.packs.is_empty() {
+    // Once the packfile section has started, errors must travel on side-band 3.
+    if let Err(e) = send_pack_data(app, &plan.packs, use_uris, out) {
+        tracing::error!("fetch: {e:#}");
+        let mut msg = Vec::new();
+        pktline::sideband(&mut msg, 3, format!("pando: {e:#}\n").as_bytes());
+        out.write_all(&msg)?;
+        return Ok(());
+    }
+    let mut tail = Vec::new();
+    pktline::flush(&mut tail);
+    out.write_all(&tail)?;
+    Ok(())
+}
+
+/// The packfile section body: an empty pack (URIs carry the data), one stored pack
+/// copied as-is, or several spliced into one.
+fn send_pack_data(app: &App, packs: &[Oid], use_uris: bool, out: &mut dyn Write) -> anyhow::Result<()> {
+    let mut data = SidebandWriter::new(out);
+    if use_uris || packs.is_empty() {
         data.write_all(&pack::empty_pack())?;
-    } else if let [single] = plan.packs.as_slice() {
+    } else if let [single] = packs {
         io::copy(&mut std::fs::File::open(app.store.pack_path(single))?, &mut data)?;
     } else {
-        let loaded: Vec<(Vec<u8>, Vec<pack::IdxEntry>)> = plan
-            .packs
+        let loaded: Vec<(Vec<u8>, Vec<pack::IdxEntry>)> = packs
             .iter()
             .map(|h| Ok((app.store.read_pack(h)?, app.store.read_idx(h)?)))
             .collect::<io::Result<_>>()?;
@@ -291,9 +309,6 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
         pack::concat(&parts, &mut data)?;
     }
     data.into_inner()?;
-    let mut tail = Vec::new();
-    pktline::flush(&mut tail);
-    out.write_all(&tail)?;
     Ok(())
 }
 
@@ -302,17 +317,14 @@ fn fetch(app: &App, args: &[String], out: &mut dyn Write) -> anyhow::Result<()> 
 
 async fn receive_pack(app: Arc<App>, req: Request) -> anyhow::Result<Response> {
     let body = body_reader(req);
-    let (report, trunk_moved) = blocking(move || {
-        let result = handle_push(&app, body);
-        result.map(|(report, moved)| {
-            if moved {
-                app.compact.notify_one();
-            }
-            (report, moved)
-        })
+    let report = blocking(move || {
+        let (report, trunk_moved) = handle_push(&app, body)?;
+        if trunk_moved {
+            app.compact.notify_one();
+        }
+        Ok(report)
     })
     .await?;
-    let _ = trunk_moved;
     Ok(git_response("application/x-git-receive-pack-result", report))
 }
 
@@ -330,6 +342,11 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
     while let Some(Packet::Data(line)) = pktline::read(&mut r)? {
         let line = String::from_utf8_lossy(&line);
         let line = line.trim_end_matches('\n');
+        if line.starts_with("shallow ") {
+            // A shallow client lists its boundary commits first. Its pack is still
+            // checked like any other: missing parents must be on trunk.
+            continue;
+        }
         let (cmd, cap_str) = line.split_once('\0').unwrap_or((line, ""));
         caps.extend(cap_str.split(' ').filter(|c| !c.is_empty()).map(String::from));
         let mut parts = cmd.splitn(3, ' ');
@@ -365,8 +382,16 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                 statuses = commands.iter().map(|_| Err("unpacker error".to_string())).collect();
             }
             Ok(planned) => {
-                let commits: Vec<(Oid, Vec<Oid>)> =
-                    parsed.as_ref().map(|p| p.commits.iter().map(|(k, v)| (*k, v.clone())).collect()).unwrap_or_default();
+                // Trunk only claims the commits its new tip reaches. Other pushed commits
+                // (a side branch in the same push) are indexed without a trunk position.
+                let commits: Vec<Vec<(Oid, Vec<Oid>)>> = commands
+                    .iter()
+                    .map(|c| match &parsed {
+                        Some(p) if meta.is_trunk(&c.refname) => p.reachable_commits(&c.new),
+                        Some(p) => p.commits.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                        None => Vec::new(),
+                    })
+                    .collect();
                 let atomic = caps.contains("atomic");
                 if atomic && planned.iter().any(Result::is_err) {
                     statuses = planned
@@ -377,7 +402,8 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                     let updates: Vec<Option<RefUpdate>> = planned
                         .iter()
                         .zip(&commands)
-                        .map(|(p, c)| {
+                        .zip(&commits)
+                        .map(|((p, c), commits)| {
                             p.as_ref().ok().map(|plan| RefUpdate {
                                 refname: &c.refname,
                                 expect: plan.expect,
@@ -385,8 +411,8 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
                                     tip: c.new,
                                     pack: parsed.as_ref().filter(|p| !p.entries.is_empty()).map(|p| p.hash),
                                     trunk_dep: plan.trunk_dep,
-                                    peeled: parsed.as_ref().and_then(|p| p.tags.get(&c.new).copied()),
-                                    commits: &commits,
+                                    peeled: parsed.as_ref().and_then(|p| p.peel(&c.new)),
+                                    commits,
                                 }),
                             })
                         })
@@ -431,23 +457,24 @@ fn handle_push(app: &App, mut r: Box<dyn BufRead + Send>) -> anyhow::Result<(Vec
 
 /// Stream the pack into staging, decode it once, and publish it to blob storage.
 fn receive_pack_data(store: &BlobStore, r: &mut dyn Read) -> anyhow::Result<ParsedPack> {
-    let staged = store.staging_path();
-    let result = (|| {
-        let mut file = std::fs::File::create(&staged)?;
-        io::copy(r, &mut file)?;
-        drop(file);
-        let parsed = pack::parse(&std::fs::read(&staged)?)?;
-        if parsed.entries.is_empty() {
-            std::fs::remove_file(&staged)?;
-        } else {
-            store.publish(&staged, &parsed.hash, &parsed.entries)?;
+    /// Removes the staging file on every exit path, panics included.
+    struct Staged(std::path::PathBuf);
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
-        anyhow::Ok(parsed)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&staged);
     }
-    result
+    let staged = Staged(store.staging_path());
+    let mut file = std::fs::File::create(&staged.0)?;
+    if io::copy(&mut r.take(MAX_PUSH_BYTES + 1), &mut file)? > MAX_PUSH_BYTES {
+        anyhow::bail!("pack larger than {MAX_PUSH_BYTES} bytes");
+    }
+    drop(file);
+    let parsed = pack::parse(&std::fs::read(&staged.0)?)?;
+    if !parsed.entries.is_empty() {
+        store.publish(&staged.0, &parsed.hash, &parsed.entries)?;
+    }
+    Ok(parsed)
 }
 
 /// What a validated command will do.
@@ -479,6 +506,11 @@ fn plan_updates(
                 if !p.commits.contains_key(parent) && !in_trunk(parent)? {
                     return Err(format!("missing objects: parent {parent} is not in the pack or on trunk"));
                 }
+            }
+        }
+        for target in p.tags.values() {
+            if !p.contains(target) && !in_trunk(target)? {
+                return Err(format!("missing objects: tag target {target} is not in the pack or on trunk"));
             }
         }
     }
