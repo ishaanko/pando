@@ -399,65 +399,42 @@ fn apply(
             .collect());
     }
     let stored = pack.filter(|p| !p.entries.is_empty());
-    let all_commits: Vec<(Oid, Vec<Oid>)> = pack
-        .map(|p| p.commits.iter().map(|(k, v)| (*k, v.clone())).collect())
-        .unwrap_or_default();
-    let all_objects: Vec<Oid> = pack
-        .map(|p| p.entries.iter().map(|e| e.oid).collect())
-        .unwrap_or_default();
-
-    // Trunk claims only what its new tip reaches; everything else in the pack is
-    // indexed without a trunk position.
-    struct Indexed {
-        commits: Vec<(Oid, Vec<Oid>)>,
-        objects: Vec<Oid>,
-        complete: bool,
+    if let Some(p) = stored {
+        meta.index_pack(
+            &p.hash,
+            pack_deps,
+            p.entries.iter().map(|e| e.oid),
+            &p.commits,
+        )?;
     }
-    let indexed: Vec<Indexed> = commands
+    // With a single ref pushed, every object in the pack is reachable from its tip.
+    let complete = commands.iter().filter(|c| !c.new.is_zero()).count() == 1;
+    // Trunk marks only what its new tip reaches; walk that once.
+    let reached: Vec<Vec<Oid>> = commands
         .iter()
-        .map(|c| {
-            let Some(p) = pack.filter(|_| !c.new.is_zero()) else {
-                return Indexed {
-                    commits: vec![],
-                    objects: vec![],
-                    complete: false,
-                };
-            };
-            let reach = p.reachable_objects([c.new]);
-            let complete = reach.len() == p.entries.len();
-            if meta.is_trunk(&c.refname) {
-                Indexed {
-                    commits: p.reachable_commits(&c.new),
-                    objects: reach.into_iter().collect(),
-                    complete,
-                }
-            } else {
-                Indexed {
-                    commits: all_commits.clone(),
-                    objects: all_objects.clone(),
-                    complete,
-                }
+        .map(|c| match stored {
+            Some(p) if !c.new.is_zero() && meta.is_trunk(&c.refname) => {
+                p.reachable_objects([c.new]).into_iter().collect()
             }
+            _ => Vec::new(),
         })
         .collect();
 
     let updates: Vec<Option<RefUpdate>> = planned
         .iter()
         .zip(commands)
-        .zip(&indexed)
-        .map(|((p, c), ix)| {
+        .zip(&reached)
+        .map(|((p, c), reached)| {
             p.as_ref().ok().map(|plan| RefUpdate {
                 refname: &c.refname,
                 expect: plan.expect,
                 new: (!c.new.is_zero()).then(|| NewVersion {
                     tip: c.new,
                     pack: stored.map(|p| p.hash),
-                    pack_deps,
                     deps: plan.deps.clone(),
-                    pack_complete: ix.complete,
+                    pack_complete: complete,
                     peeled: pack.and_then(|p| p.peel(&c.new)),
-                    commits: &ix.commits,
-                    objects: &ix.objects,
+                    reached,
                 }),
             })
         })

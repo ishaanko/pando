@@ -665,6 +665,12 @@ fn decoder_matches_git_on_deep_delta_chains() {
     for i in 0..120 {
         text.push_str(&format!("line {i} {}\n", "x".repeat(i % 17)));
         std::fs::write(repo.join("big.txt"), &text).unwrap();
+        // Objects larger than the decoder's 64 KiB buffer, compressible and not.
+        let noise: Vec<u8> = (0..200_000u32)
+            .map(|n| (n.wrapping_mul(2654435761) >> (i % 7 + 8)) as u8)
+            .collect();
+        std::fs::write(repo.join("noise.bin"), &noise).unwrap();
+        std::fs::write(repo.join("large.txt"), text.repeat(40)).unwrap();
         std::fs::create_dir_all(repo.join(format!("d{}", i % 5))).unwrap();
         std::fs::write(repo.join(format!("d{}/f", i % 5)), i.to_string()).unwrap();
         git(repo, &["add", "-A"]);

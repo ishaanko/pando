@@ -64,7 +64,8 @@ pub struct Version {
 /// Where a commit was stored.
 #[derive(Clone, Debug)]
 pub struct CommitRow {
-    pub version: i64,
+    /// The first pack that stored it.
+    pub pack: Oid,
     /// The first trunk version whose tip reaches this commit, if any.
     pub trunk_seq: Option<u64>,
     pub parents: Vec<Oid>,
@@ -98,16 +99,13 @@ pub struct RefUpdate<'a> {
 pub struct NewVersion<'a> {
     pub tip: Oid,
     pub pack: Option<Oid>,
-    /// Dependencies of the pack itself; recorded once per pack.
-    pub pack_deps: &'a Deps,
     /// Dependencies of this version (the pack's, plus the tip's if outside the pack).
     pub deps: Deps,
     pub pack_complete: bool,
     pub peeled: Option<Oid>,
-    /// Commits to index. On trunk these get this version's trunk position.
-    pub commits: &'a [(Oid, Vec<Oid>)],
-    /// Objects in `pack` to index. On trunk these get this version's trunk position.
-    pub objects: &'a [Oid],
+    /// On trunk: the objects in `pack` that the new tip reaches. They get this
+    /// version's trunk position (see [`Meta::index_pack`] for the rest).
+    pub reached: &'a [Oid],
 }
 
 pub struct Meta {
@@ -189,7 +187,7 @@ impl Meta {
              );
              CREATE TABLE IF NOT EXISTS commits (
                oid TEXT PRIMARY KEY,
-               version INTEGER NOT NULL,
+               pack TEXT NOT NULL,
                trunk_seq INTEGER,
                parents TEXT NOT NULL
              );
@@ -308,10 +306,10 @@ impl Meta {
 
     pub fn commit(&self, oid: &Oid) -> rusqlite::Result<Option<CommitRow>> {
         self.conn
-            .prepare_cached("SELECT version, trunk_seq, parents FROM commits WHERE oid = ?1")?
+            .prepare_cached("SELECT pack, trunk_seq, parents FROM commits WHERE oid = ?1")?
             .query_row([oid.hex()], |row| {
                 Ok(CommitRow {
-                    version: row.get(0)?,
+                    pack: oid_col(row, 0)?,
                     trunk_seq: row.get(1)?,
                     parents: oids_col(row, 2)?,
                 })
@@ -344,8 +342,39 @@ impl Meta {
             .optional()
     }
 
+    /// Record a newly stored pack: its dependencies, and where each of its objects and
+    /// commits lives. Objects already stored elsewhere keep their first location.
+    pub fn index_pack(
+        &mut self,
+        pack: &Oid,
+        deps: &Deps,
+        objects: impl Iterator<Item = Oid>,
+        commits: &std::collections::HashMap<Oid, Vec<Oid>>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        let hex = pack.hex();
+        tx.execute(
+            "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
+            params![hex, deps.trunk, join_oids(&deps.packs)],
+        )?;
+        {
+            let mut obj =
+                tx.prepare_cached("INSERT OR IGNORE INTO objects (oid, pack) VALUES (?1, ?2)")?;
+            for oid in objects {
+                obj.execute(params![oid.hex(), hex])?;
+            }
+            let mut com = tx.prepare_cached(
+                "INSERT OR IGNORE INTO commits (oid, pack, parents) VALUES (?1, ?2, ?3)",
+            )?;
+            for (oid, parents) in commits {
+                com.execute(params![oid.hex(), hex, join_oids(parents)])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Apply ref updates as one transaction: for each, compare-and-swap the ref
-    /// pointer, append the new version, and index its commits and objects.
+    /// pointer and append the new version; on trunk, mark what the new tip reaches.
     /// All-or-nothing: if any pointer moved since the caller looked, nothing is
     /// written and the reason is returned.
     pub fn update_all(
@@ -396,37 +425,22 @@ impl Meta {
                 "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
                 params![u.refname, id],
             )?;
-            let trunk_seq = (u.refname == self.trunk).then_some(seq);
+            if u.refname == self.trunk
+                && let Some(pack) = new.pack
             {
-                let mut ins = tx.prepare_cached(
-                    "INSERT INTO commits (oid, version, trunk_seq, parents) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (oid) DO UPDATE SET trunk_seq = COALESCE(commits.trunk_seq, excluded.trunk_seq)",
-                )?;
-                for (oid, parents) in new.commits {
-                    ins.execute(params![oid.hex(), id, trunk_seq, join_oids(parents)])?;
-                }
-            }
-            if let Some(pack) = new.pack {
-                tx.execute(
-                    "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
-                    params![
-                        pack.hex(),
-                        new.pack_deps.trunk,
-                        join_oids(&new.pack_deps.packs)
-                    ],
-                )?;
-                // Prefer the trunk location of an object: trunk ranges are already
-                // part of every fetch plan, so depending on them costs nothing extra.
-                let mut ins = tx.prepare_cached(
-                    "INSERT INTO objects (oid, pack, trunk_seq) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (oid) DO UPDATE SET
-                       pack = CASE WHEN objects.trunk_seq IS NULL AND excluded.trunk_seq IS NOT NULL
-                                   THEN excluded.pack ELSE objects.pack END,
-                       trunk_seq = COALESCE(objects.trunk_seq, excluded.trunk_seq)",
-                )?;
+                // Trunk now reaches these: they get a trunk position (and move to this
+                // pack, which holds them) unless an earlier trunk version had them.
                 let pack = pack.hex();
-                for oid in new.objects {
-                    ins.execute(params![oid.hex(), pack, trunk_seq])?;
+                let mut obj = tx.prepare_cached(
+                    "UPDATE objects SET trunk_seq = ?1, pack = ?2 WHERE oid = ?3 AND trunk_seq IS NULL",
+                )?;
+                let mut com = tx.prepare_cached(
+                    "UPDATE commits SET trunk_seq = ?1 WHERE oid = ?2 AND trunk_seq IS NULL",
+                )?;
+                for oid in new.reached {
+                    let hex = oid.hex();
+                    obj.execute(params![seq, pack, hex])?;
+                    com.execute(params![seq, hex])?;
                 }
             }
             out.push(Some(Version {

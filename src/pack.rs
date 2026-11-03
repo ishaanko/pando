@@ -17,9 +17,12 @@ const REF_DELTA: u8 = 7;
 
 /// Largest single object Pando will inflate.
 pub const MAX_OBJECT_SIZE: usize = 512 << 20;
-/// Largest total of inflated bytes (objects plus delta results) for one pack. Bounds
-/// zlib bombs and chains of deltas that each expand a few bytes into 64 KiB.
-pub const MAX_INFLATED_TOTAL: usize = 4 << 30;
+/// Inflated bytes (objects plus delta results) allowed per byte of pack, with a floor
+/// of `MIN_INFLATED_BUDGET`. Decoding streams, so this bounds CPU spent on zlib bombs
+/// and chains of deltas that each expand a few bytes into 64 KiB, not memory. Real
+/// histories reconstruct to tens of times their packed size.
+pub const INFLATE_RATIO: usize = 256;
+const MIN_INFLATED_BUDGET: usize = 4 << 30;
 /// Never reserve more than this up front; vectors grow as real data arrives.
 const MAX_PREALLOC: usize = 1 << 20;
 
@@ -227,7 +230,7 @@ fn inflate_with(
     loop {
         let (in0, out0) = (z.total_in() as usize, z.total_out());
         let status = z
-            .decompress(&input[in0..], &mut buf, FlushDecompress::Finish)
+            .decompress(&input[in0..], &mut buf, FlushDecompress::None)
             .map_err(|e| bad(format!("zlib: {e}")))?;
         let produced = (z.total_out() - out0) as usize;
         if z.total_out() as usize > size {
@@ -281,7 +284,7 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     let mut raws: Vec<Raw> = Vec::with_capacity(count.min(MAX_PREALLOC / 64));
     let mut resolved: Vec<Option<(Kind, Oid)>> = Vec::with_capacity(raws.capacity());
     let mut refs = HashMap::new();
-    let mut budget = MAX_INFLATED_TOTAL;
+    let mut budget = MIN_INFLATED_BUDGET.max(buf.len().saturating_mul(INFLATE_RATIO));
 
     // Pass 1: find object boundaries; hash whole objects while streaming them.
     let mut pos = 12;

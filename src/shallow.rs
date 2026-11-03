@@ -158,8 +158,8 @@ impl Walk {
             }
         }
         for s in starts {
-            if !depth_of.contains_key(&s) {
-                depth_of.insert(s, if relative { None } else { Some(1) });
+            if let std::collections::hash_map::Entry::Vacant(e) = depth_of.entry(s) {
+                e.insert(if relative { None } else { Some(1) });
                 queue.push_back(s);
             }
         }

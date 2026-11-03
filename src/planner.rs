@@ -87,14 +87,9 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
                     p.trunk_want = p.trunk_want.max(seq);
                     continue;
                 }
-                let v = meta
-                    .version(row.version)?
-                    .ok_or(PlanError::NotOurRef(*want))?;
-                // Even a trunk version's pack is needed explicitly here: the commit is
-                // in it but not reachable from trunk.
-                p.trunk_want = p.trunk_want.max(v.deps.trunk);
-                work.extend(v.pack);
-                work.extend(v.deps.packs);
+                // Stored but not reachable from trunk: its pack and that pack's
+                // dependencies, even if the pack belongs to a trunk version.
+                work.push(row.pack);
                 continue;
             }
         };
