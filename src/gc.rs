@@ -30,6 +30,17 @@ pub struct Report {
 }
 
 pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
+    collect(repo, Some(grace))
+}
+
+/// Only mark what is dead (and stop serving it), without deleting anything. Pushes
+/// that delete a ref or rewrite trunk run this, so dropped history stops being
+/// fetchable by id right away.
+pub fn mark(repo: &Repo) -> anyhow::Result<Report> {
+    collect(repo, None)
+}
+
+fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let mut report = Report::default();
     let mut doomed: Vec<Oid> = Vec::new();
@@ -70,7 +81,7 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
                             now
                         }
                     };
-                    if now - since >= grace.as_secs() as i64 {
+                    if grace.is_some_and(|g| now - since >= g.as_secs() as i64) {
                         doomed.push(*hash);
                     }
                 }
@@ -81,6 +92,9 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
             forget(&mut meta, repo, &live, &doomed)?;
         }
     }
+    let Some(grace) = grace else {
+        return Ok(report);
+    };
     for hash in &doomed {
         report.bytes += repo.store.delete(hash)?;
         report.deleted += 1;

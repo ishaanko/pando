@@ -91,7 +91,7 @@ pub fn read_section<R: BufRead + ?Sized>(r: &mut R) -> io::Result<(Vec<String>, 
 pub struct SidebandWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
-    /// Data bytes per packet (999 for the original `side-band`).
+    /// Data bytes per packet (995 for the original `side-band`).
     max: usize,
 }
 

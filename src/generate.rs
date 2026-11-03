@@ -54,22 +54,78 @@ impl Deepen {
     }
 }
 
-/// Which objects a partial clone leaves out (`--filter=<spec>`).
+/// Which objects a partial clone leaves out (`--filter=<spec>`): every part of a
+/// `combine:` filter must keep an object for it to be sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filter(Vec<Atom>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Filter {
+enum Atom {
     /// `blob:none`
     BlobNone,
     /// `blob:limit=<n>`: blobs of at least `n` bytes are left out.
     BlobLimit(u64),
     /// `tree:<depth>`: trees and blobs at or below `depth` (the root tree is 0).
     Tree(u64),
+    /// `object:type=<type>`: only objects of this type.
+    Type(Kind),
 }
 
 impl Filter {
     pub fn parse(spec: &str) -> anyhow::Result<Filter> {
+        match spec.strip_prefix("combine:") {
+            Some(parts) => parts
+                .split('+')
+                .map(|p| Atom::parse(&percent_decode(p)))
+                .collect::<anyhow::Result<_>>()
+                .map(Filter),
+            None => Ok(Filter(vec![Atom::parse(spec)?])),
+        }
+    }
+
+    /// Whether a tree at `depth` is walked into.
+    fn enters(&self, depth: u64) -> bool {
+        self.0
+            .iter()
+            .all(|a| !matches!(a, Atom::Tree(max) if depth >= *max))
+    }
+
+    fn keeps_tree(&self, depth: u64) -> bool {
+        self.enters(depth) && self.keeps_kind(Kind::Tree)
+    }
+
+    /// Commits and tags reached by the walk.
+    fn keeps_kind(&self, kind: Kind) -> bool {
+        self.0
+            .iter()
+            .all(|a| !matches!(a, Atom::Type(t) if *t != kind))
+    }
+
+    fn keeps_blob(
+        &self,
+        depth: u64,
+        size: impl Fn() -> anyhow::Result<u64>,
+    ) -> anyhow::Result<bool> {
+        for a in &self.0 {
+            let keep = match *a {
+                Atom::BlobNone => false,
+                Atom::BlobLimit(max) => size()? < max,
+                Atom::Tree(max) => depth < max,
+                Atom::Type(t) => t == Kind::Blob,
+            };
+            if !keep {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Atom {
+    fn parse(spec: &str) -> anyhow::Result<Atom> {
         let unsupported = || anyhow::anyhow!("filter '{spec}' not supported");
         if spec == "blob:none" {
-            return Ok(Filter::BlobNone);
+            return Ok(Atom::BlobNone);
         }
         if let Some(n) = spec.strip_prefix("blob:limit=") {
             let (digits, unit) = match n.find(|c: char| !c.is_ascii_digit()) {
@@ -84,17 +140,45 @@ impl Filter {
                 _ => return Err(unsupported()),
             };
             let n: u64 = digits.parse().map_err(|_| unsupported())?;
-            return Ok(Filter::BlobLimit(n.saturating_mul(scale)));
+            return Ok(Atom::BlobLimit(n.saturating_mul(scale)));
         }
         if let Some(d) = spec.strip_prefix("tree:") {
-            return Ok(Filter::Tree(d.parse().map_err(|_| unsupported())?));
+            return Ok(Atom::Tree(d.parse().map_err(|_| unsupported())?));
+        }
+        if let Some(t) = spec.strip_prefix("object:type=") {
+            return Ok(Atom::Type(match t {
+                "blob" => Kind::Blob,
+                "tree" => Kind::Tree,
+                "commit" => Kind::Commit,
+                "tag" => Kind::Tag,
+                _ => return Err(unsupported()),
+            }));
         }
         Err(unsupported())
     }
+}
 
-    fn keeps_tree(self, depth: u64) -> bool {
-        !matches!(self, Filter::Tree(max) if depth >= max)
+/// Undo the `%XX` escapes git uses inside `combine:` filters.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
     }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a fetch must be answered with a fresh pack rather than stored ones.
@@ -163,7 +247,7 @@ impl Generated {
 
     /// Write the pack.
     pub fn write(&self, out: &mut dyn Write) -> anyhow::Result<()> {
-        let objects = self.walk.objects(&self.odb, self.filter)?;
+        let objects = self.walk.objects(&self.odb, self.filter.as_ref())?;
         write_pack(&self.odb, &objects, out)
     }
 }
@@ -201,6 +285,8 @@ struct Walk {
     had_border: Vec<Oid>,
     /// Tags the client asked for.
     tags: Vec<Oid>,
+    /// What the client asked for by name (always sent, whatever the filter).
+    wanted: HashSet<Oid>,
     /// Trees and blobs that wanted tags point at directly; sent with no history.
     tagged: Vec<(Kind, Oid)>,
     shallow: Vec<Oid>,
@@ -259,6 +345,7 @@ impl Walk {
             }
         }
         let mut w = Walk {
+            wanted: args.wants.iter().copied().collect(),
             send: vec![],
             had_border: vec![],
             tags,
@@ -304,7 +391,9 @@ impl Walk {
                     queue.push_back(*p);
                 }
             }
-            if cut && !client_shallow.contains(&c) && !have.contains(&c) {
+            // Like git, the boundary ignores haves: a shorter depth cuts history the
+            // client already has.
+            if cut && !client_shallow.contains(&c) {
                 w.shallow.push(c);
             }
             if descended && client_shallow.contains(&c) {
@@ -327,60 +416,81 @@ impl Walk {
     /// Every object to send: tags, commits, and the parts of their trees the client
     /// does not already have and the filter keeps. Objects the client asked for by
     /// name are always sent.
-    fn objects(&self, odb: &Odb, filter: Option<Filter>) -> anyhow::Result<Vec<Oid>> {
-        let mut known = HashSet::new();
+    fn objects(&self, odb: &Odb, filter: Option<&Filter>) -> anyhow::Result<Vec<Oid>> {
+        // Trees and blobs the client has, next to what is sent.
+        let mut has = HashSet::new();
         for c in &self.had_border {
             if let Some((_, data)) = odb.read(c)? {
-                walk_tree(odb, commit_tree(&data), 0, None, &mut known, &mut |_| {})?;
+                let mut depths = HashMap::new();
+                let none = HashSet::new();
+                walk_tree(
+                    odb,
+                    commit_tree(&data),
+                    None,
+                    &none,
+                    &mut depths,
+                    &mut |o| {
+                        has.insert(o);
+                    },
+                )?;
             }
         }
         let mut out = self.tags.clone();
         let mut seen: HashSet<Oid> = out.iter().copied().collect();
-        for (kind, oid) in &self.tagged {
-            if seen.insert(*oid) {
-                out.push(*oid);
+        let mut depths = HashMap::new();
+        let mut emit = |o: Oid| {
+            if seen.insert(o) {
+                out.push(o);
             }
+        };
+        for (kind, oid) in &self.tagged {
+            emit(*oid);
             if *kind == Kind::Tree {
-                known.remove(oid);
-                walk_tree(odb, Some(*oid), 0, filter, &mut known, &mut |o| {
-                    if seen.insert(o) {
-                        out.push(o);
-                    }
-                })?;
+                walk_tree(odb, Some(*oid), filter, &has, &mut depths, &mut emit)?;
             }
         }
         for c in &self.send {
-            if seen.insert(*c) {
-                out.push(*c);
+            if self.wanted.contains(c) || filter.is_none_or(|f| f.keeps_kind(Kind::Commit)) {
+                emit(*c);
             }
             let (_, data) = odb.read(c)?.unwrap();
-            walk_tree(odb, commit_tree(&data), 0, filter, &mut known, &mut |oid| {
-                if seen.insert(oid) {
-                    out.push(oid);
-                }
-            })?;
+            walk_tree(
+                odb,
+                commit_tree(&data),
+                filter,
+                &has,
+                &mut depths,
+                &mut emit,
+            )?;
         }
         Ok(out)
     }
 }
 
-/// Visit every tree and blob under `root` (at `depth`) that is not in `known` and that
-/// `filter` keeps, adding them to `known`. A tree the filter drops is not entered.
+/// Visit every tree and blob under `root` that the client does not have (`has`) and
+/// `filter` keeps. `depths` remembers the shallowest depth each tree was walked at,
+/// so a tree first met deep down is walked again when it turns up higher (it matters
+/// for `tree:<depth>`). Visits may repeat.
 fn walk_tree(
     odb: &Odb,
     root: Option<Oid>,
-    depth: u64,
-    filter: Option<Filter>,
-    known: &mut HashSet<Oid>,
+    filter: Option<&Filter>,
+    has: &HashSet<Oid>,
+    depths: &mut HashMap<Oid, u64>,
     visit: &mut dyn FnMut(Oid),
 ) -> anyhow::Result<()> {
-    let keeps_tree = |d: u64| filter.is_none_or(|f| f.keeps_tree(d));
-    let mut stack: Vec<(Oid, u64)> = root.into_iter().map(|r| (r, depth)).collect();
-    while let Some((tree, depth)) = stack.pop() {
-        if !keeps_tree(depth) || !known.insert(tree) {
+    let mut queue: VecDeque<(Oid, u64)> = root.into_iter().map(|r| (r, 0)).collect();
+    while let Some((tree, depth)) = queue.pop_front() {
+        if has.contains(&tree) || depths.get(&tree).is_some_and(|d| *d <= depth) {
             continue;
         }
-        visit(tree);
+        depths.insert(tree, depth);
+        if filter.is_none_or(|f| f.keeps_tree(depth)) {
+            visit(tree);
+        }
+        if filter.is_some_and(|f| !f.enters(depth)) {
+            continue;
+        }
         let (_, data) = odb
             .read(&tree)?
             .ok_or_else(|| anyhow::anyhow!("missing tree {tree}"))?;
@@ -391,19 +501,14 @@ fn walk_tree(
                 continue;
             }
             if mode & 0o170000 == 0o040000 {
-                stack.push((oid, depth + 1));
+                queue.push_back((oid, depth + 1));
                 continue;
             }
-            let keep = match filter {
-                None => true,
-                Some(Filter::BlobNone) => false,
-                Some(Filter::Tree(max)) => depth + 1 < max,
-                Some(Filter::BlobLimit(max)) => {
-                    known.contains(&oid)
-                        || odb.read(&oid)?.is_some_and(|(_, d)| (d.len() as u64) < max)
-                }
-            };
-            if keep && known.insert(oid) {
+            if has.contains(&oid) {
+                continue;
+            }
+            let size = || Ok(odb.size(&oid)?.unwrap_or(0) as u64);
+            if filter.map_or(Ok(true), |f| f.keeps_blob(depth + 1, size))? {
                 visit(oid);
             }
         }

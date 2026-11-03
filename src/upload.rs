@@ -12,7 +12,7 @@ use crate::object::Oid;
 use crate::pack::{self, IdxEntry};
 use crate::pktline::{self, Packet, SidebandWriter};
 use crate::planner::{self, Plan, PlanError};
-use crate::server::{AGENT, Repo, Server, blocking, body_reader, git_response};
+use crate::server::{AGENT, Repo, Server, blocking, git_response, read_small_body};
 use crate::{express, metrics};
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
@@ -22,6 +22,27 @@ use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Largest fetch request accepted, compressed and decoded. A mirror clone of
+/// thousands of refs needs a few hundred KB.
+const MAX_REQUEST_BYTES: usize = 16 << 20;
+const MAX_REQUEST_DECODED: u64 = 64 << 20;
+/// Most lines (wants, haves, arguments) read from one request.
+const MAX_REQUEST_LINES: usize = 500_000;
+
+/// Read one section of a request, refusing absurdly long ones.
+fn read_section(r: &mut dyn BufRead) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    while let Some(Packet::Data(d)) = pktline::read(r)? {
+        anyhow::ensure!(lines.len() < MAX_REQUEST_LINES, "request too large");
+        let mut s = String::from_utf8_lossy(&d).into_owned();
+        if s.ends_with('\n') {
+            s.pop();
+        }
+        lines.push(s);
+    }
+    Ok(lines)
+}
 
 /// Which protocol a client asked for (the `Git-Protocol` header or `GIT_PROTOCOL`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +162,7 @@ pub async fn handle(
     req: Request,
 ) -> anyhow::Result<Response> {
     let version = Version::from_headers(req.headers());
-    let open_body = body_reader(req);
+    let open_body = read_small_body(req, MAX_REQUEST_BYTES, MAX_REQUEST_DECODED).await?;
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
     tokio::task::spawn_blocking(move || {
         let mut body = open_body();
@@ -168,8 +189,26 @@ pub async fn handle(
 }
 
 /// A whole upload-pack conversation over a byte stream (SSH): the advertisement, then
-/// v2 commands until the client hangs up, or one stateful v0/v1 negotiation.
+/// v2 commands until the client hangs up, or one stateful v0/v1 negotiation. Errors
+/// reach the client as an `ERR` packet, which git shows as a remote error.
 pub fn serve_stream(
+    server: &Server,
+    repo: &Repo,
+    version: Version,
+    r: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let result = converse(server, repo, version, r, out);
+    if let Err(e) = &result {
+        let mut err = Vec::new();
+        pktline::line(&mut err, format!("ERR {e}\n"));
+        let _ = out.write_all(&err);
+        let _ = out.flush();
+    }
+    result
+}
+
+fn converse(
     server: &Server,
     repo: &Repo,
     version: Version,
@@ -213,13 +252,13 @@ fn command(
     r: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<bool> {
-    let (head, _) = pktline::read_section(r)?;
+    let head = read_section(r)?;
     let command = head
         .iter()
         .find_map(|l| l.strip_prefix("command="))
         .unwrap_or("")
         .to_string();
-    let (args, _) = pktline::read_section(r)?;
+    let args = read_section(r)?;
     match command.as_str() {
         "ls-refs" => out.write_all(&ls_refs(&repo.meta.lock().unwrap(), &args)?)?,
         "fetch" => fetch(server, repo, &FetchArgs::parse(&args), out)?,
@@ -440,9 +479,7 @@ fn session_v0(
     // Wants, capabilities, shallow lines, deepen and filter requests, up to a flush.
     let mut args: Vec<String> = Vec::new();
     let mut caps: HashSet<String> = HashSet::new();
-    while let Some(Packet::Data(d)) = pktline::read(r)? {
-        let line = String::from_utf8_lossy(&d);
-        let line = line.trim_end_matches('\n');
+    for line in read_section(r)? {
         if let Some(rest) = line.strip_prefix("want ") {
             let mut parts = rest.split(' ');
             args.push(format!("want {}", parts.next().unwrap_or("")));
@@ -471,7 +508,7 @@ fn session_v0(
     let band = if caps.contains("side-band-64k") {
         Some(pktline::MAX_PAYLOAD - 1)
     } else if caps.contains("side-band") {
-        Some(999)
+        Some(995) // 1000-byte packets, as git sends
     } else {
         None
     };
@@ -509,6 +546,10 @@ fn session_v0(
         loop {
             match pktline::read(r)? {
                 Some(Packet::Data(d)) => {
+                    anyhow::ensure!(
+                        haves.len() + batch.len() < MAX_REQUEST_LINES,
+                        "request too large"
+                    );
                     let line = String::from_utf8_lossy(&d);
                     let line = line.trim_end_matches('\n');
                     if line == "done" {

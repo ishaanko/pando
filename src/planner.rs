@@ -22,8 +22,12 @@ use std::collections::{HashSet, VecDeque};
 pub const FANOUT: u64 = 4;
 /// Highest compaction level.
 pub const MAX_LEVEL: u32 = 4;
-/// How far to walk back from a `have` looking for a known ref version tip.
-const HAVE_WALK_LIMIT: usize = 256;
+/// How many commits to walk back from the haves, in total, looking for known ref
+/// version tips.
+const HAVE_WALK_LIMIT: usize = 4096;
+/// Haves beyond this many are ignored (git clients send far fewer); the cost is only
+/// a larger pack.
+const MAX_HAVES: usize = 4096;
 
 pub fn span(level: u32) -> u64 {
     FANOUT.pow(level)
@@ -54,9 +58,16 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
     let mut had_versions = HashSet::new();
     let mut had_packs = HashSet::new();
     let have_set: HashSet<Oid> = haves.iter().copied().collect();
-
+    let mut walked = HashSet::new();
+    let mut considered = HashSet::new();
     for have in haves {
-        let (known, tips) = tips_reachable_from(meta, have)?;
+        if considered.len() >= MAX_HAVES {
+            break;
+        }
+        if !considered.insert(*have) {
+            continue;
+        }
+        let (known, tips) = tips_reachable_from(meta, have, &mut walked)?;
         if !known {
             continue;
         }
@@ -95,6 +106,9 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
                 // Not a tip: an older commit, or any other object. Serve whichever
                 // pack stored it.
                 let row = meta.object(want)?.ok_or(PlanError::NotOurRef(*want))?;
+                if meta.pack_dead(&row.pack)? {
+                    return Err(PlanError::NotOurRef(*want));
+                }
                 match row.trunk_seq {
                     Some(seq) if meta.in_epoch(seq) => p.trunk_want = p.trunk_want.max(seq),
                     // Its pack and that pack's dependencies.
@@ -105,6 +119,12 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         };
         if version.on_trunk {
             p.trunk_want = p.trunk_want.max(version.seq);
+        } else if version
+            .pack
+            .is_some_and(|pk| meta.pack_dead(&pk).unwrap_or(false))
+        {
+            // Only reachable through a deleted or rewritten ref.
+            return Err(PlanError::NotOurRef(*want));
         } else if !had_versions.contains(&version.id) {
             need(&mut p, &mut old_want, version.deps.trunk);
             work.extend(version.pack);
@@ -165,12 +185,18 @@ fn best_version(mut vs: Vec<Version>) -> Option<Version> {
 }
 
 /// Is `have` a commit we know, and which ref version tips does the client therefore
-/// have? Walks parents a bounded distance; reaching a trunk tip stops that path,
-/// since trunk tips imply every earlier trunk version of their epoch.
-fn tips_reachable_from(meta: &Meta, have: &Oid) -> Result<(bool, Vec<Version>), PlanError> {
+/// have? Walks parents within a budget shared by all haves (`walked`); reaching a
+/// trunk tip stops that path, since trunk tips imply every earlier trunk version of
+/// their epoch.
+fn tips_reachable_from(
+    meta: &Meta,
+    have: &Oid,
+    walked: &mut HashSet<Oid>,
+) -> Result<(bool, Vec<Version>), PlanError> {
     let mut tips = Vec::new();
     let mut known = false;
-    let mut seen = HashSet::from([*have]);
+    let seen = walked;
+    seen.insert(*have);
     let mut queue = VecDeque::from([*have]);
     while let Some(oid) = queue.pop_front() {
         let versions = meta.versions_with_tip(&oid)?;

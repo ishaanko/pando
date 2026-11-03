@@ -78,6 +78,10 @@ pub async fn handle(server: Arc<Server>, req: Request) -> Response {
             let Some(to) = param("to") else {
                 return (StatusCode::BAD_REQUEST, "missing ?to=\n").into_response();
             };
+            // The new name must be within the caller's reach too.
+            if server.authorize(req.headers(), &to, Access::Admin).is_err() {
+                return denied();
+            }
             blocking(move || Ok(s.rename_repo(&name, &to)?.then(String::new))).await
         }
         (Method::PUT, "head") => {

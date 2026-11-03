@@ -1822,9 +1822,10 @@ fn gc_deletes_unreachable_packs_and_keeps_everything_else_servable() {
     git(&a, &["push", "-q", "origin", "--delete", "doomed"]);
     assert!(stored_objects(&s).contains(&secret));
 
-    // Within the grace period, packs are only marked.
+    // The pushes already marked what they dropped; within the grace period nothing
+    // is deleted.
     let r = pando::gc::run(&repo, std::time::Duration::from_secs(3600)).unwrap();
-    assert!(r.marked > 0 && r.deleted == 0, "{r:?}");
+    assert!(r.marked == 0 && r.deleted == 0, "{r:?}");
     assert!(stored_objects(&s).contains(&secret));
     let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
     assert!(r.deleted > 0, "{r:?}");
@@ -2044,12 +2045,20 @@ fn admin_api_manages_repositories() {
         ],
     );
     git(&z, &["fsck", "--no-progress"]);
+    // A scoped admin cannot move a repository out of its scope.
+    assert_eq!(
+        http("POST", &api("/team/z/rename?to=stolen"), Some("tl")).0,
+        403
+    );
     assert_eq!(http("DELETE", &api("/team/y"), Some("tl")).0, 204);
     assert_eq!(http("DELETE", &api("/team/y"), Some("tl")).0, 404);
     let (_, body) = http("GET", &api(""), Some("ta"));
     assert!(body.contains("team/z") && !body.contains("team/x") && !body.contains("team/y"));
-    // A pushed name that was deleted starts over as a new repository.
+    // A pushed name that was deleted starts over as a new repository; names cannot
+    // nest one repository inside another.
     push("team/y");
+    let nested = format!("{}/team/y.git/inner.git", s.base).replace("http://", "http://w:tw@");
+    git_fails(&a, &["push", "-q", &nested, "main"]);
 
     let (code, body) = http("POST", &api("/repo/gc"), Some("ta"));
     assert_eq!(code, 200);
@@ -2201,4 +2210,161 @@ fn express_cache_evicts_least_recently_served_packs() {
     assert!(!cached().contains(&format!("{}.pack", packs[0])));
     get(&packs[0]);
     assert!(cached().contains(&format!("{}.pack", packs[0])));
+}
+
+#[test]
+fn shallow_fetch_can_make_history_shorter() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    for i in 0..10 {
+        commit(&a, "f", &i.to_string());
+    }
+    git(&a, &["push", "-q", &s.url, "main"]);
+    for proto in ["2", "0"] {
+        let c = s.path(&format!("c{proto}"));
+        let v = format!("protocol.version={proto}");
+        git(
+            s.dir.path(),
+            &[
+                "-c",
+                &v,
+                "clone",
+                "-q",
+                "--depth",
+                "5",
+                &s.url,
+                c.to_str().unwrap(),
+            ],
+        );
+        git(&c, &["-c", &v, "fetch", "-q", "--depth", "1"]);
+        assert_eq!(count(&c, "origin/main"), 1, "protocol v{proto}");
+        git(&c, &["fsck", "--no-progress"]);
+    }
+}
+
+#[test]
+fn combined_filters_and_trees_shared_across_depths() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    // The same tree at depth 1 (`a`) and depth 2 (`b/a`).
+    for dir in ["a", "b/a", "b/c/d"] {
+        std::fs::create_dir_all(a.join(dir)).unwrap();
+        std::fs::write(a.join(dir).join("x"), "same").unwrap();
+    }
+    git(&a, &["add", "."]);
+    commit(&a, "f", "1");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    let blob = git(&a, &["rev-parse", "HEAD:a/x"]);
+    for (name, filters) in [
+        ("tree3", vec!["--filter=tree:3"]),
+        (
+            "combined",
+            vec!["--filter=blob:limit=1m", "--filter=tree:3"],
+        ),
+    ] {
+        let d = s.path(name);
+        let mut args = vec!["clone", "-q", "--no-checkout"];
+        args.extend(filters);
+        args.extend([s.url.as_str(), d.to_str().unwrap()]);
+        git(s.dir.path(), &args);
+        // a/x sits at depth 2, inside the filter, even though its tree also appears
+        // deeper as b/a.
+        let missing = git(&d, &["rev-list", "--objects", "--all", "--missing=print"]);
+        assert!(!missing.contains(&format!("?{blob}")), "{name}: {missing}");
+        git(&d, &["checkout", "-q", "main"]);
+        git(&d, &["fsck", "--no-progress"]);
+    }
+}
+
+#[test]
+fn deleted_history_is_not_served_by_id() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "1");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    git(&a, &["checkout", "-qb", "secret"]);
+    let secret = commit(&a, "key", "AWS_KEY=xyz");
+    git(&a, &["push", "-q", &s.url, "secret"]);
+    git(&a, &["push", "-q", &s.url, "--delete", "secret"]);
+    let c = clone(&s, "c", false);
+    let err = git_fails(&c, &["fetch", "-q", "origin", &secret]);
+    assert!(err.contains("not our ref"), "{err}");
+    // Force-pushed trunk history too.
+    git(&a, &["checkout", "-q", "main"]);
+    let dropped = commit(&a, "f", "2");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    git(&a, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&a, "f", "3");
+    git(&a, &["push", "-qf", &s.url, "main"]);
+    let err = git_fails(&c, &["fetch", "-q", "origin", &dropped]);
+    assert!(err.contains("not our ref"), "{err}");
+    git(&c, &["fetch", "-q", "origin"]);
+    git(&c, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn oversized_and_stalled_fetch_requests_do_not_block_the_server() {
+    use std::io::Write;
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    let tip = commit(&a, "f", "1");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    let addr = s.base.trim_start_matches("http://").to_string();
+
+    // Hundreds of requests that start a body and stall.
+    let stalled: Vec<std::net::TcpStream> = (0..600)
+        .map(|_| {
+            let mut t = std::net::TcpStream::connect(&addr).unwrap();
+            write!(
+                t,
+                "POST /repo.git/git-upload-pack HTTP/1.1\r\nHost: x\r\n\
+                 Content-Type: application/x-git-upload-pack-request\r\n\
+                 Git-Protocol: version=2\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n0014\r\n"
+            )
+            .unwrap();
+            t
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let c = clone(&s, "c", false);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(git(&c, &["rev-parse", "HEAD"]), tip);
+    drop(stalled);
+
+    // A request with a million haves is refused, not planned.
+    let mut body = Vec::new();
+    for line in ["command=fetch\n".to_string(), "object-format=sha1\n".into()] {
+        body.extend(format!("{:04x}{line}", line.len() + 4).bytes());
+    }
+    body.extend(b"0001");
+    let want = format!("want {tip}\n");
+    body.extend(format!("{:04x}{want}", want.len() + 4).bytes());
+    let have = format!("have {}\n", "1".repeat(40));
+    let have = format!("{:04x}{have}", have.len() + 4);
+    for _ in 0..1_000_000 {
+        body.extend(have.bytes());
+    }
+    body.extend(b"0000");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&body).unwrap();
+    let gz = gz.finish().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let text = rt.block_on(async {
+        pando::http_client()
+            .post(format!("{}/git-upload-pack", s.url))
+            .header("Git-Protocol", "version=2")
+            .header("Content-Encoding", "gzip")
+            .body(gz)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+    assert!(text.contains("ERR"), "{text}");
 }

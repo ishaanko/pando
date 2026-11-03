@@ -18,9 +18,9 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -382,13 +382,14 @@ pub fn repo_names(data: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// Repository names: one or more `/`-separated segments of `[A-Za-z0-9._-]`, none
-/// starting with a dot.
+/// starting with a dot or ending in `.git` (so no repository nests inside another).
 pub fn valid_repo_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.split('/').all(|seg| {
             !seg.is_empty()
                 && !seg.starts_with('.')
+                && !seg.ends_with(".git")
                 && seg
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -507,16 +508,67 @@ pub async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await?
 }
 
-/// Wrap a request body as a blocking reader, gunzipping if the client compressed it.
-/// The returned opener must run on a blocking thread: the gzip decoder reads its
-/// header as soon as it is built, and the bridge cannot block an async worker.
-pub fn body_reader(req: Request) -> impl FnOnce() -> Box<dyn BufRead + Send> + Send {
-    let gzip = req
-        .headers()
+/// How long a client may leave a request body idle before it is dropped.
+pub const BODY_IDLE: Duration = Duration::from_secs(120);
+
+fn is_gzip(req: &Request) -> bool {
+    req.headers()
         .get(header::CONTENT_ENCODING)
-        .is_some_and(|v| v == "gzip");
-    let stream = req.into_body().into_data_stream().map_err(io::Error::other);
-    let sync = SyncIoBridge::new(StreamReader::new(stream));
+        .is_some_and(|v| v == "gzip")
+}
+
+/// Read a whole (small) request body without holding a blocking thread, up to `max`
+/// bytes. A client that stalls for [`BODY_IDLE`] or sends more is refused. Returns a
+/// reader that gunzips if needed, decoding at most `max_decoded` bytes; it must be
+/// opened on a blocking thread.
+pub async fn read_small_body(
+    req: Request,
+    max: usize,
+    max_decoded: u64,
+) -> anyhow::Result<impl FnOnce() -> Box<dyn BufRead + Send> + Send> {
+    let gzip = is_gzip(&req);
+    let mut stream = req.into_body().into_data_stream();
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(BODY_IDLE, stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("request body stalled"))?;
+        let Some(chunk) = chunk else { break };
+        body.extend_from_slice(&chunk?);
+        anyhow::ensure!(body.len() <= max, "request body larger than {max} bytes");
+    }
+    Ok(move || -> Box<dyn BufRead + Send> {
+        let cursor = io::Cursor::new(body);
+        if gzip {
+            Box::new(BufReader::new(
+                flate2::read::GzDecoder::new(cursor).take(max_decoded),
+            ))
+        } else {
+            Box::new(cursor)
+        }
+    })
+}
+
+/// Wrap a (possibly huge) request body as a blocking reader, gunzipping if the client
+/// compressed it. A body that stalls for [`BODY_IDLE`] fails the read. The returned
+/// opener must run on a blocking thread: the gzip decoder reads its header as soon as
+/// it is built, and the bridge cannot block an async worker.
+pub fn body_reader(req: Request) -> impl FnOnce() -> Box<dyn BufRead + Send> + Send {
+    let gzip = is_gzip(&req);
+    let stream = futures_util::stream::unfold(req.into_body().into_data_stream(), |mut s| async {
+        match tokio::time::timeout(BODY_IDLE, s.next()).await {
+            Ok(Some(chunk)) => Some((chunk.map_err(io::Error::other), s)),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request body stalled",
+                )),
+                s,
+            )),
+        }
+    });
+    let sync = SyncIoBridge::new(StreamReader::new(Box::pin(stream)));
     move || -> Box<dyn BufRead + Send> {
         if gzip {
             Box::new(BufReader::new(flate2::read::GzDecoder::new(sync)))

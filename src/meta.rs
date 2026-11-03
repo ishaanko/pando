@@ -486,6 +486,17 @@ impl Meta {
         Ok(peeled)
     }
 
+    /// Whether gc found a pack unreachable (it is kept for a while, but not served
+    /// to new requests by object id).
+    pub fn pack_dead(&self, pack: &Oid) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT dead_since IS NOT NULL FROM packs WHERE hash = ?1")?
+            .query_row([pack.hex()], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
+    }
+
     /// Dependencies recorded for a stored pack.
     pub fn pack_deps(&self, pack: &Oid) -> rusqlite::Result<Option<Deps>> {
         self.conn
