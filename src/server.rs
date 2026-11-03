@@ -8,7 +8,7 @@
 //! - `POST /<repo>.git/git-receive-pack`       push (see `receive.rs`)
 //! - `GET  /<repo>.git/pack/<hash>.pack`       stored packs (the local Express origin)
 
-use crate::auth::{Access, Auth};
+use crate::auth::{Access, Auth, UrlSigner};
 use crate::express::{self, Express};
 use crate::meta::Meta;
 use crate::store::BlobStore;
@@ -56,6 +56,8 @@ pub struct Config {
     pub public_read: bool,
     /// Background compaction period. `None` disables the background compactor.
     pub compact_every: Option<Duration>,
+    /// Secret for signing pack URLs, shared with Express nodes. Random when unset.
+    pub url_secret: Option<String>,
 }
 
 impl Config {
@@ -69,6 +71,7 @@ impl Config {
             auth: None,
             public_read: false,
             compact_every: Some(Duration::from_secs(30)),
+            url_secret: None,
         }
     }
 }
@@ -87,6 +90,7 @@ pub struct Server {
     repos: Mutex<HashMap<String, Arc<Repo>>>,
     /// Serves this server's own packs; also the origin for remote Express nodes.
     local: Express,
+    pub signer: UrlSigner,
 }
 
 impl Server {
@@ -100,16 +104,26 @@ impl Server {
         let find: express::LocalPacks = Arc::new(move |repo: &str, hash| {
             valid_repo_name(repo).then(|| root.join(format!("{repo}.git/blobs/packs/{hash}.pack")))
         });
-        let local = Express::new(express::Origin::Local(find), None)?;
+        let local = Express::new(express::Origin::Local(find), None, None)?;
+        let signer = match &cfg.url_secret {
+            Some(s) => UrlSigner::new(s.as_bytes()),
+            None => UrlSigner::random()?,
+        };
         Ok(Arc::new(Server {
             cfg,
             repos: Mutex::new(HashMap::new()),
             local,
+            signer,
         }))
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new().fallback(dispatch).with_state(self.clone())
+    }
+
+    /// Whether pack downloads need a token or a signed URL.
+    pub fn packs_need_auth(&self) -> bool {
+        self.cfg.auth.is_some() && !self.cfg.public_read
     }
 
     /// Base URLs that packfile URIs point at.
@@ -210,7 +224,22 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
     if method == Method::GET
         && let Some((repo, hash)) = express::parse_pack_path(&path)
     {
-        return express::serve(&server.local, repo, hash, req.headers()).await;
+        let query = req.uri().query().unwrap_or("");
+        let allowed = !server.packs_need_auth()
+            || server.signer.verify(repo, &hash, query)
+            || server
+                .cfg
+                .auth
+                .as_ref()
+                .is_some_and(|a| a.check(req.headers()).is_some());
+        if !allowed {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "pack URL is unsigned or expired\n",
+            )
+                .into_response();
+        }
+        return express::serve(&server.local, repo, hash, req.headers(), "").await;
     }
     let Some((name, endpoint)) = split_path(&path) else {
         return StatusCode::NOT_FOUND.into_response();

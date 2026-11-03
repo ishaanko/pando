@@ -80,3 +80,99 @@ impl Auth {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+/// Signs pack URLs handed out in fetch responses, so a client can download exactly the
+/// packs it was authorized for, for a limited time, without credentials. Express nodes
+/// given the same secret check the same signatures.
+pub struct UrlSigner {
+    secret: Vec<u8>,
+}
+
+/// How long a signed pack URL stays valid.
+const URL_TTL_SECS: u64 = 3600;
+
+impl UrlSigner {
+    pub fn new(secret: &[u8]) -> UrlSigner {
+        UrlSigner {
+            secret: secret.to_vec(),
+        }
+    }
+
+    /// A signer with a random secret (URLs stop working when the process restarts).
+    pub fn random() -> std::io::Result<UrlSigner> {
+        use std::io::Read;
+        let mut secret = vec![0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        Ok(UrlSigner { secret })
+    }
+
+    /// The query string (`exp=...&sig=...`) authorizing `repo`'s pack `hash`.
+    pub fn sign(&self, repo: &str, hash: &crate::object::Oid) -> String {
+        let exp = now() + URL_TTL_SECS;
+        format!("exp={exp}&sig={}", hex::encode(self.mac(repo, hash, exp)))
+    }
+
+    pub fn verify(&self, repo: &str, hash: &crate::object::Oid, query: &str) -> bool {
+        let field = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k));
+        let (Some(exp), Some(sig)) = (field("exp="), field("sig=")) else {
+            return false;
+        };
+        let (Ok(exp), Ok(sig)) = (exp.parse::<u64>(), hex::decode(sig)) else {
+            return false;
+        };
+        exp >= now() && constant_time_eq(&self.mac(repo, hash, exp), &sig)
+    }
+
+    fn mac(&self, repo: &str, hash: &crate::object::Oid, exp: u64) -> [u8; 20] {
+        hmac_sha1(&self.secret, format!("{repo}\n{hash}\n{exp}").as_bytes())
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// HMAC (RFC 2104) over SHA-1.
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..20].copy_from_slice(&Sha1::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.map(|x| x ^ b);
+    let inner = Sha1::new()
+        .chain_update(pad(0x36))
+        .chain_update(msg)
+        .finalize();
+    Sha1::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmac_matches_rfc_2202() {
+        let mac = hmac_sha1(&[0x0b; 20], b"Hi There");
+        assert_eq!(hex::encode(mac), "b617318655057264e28bc0b6fb378c8ef146be00");
+    }
+
+    #[test]
+    fn signed_urls_verify_only_for_their_pack() {
+        let s = UrlSigner::new(b"k");
+        let h = crate::object::Oid([7; 20]);
+        let q = s.sign("r", &h);
+        assert!(s.verify("r", &h, &q));
+        assert!(!s.verify("other", &h, &q));
+        assert!(!s.verify("r", &crate::object::Oid([8; 20]), &q));
+        assert!(!UrlSigner::new(b"x").verify("r", &h, &q));
+    }
+}

@@ -6,7 +6,7 @@
 //! range and which other packs the new versions depend on. Each ref then moves by a
 //! compare-and-swap on its pointer.
 
-use crate::meta::{Deps, Meta, NewVersion, RefUpdate, Version};
+use crate::meta::{CommitRow, Deps, Meta, NewVersion, RefUpdate, Version};
 use crate::object::Oid;
 use crate::pack::{self, ParsedPack};
 use crate::pktline::{self, Packet};
@@ -345,6 +345,22 @@ fn plan_updates(
             if !pack.is_some_and(|p| p.contains(&c.new)) {
                 deps.add(&resolve(meta, &c.new)?);
             }
+            if current.is_none() {
+                let sibling = commands.iter().find(|o| {
+                    !o.new.is_zero()
+                        && (o.refname.starts_with(&format!("{}/", c.refname))
+                            || c.refname.starts_with(&format!("{}/", o.refname)))
+                });
+                if let Some(other) = sibling {
+                    return Err(format!(
+                        "cannot create both {} and {}",
+                        c.refname, other.refname
+                    ));
+                }
+                if let Some(other) = meta.ref_path_conflict(&c.refname).map_err(db)? {
+                    return Err(format!("conflicts with existing ref {other}"));
+                }
+            }
             if is_trunk {
                 if stale(&current) {
                     return Err("fetch first".into());
@@ -405,6 +421,7 @@ fn apply(
             pack_deps,
             p.entries.iter().map(|e| e.oid),
             &p.commits,
+            &p.tags,
         )?;
     }
     // With a single ref pushed, every object in the pack is reachable from its tip.
@@ -420,11 +437,29 @@ fn apply(
         })
         .collect();
 
+    // Branch packs a new trunk tip has absorbed (fast-forwarded to or merged).
+    let reached_packs: Vec<Vec<Oid>> = commands
+        .iter()
+        .zip(planned)
+        .map(|(c, p)| match p {
+            Ok(plan)
+                if !c.new.is_zero() && meta.is_trunk(&c.refname) && !plan.deps.packs.is_empty() =>
+            {
+                absorbed_packs(meta, pack, &c.new, &plan.deps.packs)
+            }
+            _ => Ok(Vec::new()),
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    let peeled: Vec<Option<Oid>> = commands
+        .iter()
+        .map(|c| peel(meta, pack, &c.new))
+        .collect::<rusqlite::Result<_>>()?;
+
     let updates: Vec<Option<RefUpdate>> = planned
         .iter()
         .zip(commands)
-        .zip(&reached)
-        .map(|((p, c), reached)| {
+        .zip(reached.iter().zip(&reached_packs).zip(&peeled))
+        .map(|((p, c), ((reached, reached_packs), peeled))| {
             p.as_ref().ok().map(|plan| RefUpdate {
                 refname: &c.refname,
                 expect: plan.expect,
@@ -433,8 +468,9 @@ fn apply(
                     pack: stored.map(|p| p.hash),
                     deps: plan.deps.clone(),
                     pack_complete: complete,
-                    peeled: pack.and_then(|p| p.peel(&c.new)),
+                    peeled: *peeled,
                     reached,
+                    reached_packs,
                 }),
             })
         })
@@ -458,9 +494,67 @@ fn apply(
     Ok(out)
 }
 
-/// Is the current tip of a ref an ancestor of `new`? Walks pushed commits first, then
-/// the commit index. Trunk commits are not expanded when they cannot lead to the
-/// answer, so a non-fast-forward check does not crawl all of history.
+/// Follow annotated tags from `tip`, through this pack and tags stored earlier, to the
+/// first non-tag object. `None` if `tip` is not a tag.
+fn peel(meta: &Meta, pack: Option<&ParsedPack>, tip: &Oid) -> rusqlite::Result<Option<Oid>> {
+    let mut cur = *tip;
+    let mut peeled = None;
+    for _ in 0..64 {
+        let next = match pack.and_then(|p| p.tags.get(&cur)) {
+            Some(t) => Some(*t),
+            None => meta.tag_target(&cur)?,
+        };
+        match next {
+            Some(t) => {
+                cur = t;
+                peeled = Some(t);
+            }
+            None => break,
+        }
+    }
+    Ok(peeled)
+}
+
+/// Which of `targets` are reachable from `from` (inclusive). Pushed commits are walked
+/// freely; at most `ANCESTRY_WALK_LIMIT` commits come from the index, and `skip`
+/// prunes indexed commits that cannot lead to an answer.
+fn reach(
+    meta: &Meta,
+    pack: Option<&ParsedPack>,
+    from: &Oid,
+    targets: &HashSet<Oid>,
+    skip: impl Fn(&CommitRow) -> bool,
+) -> rusqlite::Result<HashSet<Oid>> {
+    let mut found = HashSet::new();
+    let mut seen = HashSet::from([*from]);
+    let mut queue = VecDeque::from([*from]);
+    let mut lookups = 0;
+    while let Some(oid) = queue.pop_front() {
+        if targets.contains(&oid) {
+            found.insert(oid);
+            if found.len() == targets.len() {
+                break;
+            }
+        }
+        let parents = match pack.and_then(|p| p.commits.get(&oid)) {
+            Some(ps) => ps.clone(),
+            None => {
+                lookups += 1;
+                if lookups > ANCESTRY_WALK_LIMIT {
+                    break;
+                }
+                match meta.commit(&oid)? {
+                    Some(row) if !skip(&row) => row.parents,
+                    _ => continue,
+                }
+            }
+        };
+        queue.extend(parents.into_iter().filter(|p| seen.insert(*p)));
+    }
+    Ok(found)
+}
+
+/// Is the current tip of a ref an ancestor of `new`?
 fn is_ancestor(
     meta: &Meta,
     pack: Option<&ParsedPack>,
@@ -471,37 +565,44 @@ fn is_ancestor(
     let target_is_trunk_head = meta.is_trunk(&current.refname);
     let target_on_trunk =
         target_is_trunk_head || meta.commit(&target)?.and_then(|c| c.trunk_seq).is_some();
-    let mut seen = HashSet::from([*new]);
-    let mut queue = VecDeque::from([*new]);
-    let mut cache: HashMap<Oid, Vec<Oid>> = HashMap::new();
-    while let Some(oid) = queue.pop_front() {
-        if oid == target {
-            return Ok(true);
+    // Every trunk commit is reachable from the trunk head, so the head cannot be
+    // strictly behind one; nor can a commit that is not on trunk.
+    let skip =
+        |row: &CommitRow| row.trunk_seq.is_some() && (target_is_trunk_head || !target_on_trunk);
+    Ok(!reach(meta, pack, new, &HashSet::from([target]), skip)?.is_empty())
+}
+
+/// Packs among `deps` (and their dependencies) whose objects are all reachable from
+/// a new trunk tip: those holding a complete version whose tip the new tip reaches.
+fn absorbed_packs(
+    meta: &Meta,
+    pack: Option<&ParsedPack>,
+    tip: &Oid,
+    deps: &[Oid],
+) -> rusqlite::Result<Vec<Oid>> {
+    let mut by_tip: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut work = deps.to_vec();
+    while let Some(q) = work.pop() {
+        if seen.len() >= 1000 || !seen.insert(q) {
+            continue;
         }
-        let parents = match pack.and_then(|p| p.commits.get(&oid)) {
-            Some(ps) => ps.clone(),
-            None => {
-                let Some(row) = meta.commit(&oid)? else {
-                    continue;
-                };
-                // Every trunk commit is reachable from the trunk head, so the head
-                // cannot be strictly behind one; nor can a commit that is not on trunk.
-                if row.trunk_seq.is_some() && (target_is_trunk_head || !target_on_trunk) {
-                    continue;
-                }
-                cache.entry(oid).or_insert(row.parents).clone()
-            }
-        };
-        for p in parents {
-            if seen.len() >= ANCESTRY_WALK_LIMIT {
-                return Ok(false);
-            }
-            if seen.insert(p) {
-                queue.push_back(p);
-            }
+        for v in meta.complete_versions_in_pack(&q)? {
+            by_tip.entry(v.tip).or_default().push(q);
+        }
+        if let Some(d) = meta.pack_deps(&q)? {
+            work.extend(d.packs);
         }
     }
-    Ok(false)
+    let targets: HashSet<Oid> = by_tip.keys().copied().collect();
+    let found = reach(meta, pack, tip, &targets, |row| row.trunk_seq.is_some())?;
+    let mut out: Vec<Oid> = found
+        .iter()
+        .flat_map(|t| by_tip[t].iter().copied())
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// A conservative subset of `git check-ref-format`.

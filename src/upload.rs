@@ -240,9 +240,15 @@ fn fetch(
         pktline::line(&mut head, "packfile-uris\n");
         for hash in &plan.packs {
             let node = express::pick_node(&nodes, hash);
+            // With auth on, a signed, expiring URL stands in for the client's token.
+            let query = if server.packs_need_auth() {
+                format!("?{}", server.signer.sign(&repo.name, hash))
+            } else {
+                String::new()
+            };
             pktline::line(
                 &mut head,
-                format!("{hash} {node}/{}.git/pack/{hash}.pack\n", repo.name),
+                format!("{hash} {node}/{}.git/pack/{hash}.pack{query}\n", repo.name),
             );
         }
         pktline::delim(&mut head);

@@ -1,6 +1,6 @@
 use axum::serve::ListenerExt;
 use clap::{Parser, Subcommand};
-use pando::auth::Auth;
+use pando::auth::{Auth, UrlSigner};
 use pando::express::{self, Express, Origin};
 use pando::server::{Advertise, Config, Server};
 use std::path::PathBuf;
@@ -45,6 +45,10 @@ enum Cmd {
         /// Upper bound between compaction passes, in seconds.
         #[arg(long, default_value_t = 30)]
         compact_interval: u64,
+        /// Secret for signing pack URLs when --auth-file is set. Give Express nodes the
+        /// same value. Random per process when unset.
+        #[arg(long, env = "PANDO_URL_SECRET")]
+        url_secret: Option<String>,
     },
     /// Serve packs from a local cache, filling from an origin Pando or Express node.
     Express {
@@ -54,6 +58,9 @@ enum Cmd {
         origin: String,
         #[arg(long, default_value = "./express-cache")]
         cache: PathBuf,
+        /// Require pack URLs signed with this secret (the origin's --url-secret).
+        #[arg(long, env = "PANDO_URL_SECRET")]
+        url_secret: Option<String>,
     },
 }
 
@@ -76,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             public_read,
             express,
             compact_interval,
+            url_secret,
         } => {
             let auth = auth_file.as_deref().map(Auth::load).transpose()?;
             if auth.is_none() {
@@ -91,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.public_read = public_read;
             cfg.express = express;
             cfg.compact_every = Some(Duration::from_secs(compact_interval));
+            cfg.url_secret = url_secret;
             let router = Server::new(cfg)?.router();
             let listener = tokio::net::TcpListener::bind(&listen).await?.tap_io(|tcp| {
                 let _ = tcp.set_nodelay(true);
@@ -104,12 +113,14 @@ async fn main() -> anyhow::Result<()> {
             listen,
             origin,
             cache,
+            url_secret,
         } => {
             let origin = Origin::Remote {
                 base: origin.trim_end_matches('/').to_string(),
                 client: reqwest::Client::new(),
             };
-            let router = express::router(Arc::new(Express::new(origin, Some(cache))?));
+            let signer = url_secret.map(|s| UrlSigner::new(s.as_bytes()));
+            let router = express::router(Arc::new(Express::new(origin, Some(cache), signer)?));
             let listener = tokio::net::TcpListener::bind(&listen).await?.tap_io(|tcp| {
                 let _ = tcp.set_nodelay(true);
             });

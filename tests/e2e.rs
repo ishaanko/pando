@@ -75,7 +75,7 @@ impl Server {
                 base: url.clone(),
                 client: reqwest::Client::new(),
             };
-            let express = Express::new(origin, Some(cache.clone())).unwrap();
+            let express = Express::new(origin, Some(cache.clone()), None).unwrap();
             serve_in_background(listener, express::router(Arc::new(express)));
             caches.push(cache);
         }
@@ -1121,4 +1121,226 @@ fn public_read_allows_anonymous_fetch_only() {
     git(&anon, &["fsck", "--strict"]);
     commit(&anon, "g", "y");
     git_fails(&anon, &["push", "origin", "main"]);
+}
+
+// ---------------------------------------------------------------------------------
+// Regressions from review.
+
+#[test]
+fn clashing_ref_names_are_rejected() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    git(
+        &a,
+        &["push", "-q", &s.url, "main", "main:refs/heads/feature"],
+    );
+    let err = git_fails(&a, &["push", &s.url, "main:refs/heads/feature/x"]);
+    assert!(err.contains("conflicts with existing ref"), "{err}");
+    let err = git_fails(&a, &["push", &s.url, "main:refs/heads/main/x"]);
+    assert!(err.contains("conflicts"), "{err}");
+    let err = git_fails(
+        &a,
+        &["push", &s.url, "main:refs/heads/a", "main:refs/heads/a/b"],
+    );
+    assert!(err.contains("cannot create both"), "{err}");
+    // Existing clones keep fetching cleanly.
+    let b = clone(&s, "b", false);
+    git(&b, &["fetch", "-q"]);
+}
+
+#[test]
+fn huge_trunk_fast_forward_is_accepted() {
+    // More new commits than the ancestry walk will look up in the index.
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    let n = 100_010;
+    let mut script = String::new();
+    for i in 1..=n {
+        script.push_str(&format!(
+            "commit refs/heads/main\nmark :{i}\ncommitter t <t@t> {i} +0000\ndata 0\n{}\n",
+            if i > 1 {
+                format!("from :{}\n", i - 1)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    let mut child = Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&a)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    git(&a, &["push", "-q", &s.url, "main~100009:refs/heads/main"]);
+    git(&a, &["push", "-q", &s.url, "main"]);
+    assert_eq!(s.trunk_seq(), 2);
+}
+
+#[test]
+fn branches_absorbed_into_trunk_stop_being_fetched_separately() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["checkout", "-qb", "feat"]);
+    commit(&a, "big", "feature payload");
+    git(&a, &["push", "-q", "origin", "feat"]);
+    // Fast-forward trunk onto the already-pushed branch: an empty pack.
+    git(&a, &["checkout", "-q", "main"]);
+    git(&a, &["merge", "-q", "--ff-only", "feat"]);
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["push", "-q", "origin", "--delete", "feat"]);
+    let blob = Oid::from_hex(&git(&a, &["rev-parse", "HEAD:big"])).unwrap();
+    assert!(
+        s.repo()
+            .meta
+            .lock()
+            .unwrap()
+            .object(&blob)
+            .unwrap()
+            .unwrap()
+            .trunk_seq
+            .is_some()
+    );
+
+    for i in 0..3 {
+        commit(&a, "f", &i.to_string());
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    // A client one trunk version behind needs exactly one pack.
+    let r = s.repo();
+    let m = r.meta.lock().unwrap();
+    let head = m.trunk_head().unwrap().unwrap();
+    let prev = m.trunk_version(head.seq - 1).unwrap().unwrap();
+    let plan = planner::plan(&m, &[head.tip], &[prev.tip]).unwrap();
+    assert_eq!(plan.packs.len(), 1, "{plan:?}");
+}
+
+#[test]
+fn shallow_clones_handle_tags_of_trees_and_blobs_and_exclude_tags() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    for i in 0..5 {
+        commit(&a, "f", &i.to_string());
+        if i == 1 {
+            git(&a, &["tag", "v1"]);
+        }
+    }
+    git(&a, &["tag", "treetag", "main^{tree}"]);
+    git(&a, &["tag", "-a", "blobtag", "-m", "a blob", "main:f"]);
+    git(&a, &["push", "-q", &s.url, "main", "--tags"]);
+    let c = s.path("c");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--no-single-branch",
+            &s.url,
+            c.to_str().unwrap(),
+        ],
+    );
+    git(&c, &["fsck"]);
+    git(&c, &["cat-file", "-e", "treetag"]);
+    let ex = s.path("ex");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--shallow-exclude=v1",
+            &s.url,
+            ex.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(count(&ex, "HEAD"), 3);
+}
+
+#[test]
+fn nested_and_aliased_tags_peel_to_the_commit() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    let head = commit(&a, "f", "x");
+    git(&a, &["tag", "-a", "inner", "-m", "inner"]);
+    git(&a, &["push", "-q", &s.url, "main", "inner"]);
+    git(&a, &["tag", "-a", "outer", "-m", "outer", "inner"]);
+    git(&a, &["push", "-q", &s.url, "outer"]);
+    git(&a, &["push", "-q", &s.url, "inner:refs/tags/alias"]);
+    let ls = git(&a, &["ls-remote", &s.url]);
+    for tag in ["inner", "outer", "alias"] {
+        assert!(
+            ls.contains(&format!("{head}\trefs/tags/{tag}^{{}}")),
+            "{tag}: {ls}"
+        );
+    }
+}
+
+#[test]
+fn pack_urls_are_signed_when_auth_is_on() {
+    let tokens = TempDir::new().unwrap();
+    let file = tokens.path().join("tokens");
+    std::fs::write(&file, "me sekrit write\n").unwrap();
+    let auth = pando::auth::Auth::load(&file).unwrap();
+    let s = Server::start_configured(|c| c.auth = Some(auth));
+    let authed = s.url.replacen("http://", "http://me:sekrit@", 1);
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    git(&a, &["push", "-q", &authed, "main"]);
+
+    // Packfile URIs work for an authorized client without forwarding its token.
+    let dest = s.path("uri");
+    git(
+        s.dir.path(),
+        &[
+            "-c",
+            "fetch.uriprotocols=http",
+            "clone",
+            "-q",
+            &authed,
+            dest.to_str().unwrap(),
+        ],
+    );
+    git(&dest, &["fsck", "--strict"]);
+
+    let pack = s
+        .repo()
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_head()
+        .unwrap()
+        .unwrap()
+        .pack
+        .unwrap();
+    let url = format!("{}/repo.git/pack/{pack}.pack", s.base);
+    let status = |u: String| {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { reqwest::get(u).await.unwrap().status().as_u16() })
+    };
+    assert_eq!(status(url.clone()), 401);
+    let signed = s.server.signer.sign("repo", &pack);
+    assert_eq!(status(format!("{url}?{signed}")), 200);
+    assert_eq!(
+        status(format!("{url}?{}", signed.replace("sig=", "sig=00"))),
+        401
+    );
 }

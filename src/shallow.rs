@@ -60,12 +60,23 @@ pub fn fetch(repo: &Repo, args: &FetchArgs, out: &mut dyn Write) -> anyhow::Resu
             .map_err(|e| anyhow::anyhow!("upload-pack: {e}"))?;
         let mut not_tips = Vec::new();
         for name in args.deepen.iter().flat_map(|d| &d.not) {
-            let full = if name.starts_with("refs/") {
-                name.clone()
-            } else {
-                format!("refs/heads/{name}")
-            };
-            match meta.current(&full)? {
+            // Resolve a short name the way git does.
+            let candidates = [
+                name.clone(),
+                format!("refs/{name}"),
+                format!("refs/tags/{name}"),
+                format!("refs/heads/{name}"),
+                format!("refs/remotes/{name}"),
+                format!("refs/remotes/{name}/HEAD"),
+            ];
+            let mut found = None;
+            for full in &candidates {
+                if let Some(v) = meta.current(full)? {
+                    found = Some(v);
+                    break;
+                }
+            }
+            match found {
                 Some(v) => not_tips.push(v.peeled.unwrap_or(v.tip)),
                 None => anyhow::bail!("deepen-not: unknown ref {name}"),
             }
@@ -112,6 +123,8 @@ struct Walk {
     had_border: Vec<Oid>,
     /// Tags the client asked for.
     tags: Vec<Oid>,
+    /// Trees and blobs that wanted tags point at directly; sent with no history.
+    tagged: Vec<(Kind, Oid)>,
     shallow: Vec<Oid>,
     unshallow: Vec<Oid>,
 }
@@ -125,7 +138,8 @@ impl Walk {
 
         let mut tags = Vec::new();
         let mut starts = Vec::new();
-        for want in &args.wants {
+        let mut tagged = Vec::new();
+        'wants: for want in &args.wants {
             let mut oid = *want;
             loop {
                 let (kind, data) = odb
@@ -138,7 +152,10 @@ impl Walk {
                             .ok_or_else(|| anyhow::anyhow!("bad tag {oid}"))?;
                     }
                     Kind::Commit => break,
-                    _ => anyhow::bail!("want {want} is not a commit or tag"),
+                    kind => {
+                        tagged.push((kind, oid));
+                        continue 'wants;
+                    }
                 }
             }
             starts.push(oid);
@@ -167,6 +184,7 @@ impl Walk {
             send: vec![],
             had_border: vec![],
             tags,
+            tagged,
             shallow: vec![],
             unshallow: vec![],
         };
@@ -239,6 +257,20 @@ impl Walk {
         }
         let mut out = self.tags.clone();
         let mut seen: HashSet<Oid> = out.iter().copied().collect();
+        for (kind, oid) in &self.tagged {
+            match kind {
+                Kind::Tree => walk_tree(odb, Some(*oid), &mut known, &mut |o| {
+                    if seen.insert(o) {
+                        out.push(o);
+                    }
+                })?,
+                _ => {
+                    if seen.insert(*oid) {
+                        out.push(*oid);
+                    }
+                }
+            }
+        }
         for c in &self.send {
             if seen.insert(*c) {
                 out.push(*c);

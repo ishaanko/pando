@@ -106,6 +106,9 @@ pub struct NewVersion<'a> {
     /// On trunk: the objects in `pack` that the new tip reaches. They get this
     /// version's trunk position (see [`Meta::index_pack`] for the rest).
     pub reached: &'a [Oid],
+    /// On trunk: other packs whose every object the new tip now reaches (a branch
+    /// that trunk fast-forwarded to or merged). They join trunk at this position too.
+    pub reached_packs: &'a [Oid],
 }
 
 pub struct Meta {
@@ -196,6 +199,9 @@ impl Meta {
                pack TEXT NOT NULL,
                trunk_seq INTEGER
              );
+             CREATE TABLE IF NOT EXISTS tags (oid TEXT PRIMARY KEY, target TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS objects_by_pack ON objects (pack);
+             CREATE INDEX IF NOT EXISTS commits_by_pack ON commits (pack);
              CREATE TABLE IF NOT EXISTS covers (
                level INTEGER NOT NULL,
                start INTEGER NOT NULL,
@@ -288,6 +294,37 @@ impl Meta {
         Ok(out)
     }
 
+    /// Whether creating `refname` would clash with an existing ref as a directory or
+    /// a file (`a/b` and `a/b/c` cannot both exist).
+    pub fn ref_path_conflict(&self, refname: &str) -> rusqlite::Result<Option<String>> {
+        let child: Option<String> = self
+            .conn
+            .prepare_cached("SELECT name FROM refs WHERE name > ?1 AND name < ?2 LIMIT 1")?
+            .query_row(params![format!("{refname}/"), format!("{refname}0")], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if child.is_some() {
+            return Ok(child);
+        }
+        let mut parent = refname;
+        while let Some((dir, _)) = parent.rsplit_once('/') {
+            if self.current(dir)?.is_some() {
+                return Ok(Some(dir.to_string()));
+            }
+            parent = dir;
+        }
+        Ok(None)
+    }
+
+    /// Complete versions (every pack object reachable from the tip) stored in `pack`.
+    pub fn complete_versions_in_pack(&self, pack: &Oid) -> rusqlite::Result<Vec<Version>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {VERSION_COLS} FROM versions v WHERE v.pack = ?1 AND v.pack_complete"
+        ))?;
+        stmt.query_map([pack.hex()], version_row)?.collect()
+    }
+
     pub fn versions_with_tip(&self, tip: &Oid) -> rusqlite::Result<Vec<Version>> {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {VERSION_COLS} FROM versions v WHERE v.tip = ?1 ORDER BY v.id"
@@ -329,6 +366,31 @@ impl Meta {
             .optional()
     }
 
+    /// The object an annotated tag points at, for any stored tag.
+    pub fn tag_target(&self, oid: &Oid) -> rusqlite::Result<Option<Oid>> {
+        self.conn
+            .prepare_cached("SELECT target FROM tags WHERE oid = ?1")?
+            .query_row([oid.hex()], |r| oid_col(r, 0))
+            .optional()
+    }
+
+    /// Follow annotated tags (stored anywhere) to the first non-tag object. `None` if
+    /// `oid` is not a tag.
+    pub fn peel(&self, oid: &Oid) -> rusqlite::Result<Option<Oid>> {
+        let mut cur = *oid;
+        let mut peeled = None;
+        for _ in 0..64 {
+            match self.tag_target(&cur)? {
+                Some(t) => {
+                    cur = t;
+                    peeled = Some(t);
+                }
+                None => break,
+            }
+        }
+        Ok(peeled)
+    }
+
     /// Dependencies recorded for a stored pack.
     pub fn pack_deps(&self, pack: &Oid) -> rusqlite::Result<Option<Deps>> {
         self.conn
@@ -350,6 +412,7 @@ impl Meta {
         deps: &Deps,
         objects: impl Iterator<Item = Oid>,
         commits: &std::collections::HashMap<Oid, Vec<Oid>>,
+        tags: &std::collections::HashMap<Oid, Oid>,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         let hex = pack.hex();
@@ -368,6 +431,11 @@ impl Meta {
             )?;
             for (oid, parents) in commits {
                 com.execute(params![oid.hex(), hex, join_oids(parents)])?;
+            }
+            let mut tag =
+                tx.prepare_cached("INSERT OR IGNORE INTO tags (oid, target) VALUES (?1, ?2)")?;
+            for (oid, target) in tags {
+                tag.execute(params![oid.hex(), target.hex()])?;
             }
         }
         tx.commit()
@@ -441,6 +509,19 @@ impl Meta {
                     let hex = oid.hex();
                     obj.execute(params![seq, pack, hex])?;
                     com.execute(params![seq, hex])?;
+                }
+            }
+            if u.refname == self.trunk {
+                for pack in new.reached_packs {
+                    let hex = pack.hex();
+                    tx.execute(
+                        "UPDATE objects SET trunk_seq = ?1 WHERE pack = ?2 AND trunk_seq IS NULL",
+                        params![seq, hex],
+                    )?;
+                    tx.execute(
+                        "UPDATE commits SET trunk_seq = ?1 WHERE pack = ?2 AND trunk_seq IS NULL",
+                        params![seq, hex],
+                    )?;
                 }
             }
             out.push(Some(Version {

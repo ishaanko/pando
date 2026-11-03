@@ -7,6 +7,7 @@
 //! into a single origin read. Pando spreads packs across Express nodes with
 //! rendezvous hashing, so each node caches a stable slice of the pack space.
 
+use crate::auth::UrlSigner;
 use crate::object::Oid;
 use axum::Router;
 use axum::body::Body;
@@ -41,10 +42,17 @@ pub struct Express {
     /// Local disk cache. Without one, a local origin is served directly.
     cache: Option<PathBuf>,
     fills: Mutex<HashMap<Oid, Arc<tokio::sync::Mutex<()>>>>,
+    signer: Option<UrlSigner>,
 }
 
 impl Express {
-    pub fn new(origin: Origin, cache: Option<PathBuf>) -> std::io::Result<Express> {
+    /// With a `signer`, every request must carry a valid signed query (see
+    /// [`UrlSigner`]); the same query is forwarded when filling from the origin.
+    pub fn new(
+        origin: Origin,
+        cache: Option<PathBuf>,
+        signer: Option<UrlSigner>,
+    ) -> std::io::Result<Express> {
         if let Some(dir) = &cache {
             std::fs::create_dir_all(dir)?;
         }
@@ -52,11 +60,17 @@ impl Express {
             origin,
             cache,
             fills: Mutex::new(HashMap::new()),
+            signer,
         })
     }
 
     /// A local path holding the pack, filling the cache if needed.
-    async fn local_path(&self, repo: &str, hash: Oid) -> anyhow::Result<Option<PathBuf>> {
+    async fn local_path(
+        &self,
+        repo: &str,
+        hash: Oid,
+        query: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
         let Some(dir) = &self.cache else {
             return Ok(match &self.origin {
                 Origin::Local(find) => find(repo, &hash).filter(|p| p.exists()),
@@ -72,14 +86,20 @@ impl Express {
         let filled = if path.exists() {
             Ok(true)
         } else {
-            self.fill(repo, hash, &path).await
+            self.fill(repo, hash, query, &path).await
         };
         self.fills.lock().unwrap().remove(&hash);
         Ok(filled?.then_some(path))
     }
 
     /// Copy one pack from the origin into the cache, verifying its trailer hash.
-    async fn fill(&self, repo: &str, hash: Oid, dest: &std::path::Path) -> anyhow::Result<bool> {
+    async fn fill(
+        &self,
+        repo: &str,
+        hash: Oid,
+        query: &str,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<bool> {
         static FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dest.with_extension(format!("tmp-{}-{n}", std::process::id()));
@@ -108,7 +128,7 @@ impl Express {
             }
             Origin::Remote { base, client } => {
                 let resp = client
-                    .get(format!("{base}/{repo}.git/pack/{hash}.pack"))
+                    .get(format!("{base}/{repo}.git/pack/{hash}.pack?{query}"))
                     .send()
                     .await?;
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -149,7 +169,20 @@ async fn get_pack(
     headers: HeaderMap,
 ) -> Response {
     match parse_pack_path(uri.path()) {
-        Some((repo, hash)) => serve(&x, repo, hash, &headers).await,
+        Some((repo, hash)) => {
+            let query = uri.query().unwrap_or("");
+            if x.signer
+                .as_ref()
+                .is_some_and(|s| !s.verify(repo, &hash, query))
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "pack URL is unsigned or expired\n",
+                )
+                    .into_response();
+            }
+            serve(&x, repo, hash, &headers, query).await
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -157,8 +190,14 @@ async fn get_pack(
 /// Serve one pack, with `Range: bytes=N-` support so interrupted downloads can
 /// resume. Pack URLs are capability URLs: the 160-bit hash is only learned from an
 /// authorized fetch.
-pub async fn serve(x: &Express, repo: &str, hash: Oid, headers: &HeaderMap) -> Response {
-    let path = match x.local_path(repo, hash).await {
+pub async fn serve(
+    x: &Express,
+    repo: &str,
+    hash: Oid,
+    headers: &HeaderMap,
+    query: &str,
+) -> Response {
+    let path = match x.local_path(repo, hash, query).await {
         Ok(Some(p)) => p,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
