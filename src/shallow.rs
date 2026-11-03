@@ -144,19 +144,23 @@ impl Walk {
             starts.push(oid);
         }
 
-        // Depth counts from the wants (depth 1); with deepen-relative it extends the
-        // client's existing boundary by `depth` instead.
+        // Depth counts from the wants (depth 1). With deepen-relative it counts from
+        // the client's current boundary instead (depth 0), and the path from the wants
+        // down to history the client has is unlimited (`None`).
+        let relative = deepen.is_some_and(|d| d.relative);
         let limit = deepen.and_then(|d| d.depth).map(|n| n.max(1));
-        let mut depth_of: HashMap<Oid, u32> = HashMap::new();
+        let mut depth_of: HashMap<Oid, Option<u32>> = HashMap::new();
         let mut queue = VecDeque::new();
-        for s in starts {
-            depth_of.insert(s, 1);
-            queue.push_back(s);
-        }
-        if deepen.is_some_and(|d| d.relative) {
+        if relative {
             for s in &client_shallow {
-                depth_of.insert(*s, 1);
+                depth_of.insert(*s, Some(0));
                 queue.push_back(*s);
+            }
+        }
+        for s in starts {
+            if !depth_of.contains_key(&s) {
+                depth_of.insert(s, if relative { None } else { Some(1) });
+                queue.push_back(s);
             }
         }
         let mut w = Walk {
@@ -177,11 +181,11 @@ impl Walk {
                 w.send.push(c);
             }
             let parents = commit_parents(&data);
-            // Without deepen, history the client has is a hard stop.
-            if deepen.is_none() && is_had {
+            // History the client has is a hard stop, unless we are deepening below it.
+            if is_had && (deepen.is_none() || (d.is_none() && !client_shallow.contains(&c))) {
                 continue;
             }
-            let at_limit = limit.is_some_and(|n| d >= n);
+            let at_limit = matches!((d, limit), (Some(d), Some(n)) if d >= n);
             let too_old = |p: &Oid| -> anyhow::Result<bool> {
                 let Some(since) = deepen.and_then(|d| d.since) else {
                     return Ok(false);
@@ -200,7 +204,7 @@ impl Walk {
                 }
                 descended = true;
                 if !depth_of.contains_key(p) {
-                    depth_of.insert(*p, d + 1);
+                    depth_of.insert(*p, d.map(|d| d + 1));
                     queue.push_back(*p);
                 }
             }

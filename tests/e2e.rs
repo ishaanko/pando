@@ -701,3 +701,417 @@ fn decoder_matches_git_on_deep_delta_chains() {
         .to_string();
     assert_eq!(parsed.hash.hex(), name);
 }
+
+// ---------------------------------------------------------------------------------
+// Drop-in compatibility: stock git workflows against the default configuration.
+
+fn count(repo: &Path, rev: &str) -> usize {
+    git(repo, &["rev-list", "--count", rev]).parse().unwrap()
+}
+
+#[test]
+fn everyday_branch_workflows_behave_like_git() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "-u", "origin", "main"]);
+    let b = clone(&s, "b", false);
+
+    // Two people on one branch: the second is told to fetch first, like any server.
+    git(&a, &["checkout", "-qb", "topic"]);
+    commit(&a, "t", "a1");
+    git(&a, &["push", "-q", "-u", "origin", "topic"]);
+    git(&b, &["fetch", "-q"]);
+    git(&b, &["checkout", "-q", "-b", "topic", "origin/topic"]);
+    commit(&b, "tb", "b1");
+    commit(&a, "t", "a2");
+    git(&a, &["push", "-q"]);
+    let err = git_fails(&b, &["push", "origin", "topic"]);
+    assert!(
+        err.contains("fetch first") || err.contains("non-fast-forward"),
+        "{err}"
+    );
+
+    // Rebase and force push.
+    git(&b, &["pull", "-q", "--rebase"]);
+    git(&b, &["push", "-q", "origin", "topic"]);
+    git(&b, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let err = git_fails(&b, &["push", "origin", "topic"]);
+    assert!(
+        err.contains("non-fast-forward") || err.contains("rejected"),
+        "{err}"
+    );
+    git(&b, &["push", "-q", "-f", "origin", "topic"]);
+    assert_eq!(
+        git(&a, &["ls-remote", "origin", "refs/heads/topic"])
+            .split('\t')
+            .next()
+            .unwrap(),
+        git(&b, &["rev-parse", "HEAD"])
+    );
+
+    // --force-with-lease protects against overwriting work you have not seen.
+    git(&a, &["fetch", "-q"]);
+    git(&a, &["reset", "-q", "--hard", "origin/topic"]);
+    commit(&a, "t", "a3");
+    git(&a, &["push", "-q"]);
+    git(&b, &["commit", "-q", "--amend", "-m", "again"]);
+    let err = git_fails(&b, &["push", "--force-with-lease", "origin", "topic"]);
+    assert!(err.contains("stale info"), "{err}");
+    git(&b, &["fetch", "-q"]);
+    git(&b, &["push", "-q", "--force-with-lease", "origin", "topic"]);
+
+    // Delete by short name, then prune elsewhere.
+    git(&b, &["push", "-q", "origin", "--delete", "topic"]);
+    git(&a, &["fetch", "-q", "--prune"]);
+    assert!(!git(&a, &["branch", "-r"]).contains("origin/topic"));
+
+    // Atomic multi-ref push and tags.
+    git(&a, &["checkout", "-q", "main"]);
+    git(&a, &["pull", "-q", "--ff-only"]);
+    git(&a, &["tag", "-a", "v1", "-m", "v1"]);
+    git(&a, &["branch", "release"]);
+    git(&a, &["push", "-q", "--atomic", "origin", "release", "v1"]);
+    let fresh = clone(&s, "fresh", false);
+    assert_eq!(git(&fresh, &["describe", "--tags", "origin/release"]), "v1");
+    git(&fresh, &["fsck", "--strict"]);
+}
+
+#[test]
+fn objects_omitted_because_of_other_branches_are_still_served() {
+    // With every ref advertised, a pusher leaves out objects it knows the server has
+    // on *any* branch. A reader of only trunk must still get them.
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["checkout", "-qb", "feature"]);
+    commit(&a, "feature.txt", "a blob that only exists on feature");
+    commit(&a, "more.txt", "more feature work");
+    git(&a, &["push", "-q", "origin", "feature"]);
+
+    // Another client fetches feature, then on main merges it and also reuses the
+    // feature-only blob in a new file.
+    let b = clone(&s, "b", false);
+    git(
+        &b,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "merge feature",
+            "origin/feature",
+        ],
+    );
+    std::fs::write(b.join("copy.txt"), "a blob that only exists on feature").unwrap();
+    git(&b, &["add", "copy.txt"]);
+    git(&b, &["commit", "-qm", "reuse blob"]);
+    git(&b, &["push", "-q", "origin", "main"]);
+    let main = s.repo().meta.lock().unwrap().trunk_head().unwrap().unwrap();
+    let merge = s
+        .repo()
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(main.seq)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !merge.deps.packs.is_empty(),
+        "trunk version should depend on the feature pack"
+    );
+
+    // Trunk-only readers, before and after compaction, by both transports.
+    for round in 0..2 {
+        for uris in [false, true] {
+            let name = format!("main-only-{round}-{uris}");
+            let dest = s.path(&name);
+            let mut args = vec![];
+            if uris {
+                args.extend(["-c", "fetch.uriprotocols=http"]);
+            }
+            args.extend([
+                "clone",
+                "-q",
+                "--single-branch",
+                "--branch",
+                "main",
+                &s.url,
+                dest.to_str().unwrap(),
+            ]);
+            git(s.dir.path(), &args);
+            git(&dest, &["fsck", "--strict"]);
+            assert_eq!(
+                git(&dest, &["rev-parse", "HEAD"]),
+                git(&b, &["rev-parse", "HEAD"])
+            );
+        }
+        for i in 0..4 {
+            commit(&b, "pad", &i.to_string());
+            git(&b, &["push", "-q", "origin", "main"]);
+        }
+        s.compact();
+    }
+}
+
+#[test]
+fn shallow_clones_fetch_deepen_and_unshallow() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..10 {
+        commit(&a, &format!("f{}", i % 3), &i.to_string());
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+
+    let c = s.path("shallow");
+    git(
+        s.dir.path(),
+        &["clone", "-q", "--depth", "1", &s.url, c.to_str().unwrap()],
+    );
+    assert_eq!(count(&c, "HEAD"), 1);
+    git(&c, &["fsck"]);
+
+    // New commits arrive in the shallow clone without deepening it.
+    for i in 10..13 {
+        commit(&a, "g", &i.to_string());
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    git(&c, &["pull", "-q", "--ff-only"]);
+    assert_eq!(
+        git(&c, &["rev-parse", "HEAD"]),
+        git(&a, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(count(&c, "HEAD"), 4);
+
+    git(&c, &["fetch", "-q", "--deepen", "3"]);
+    assert_eq!(count(&c, "HEAD"), 7);
+    git(&c, &["fetch", "-q", "--unshallow"]);
+    assert_eq!(count(&c, "HEAD"), 13);
+    assert_eq!(git(&c, &["rev-parse", "--is-shallow-repository"]), "false");
+    git(&c, &["fsck", "--strict"]);
+
+    // Shallow by time and by exclusion.
+    let v5 = s
+        .repo()
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(5)
+        .unwrap()
+        .unwrap()
+        .tip;
+    git(
+        &a,
+        &["push", "-q", "origin", &format!("{v5}:refs/heads/old")],
+    );
+    let ex = s.path("exclude");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--shallow-exclude",
+            "old",
+            "--branch",
+            "main",
+            &s.url,
+            ex.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(count(&ex, "HEAD"), 8);
+    let since = s.path("since");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--shallow-since",
+            "2000-01-01",
+            &s.url,
+            since.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(count(&since, "HEAD"), 13);
+
+    // A shallow clone can push.
+    commit(&c, "h", "from shallow");
+    git(&c, &["push", "-q", "origin", "main"]);
+    let full = clone(&s, "full", false);
+    git(&full, &["fsck", "--strict"]);
+}
+
+#[test]
+fn partial_clone_falls_back_to_full() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    let dest = s.path("partial");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &s.url,
+            dest.to_str().unwrap(),
+        ],
+    );
+    git(&dest, &["fsck", "--strict"]);
+}
+
+#[test]
+fn mirror_import_round_trips() {
+    // Build a repository with merges, several branches and tags, push it with
+    // --mirror, and clone it back.
+    let s = Server::start();
+    let src = s.path("src");
+    init(&src);
+    for i in 0..5 {
+        commit(&src, "base", &i.to_string());
+    }
+    for b in ["x", "y"] {
+        git(&src, &["checkout", "-qb", b, "main"]);
+        for i in 0..3 {
+            commit(&src, &format!("{b}.txt"), &i.to_string());
+        }
+    }
+    git(&src, &["checkout", "-q", "main"]);
+    git(&src, &["merge", "-q", "--no-ff", "-m", "merge x", "x"]);
+    git(&src, &["tag", "-a", "v1", "-m", "v1"]);
+    git(&src, &["tag", "light", "y"]);
+    git(&src, &["push", "-q", "--mirror", &s.url]);
+
+    let back = s.path("back");
+    git(
+        s.dir.path(),
+        &["clone", "-q", "--mirror", &s.url, back.to_str().unwrap()],
+    );
+    assert_eq!(git(&back, &["show-ref"]), git(&src, &["show-ref"]));
+    git(&back, &["fsck", "--strict"]);
+}
+
+#[test]
+fn repositories_are_isolated_and_trunk_follows_the_first_push() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["checkout", "-qb", "master"]);
+    commit(&a, "f", "a");
+    git(
+        &a,
+        &["push", "-q", &format!("{}/org/alpha.git", s.base), "master"],
+    );
+    let b = s.path("b");
+    init(&b);
+    commit(&b, "f", "b");
+    git(&b, &["push", "-q", &format!("{}/beta", s.base), "main"]);
+
+    let alpha = s.path("alpha");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            &format!("{}/org/alpha.git", s.base),
+            alpha.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(git(&alpha, &["symbolic-ref", "HEAD"]), "refs/heads/master");
+    assert_eq!(
+        git(&alpha, &["rev-parse", "HEAD"]),
+        git(&a, &["rev-parse", "HEAD"])
+    );
+    assert!(!git(&alpha, &["ls-remote", "origin"]).contains("refs/heads/main"));
+
+    let err = git_fails(
+        s.dir.path(),
+        &[
+            "clone",
+            &format!("{}/nope.git", s.base),
+            s.path("nope").to_str().unwrap(),
+        ],
+    );
+    assert!(err.contains("not found") || err.contains("404"), "{err}");
+}
+
+#[test]
+fn tokens_gate_reads_and_writes() {
+    let tokens = TempDir::new().unwrap();
+    let file = tokens.path().join("tokens");
+    std::fs::write(
+        &file,
+        "# name token access\nci sekrit-read read\nme sekrit-write write\n",
+    )
+    .unwrap();
+    let auth = pando::auth::Auth::load(&file).unwrap();
+    let s = Server::start_configured(|c| c.auth = Some(auth));
+    let with = |token: &str| {
+        s.url
+            .replacen("http://", &format!("http://user:{token}@"), 1)
+    };
+
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    let err = git_fails(&a, &["push", &s.url, "main"]);
+    assert!(
+        err.contains("401") || err.contains("Authentication") || err.contains("could not read"),
+        "{err}"
+    );
+    let err = git_fails(&a, &["push", &with("sekrit-read"), "main"]);
+    assert!(err.contains("403"), "{err}");
+    let err = git_fails(&a, &["push", &with("wrong"), "main"]);
+    assert!(!err.is_empty());
+    git(&a, &["push", "-q", &with("sekrit-write"), "main"]);
+
+    git_fails(
+        s.dir.path(),
+        &["clone", &s.url, s.path("anon").to_str().unwrap()],
+    );
+    let r = s.path("reader");
+    git(
+        s.dir.path(),
+        &["clone", "-q", &with("sekrit-read"), r.to_str().unwrap()],
+    );
+    assert_eq!(
+        git(&r, &["rev-parse", "HEAD"]),
+        git(&a, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn public_read_allows_anonymous_fetch_only() {
+    let tokens = TempDir::new().unwrap();
+    let file = tokens.path().join("tokens");
+    std::fs::write(&file, "me sekrit-write write\n").unwrap();
+    let auth = pando::auth::Auth::load(&file).unwrap();
+    let s = Server::start_configured(|c| {
+        c.auth = Some(auth);
+        c.public_read = true;
+    });
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    git(
+        &a,
+        &[
+            "push",
+            "-q",
+            &s.url.replacen("http://", "http://me:sekrit-write@", 1),
+            "main",
+        ],
+    );
+    let anon = clone(&s, "anon", true);
+    git(&anon, &["fsck", "--strict"]);
+    commit(&anon, "g", "y");
+    git_fails(&anon, &["push", "origin", "main"]);
+}
