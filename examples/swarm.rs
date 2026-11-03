@@ -83,22 +83,9 @@ fn main() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = match backend.as_str() {
         "pando" => {
-            let (app, router) = pando::server::open(
-                &dir.path().join("data"),
-                "refs/heads/main",
-                &base,
-                Vec::new(),
-            )
-            .unwrap();
-            let compactor = app.clone();
-            std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(async move {
-                        pando::server::spawn_compactor(compactor, Duration::from_secs(1))
-                    })
-            });
-            router
+            let mut cfg = pando::server::Config::new(dir.path().join("data"), &base);
+            cfg.compact_every = Some(Duration::from_secs(1));
+            pando::server::Server::new(cfg).unwrap().router()
         }
         "git" => {
             let root = dir.path().join("git-root");

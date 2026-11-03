@@ -50,6 +50,7 @@ pub enum PlanError {
 pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError> {
     let mut p = Plan::default();
     let mut had_versions = HashSet::new();
+    let mut had_packs = HashSet::new();
     let have_set: HashSet<Oid> = haves.iter().copied().collect();
 
     for have in haves {
@@ -64,11 +65,15 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
                 p.trunk_have = p.trunk_have.max(v.seq);
             } else {
                 had_versions.insert(v.id);
+                if v.pack_complete {
+                    had_packs.extend(v.pack);
+                }
             }
         }
     }
 
-    let mut side_packs = Vec::new();
+    // Side packs still to include, and trunk coverage so far.
+    let mut work: Vec<Oid> = Vec::new();
     for want in wants {
         if have_set.contains(want) {
             continue;
@@ -76,28 +81,57 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         let version = match best_version(meta, meta.versions_with_tip(want)?) {
             Some(v) => v,
             None => {
-                // Not a tip: an older commit. Serve whichever version first stored it.
+                // Not a tip: an older commit. Serve whichever version stored it.
                 let row = meta.commit(want)?.ok_or(PlanError::NotOurRef(*want))?;
                 if let Some(seq) = row.trunk_seq {
                     p.trunk_want = p.trunk_want.max(seq);
                     continue;
                 }
-                meta.version(row.version)?
-                    .ok_or(PlanError::NotOurRef(*want))?
+                let v = meta
+                    .version(row.version)?
+                    .ok_or(PlanError::NotOurRef(*want))?;
+                // Even a trunk version's pack is needed explicitly here: the commit is
+                // in it but not reachable from trunk.
+                p.trunk_want = p.trunk_want.max(v.deps.trunk);
+                work.extend(v.pack);
+                work.extend(v.deps.packs);
+                continue;
             }
         };
         if meta.is_trunk(&version.refname) {
             p.trunk_want = p.trunk_want.max(version.seq);
         } else if !had_versions.contains(&version.id) {
-            p.trunk_want = p.trunk_want.max(version.trunk_dep);
-            side_packs.extend(version.pack);
+            p.trunk_want = p.trunk_want.max(version.deps.trunk);
+            work.extend(version.pack);
+            work.extend(version.deps.packs);
         }
     }
 
-    if p.trunk_want > p.trunk_have {
-        p.packs = cover_trunk(meta, p.trunk_have, p.trunk_want)?;
+    // Follow dependencies to a fixed point: side packs can raise the trunk range, and
+    // newly covered trunk versions can need side packs.
+    let mut side = Vec::new();
+    let mut seen = HashSet::new();
+    let mut covered = p.trunk_have;
+    loop {
+        while let Some(pack) = work.pop() {
+            if had_packs.contains(&pack) || !seen.insert(pack) {
+                continue;
+            }
+            side.push(pack);
+            if let Some(deps) = meta.pack_deps(&pack)? {
+                p.trunk_want = p.trunk_want.max(deps.trunk);
+                work.extend(deps.packs);
+            }
+        }
+        if p.trunk_want <= covered {
+            break;
+        }
+        let (packs, deps) = cover_trunk(meta, covered, p.trunk_want)?;
+        p.packs.extend(packs);
+        work.extend(deps);
+        covered = p.trunk_want;
     }
-    for pack in side_packs {
+    for pack in side {
         if !p.packs.contains(&pack) {
             p.packs.push(pack);
         }
@@ -143,27 +177,30 @@ fn tips_reachable_from(meta: &Meta, have: &Oid) -> Result<(bool, Vec<Version>), 
 }
 
 /// Packs covering trunk versions `(have, want]`, using the largest aligned cover that
-/// fits at each step.
-pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<Vec<Oid>, PlanError> {
+/// fits at each step, plus the non-trunk packs those versions depend on.
+pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<Oid>), PlanError> {
     let mut packs = Vec::new();
+    let mut deps = Vec::new();
     let mut at = have; // versions 1..=at are covered
     'outer: while at < want {
         for level in (1..=MAX_LEVEL).rev() {
             let s = span(level);
             if at.is_multiple_of(s)
                 && at + s <= want
-                && let Some(pack) = meta.cover(level, at + 1)?
+                && let Some(cover) = meta.cover(level, at + 1)?
             {
-                packs.extend(pack);
+                packs.extend(cover.pack);
+                deps.extend(cover.packs);
                 at += s;
                 continue 'outer;
             }
         }
         let v = meta
             .trunk_version(at + 1)?
-            .ok_or_else(|| PlanError::NotOurRef(Oid::ZERO))?;
+            .ok_or(PlanError::NotOurRef(Oid::ZERO))?;
         packs.extend(v.pack);
+        deps.extend(v.deps.packs);
         at += 1;
     }
-    Ok(packs)
+    Ok((packs, deps))
 }

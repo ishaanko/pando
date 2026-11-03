@@ -1,22 +1,46 @@
 //! The metadata store (the diagrams call it "Turtle").
 //!
 //! Every time a ref moves, Pando appends an immutable *ref version*: the new tip, the
-//! pack that supplied its objects, and the trunk version that pack was negotiated
-//! against. The ref pointer is the only mutable, contended key, and it moves by
-//! compare-and-swap. A push therefore costs O(1) metadata operations (plus one commit
-//! index row per pushed commit), and pushes to different refs never conflict.
+//! pack that supplied its objects, and what that pack depends on. The ref pointer is
+//! the only mutable, contended key, and it moves by compare-and-swap, so pushes to
+//! different refs never conflict.
 //!
-//! The dependency rule that makes packs reusable: Pando only ever lets a client omit
-//! objects reachable from trunk. So a version of any ref is fully described by
-//! `its pack + trunk versions 1..=trunk_dep`. Trunk itself is a linear chain where
-//! version `n` depends on `n - 1`.
+//! Dependencies. A client leaves out of its push anything the server advertised and
+//! the client already has. Pando finds exactly what was left out by resolving every
+//! reference that points outside the pack through the object index, and records it as:
+//!
+//! - `trunk`: trunk versions `1..=trunk` hold everything reachable from trunk that
+//!   the pack needs. Trunk is a fast-forward-only chain, so this is one number.
+//! - `packs`: specific other packs for anything not reachable from trunk.
+//!
+//! A version is complete given its pack plus its dependencies, transitively.
 //!
 //! SQLite is the reference backend. Nothing here needs more than single-row CAS and
-//! small multi-key transactions, so it maps onto any horizontally scalable KV store.
+//! small transactions, so it maps onto any horizontally scalable KV store.
 
 use crate::object::Oid;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
+
+/// What a pack (or a version without a pack) needs besides itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Deps {
+    /// Trunk versions `1..=trunk`.
+    pub trunk: u64,
+    /// Other packs, each with its own dependencies.
+    pub packs: Vec<Oid>,
+}
+
+impl Deps {
+    pub fn add(&mut self, other: &Deps) {
+        self.trunk = self.trunk.max(other.trunk);
+        for p in &other.packs {
+            if !self.packs.contains(p) {
+                self.packs.push(*p);
+            }
+        }
+    }
+}
 
 /// One immutable ref version.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,19 +53,37 @@ pub struct Version {
     /// The pack that introduced this version's objects. `None` when the push carried
     /// no new objects (for example a branch created at an existing commit).
     pub pack: Option<Oid>,
-    /// Trunk versions `1..=trunk_dep` complete this version's history.
-    pub trunk_dep: u64,
-    /// For annotated tags, the object the tag points at.
+    pub deps: Deps,
+    /// Every object in `pack` is reachable from `tip`, so a client holding `tip` holds
+    /// the whole pack. False when one push carried several refs.
+    pub pack_complete: bool,
+    /// For annotated tags, the non-tag object the tag chain ends at.
     pub peeled: Option<Oid>,
 }
 
-/// Where a commit was first stored.
+/// Where a commit was stored.
 #[derive(Clone, Debug)]
 pub struct CommitRow {
     pub version: i64,
-    /// The first trunk version whose pack contains this commit, if any.
+    /// The first trunk version whose tip reaches this commit, if any.
     pub trunk_seq: Option<u64>,
     pub parents: Vec<Oid>,
+}
+
+/// Where any object is stored.
+#[derive(Clone, Debug)]
+pub struct ObjectRow {
+    pub pack: Oid,
+    /// The first trunk version whose tip reaches this object, if any.
+    pub trunk_seq: Option<u64>,
+}
+
+/// A compaction cover over trunk versions.
+#[derive(Clone, Debug)]
+pub struct Cover {
+    pub pack: Option<Oid>,
+    /// Union of the covered versions' non-trunk dependencies.
+    pub packs: Vec<Oid>,
 }
 
 /// A ref change to apply atomically.
@@ -56,10 +98,16 @@ pub struct RefUpdate<'a> {
 pub struct NewVersion<'a> {
     pub tip: Oid,
     pub pack: Option<Oid>,
-    pub trunk_dep: u64,
+    /// Dependencies of the pack itself; recorded once per pack.
+    pub pack_deps: &'a Deps,
+    /// Dependencies of this version (the pack's, plus the tip's if outside the pack).
+    pub deps: Deps,
+    pub pack_complete: bool,
     pub peeled: Option<Oid>,
-    /// Commits to add to the commit index, attributed to this version.
+    /// Commits to index. On trunk these get this version's trunk position.
     pub commits: &'a [(Oid, Vec<Oid>)],
+    /// Objects in `pack` to index. On trunk these get this version's trunk position.
+    pub objects: &'a [Oid],
 }
 
 pub struct Meta {
@@ -67,7 +115,8 @@ pub struct Meta {
     pub trunk: String,
 }
 
-const VERSION_COLS: &str = "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.peeled";
+const VERSION_COLS: &str =
+    "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.side_deps, v.pack_complete, v.peeled";
 
 fn oid_col(row: &Row, i: usize) -> rusqlite::Result<Oid> {
     let s: String = row.get(i)?;
@@ -81,6 +130,15 @@ fn opt_oid_col(row: &Row, i: usize) -> rusqlite::Result<Option<Oid>> {
     Ok(s.and_then(|s| Oid::from_hex(&s)))
 }
 
+fn oids_col(row: &Row, i: usize) -> rusqlite::Result<Vec<Oid>> {
+    let s: String = row.get(i)?;
+    Ok(s.split_whitespace().filter_map(Oid::from_hex).collect())
+}
+
+fn join_oids(oids: &[Oid]) -> String {
+    oids.iter().map(Oid::hex).collect::<Vec<_>>().join(" ")
+}
+
 fn version_row(row: &Row) -> rusqlite::Result<Version> {
     Ok(Version {
         id: row.get(0)?,
@@ -88,18 +146,25 @@ fn version_row(row: &Row) -> rusqlite::Result<Version> {
         seq: row.get(2)?,
         tip: oid_col(row, 3)?,
         pack: opt_oid_col(row, 4)?,
-        trunk_dep: row.get(5)?,
-        peeled: opt_oid_col(row, 6)?,
+        deps: Deps {
+            trunk: row.get(5)?,
+            packs: oids_col(row, 6)?,
+        },
+        pack_complete: row.get(7)?,
+        peeled: opt_oid_col(row, 8)?,
     })
 }
 
 impl Meta {
-    pub fn open(path: impl AsRef<Path>, trunk: &str) -> rusqlite::Result<Meta> {
+    /// Open (or create) a repository's metadata. `default_trunk` applies until the
+    /// first push fixes the trunk ref (see [`Meta::fix_trunk`]).
+    pub fn open(path: impl AsRef<Path>, default_trunk: &str) -> rusqlite::Result<Meta> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS versions (
                id INTEGER PRIMARY KEY,
                ref TEXT NOT NULL,
@@ -107,6 +172,8 @@ impl Meta {
                tip TEXT NOT NULL,
                pack TEXT,
                trunk_dep INTEGER NOT NULL,
+               side_deps TEXT NOT NULL,
+               pack_complete INTEGER NOT NULL,
                peeled TEXT,
                UNIQUE (ref, seq)
              );
@@ -115,23 +182,60 @@ impl Meta {
                name TEXT PRIMARY KEY,
                version INTEGER NOT NULL REFERENCES versions (id)
              );
+             CREATE TABLE IF NOT EXISTS packs (
+               hash TEXT PRIMARY KEY,
+               trunk_dep INTEGER NOT NULL,
+               side_deps TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS commits (
                oid TEXT PRIMARY KEY,
                version INTEGER NOT NULL,
                trunk_seq INTEGER,
                parents TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS objects (
+               oid TEXT PRIMARY KEY,
+               pack TEXT NOT NULL,
+               trunk_seq INTEGER
+             );
              CREATE TABLE IF NOT EXISTS covers (
                level INTEGER NOT NULL,
                start INTEGER NOT NULL,
                pack TEXT,
+               side_deps TEXT NOT NULL,
                PRIMARY KEY (level, start)
              );",
         )?;
-        Ok(Meta {
-            conn,
-            trunk: trunk.to_string(),
-        })
+        let trunk = conn
+            .query_row("SELECT value FROM settings WHERE key = 'trunk'", [], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or_else(|| default_trunk.to_string());
+        Ok(Meta { conn, trunk })
+    }
+
+    /// Whether the trunk ref has been chosen yet.
+    pub fn trunk_fixed(&self) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM settings WHERE key = 'trunk'", [], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Choose the trunk ref, once. Later calls keep the first choice.
+    pub fn fix_trunk(&mut self, refname: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('trunk', ?1)",
+            [refname],
+        )?;
+        self.trunk =
+            self.conn
+                .query_row("SELECT value FROM settings WHERE key = 'trunk'", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(())
     }
 
     pub fn is_trunk(&self, refname: &str) -> bool {
@@ -155,11 +259,10 @@ impl Meta {
 
     pub fn trunk_version(&self, seq: u64) -> rusqlite::Result<Option<Version>> {
         self.conn
-            .query_row(
-                &format!("SELECT {VERSION_COLS} FROM versions v WHERE v.ref = ?1 AND v.seq = ?2"),
-                params![self.trunk, seq],
-                version_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {VERSION_COLS} FROM versions v WHERE v.ref = ?1 AND v.seq = ?2"
+            ))?
+            .query_row(params![self.trunk, seq], version_row)
             .optional()
     }
 
@@ -196,11 +299,10 @@ impl Meta {
 
     pub fn version(&self, id: i64) -> rusqlite::Result<Option<Version>> {
         self.conn
-            .query_row(
-                &format!("SELECT {VERSION_COLS} FROM versions v WHERE v.id = ?1"),
-                [id],
-                version_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {VERSION_COLS} FROM versions v WHERE v.id = ?1"
+            ))?
+            .query_row([id], version_row)
             .optional()
     }
 
@@ -208,23 +310,44 @@ impl Meta {
         self.conn
             .prepare_cached("SELECT version, trunk_seq, parents FROM commits WHERE oid = ?1")?
             .query_row([oid.hex()], |row| {
-                let parents: String = row.get(2)?;
                 Ok(CommitRow {
                     version: row.get(0)?,
                     trunk_seq: row.get(1)?,
-                    parents: parents
-                        .split_whitespace()
-                        .filter_map(Oid::from_hex)
-                        .collect(),
+                    parents: oids_col(row, 2)?,
+                })
+            })
+            .optional()
+    }
+
+    pub fn object(&self, oid: &Oid) -> rusqlite::Result<Option<ObjectRow>> {
+        self.conn
+            .prepare_cached("SELECT pack, trunk_seq FROM objects WHERE oid = ?1")?
+            .query_row([oid.hex()], |row| {
+                Ok(ObjectRow {
+                    pack: oid_col(row, 0)?,
+                    trunk_seq: row.get(1)?,
+                })
+            })
+            .optional()
+    }
+
+    /// Dependencies recorded for a stored pack.
+    pub fn pack_deps(&self, pack: &Oid) -> rusqlite::Result<Option<Deps>> {
+        self.conn
+            .prepare_cached("SELECT trunk_dep, side_deps FROM packs WHERE hash = ?1")?
+            .query_row([pack.hex()], |row| {
+                Ok(Deps {
+                    trunk: row.get(0)?,
+                    packs: oids_col(row, 1)?,
                 })
             })
             .optional()
     }
 
     /// Apply ref updates as one transaction: for each, compare-and-swap the ref
-    /// pointer, append the new version, and index its commits. All-or-nothing: if any
-    /// pointer moved since the caller looked, nothing is written and the reason is
-    /// returned.
+    /// pointer, append the new version, and index its commits and objects.
+    /// All-or-nothing: if any pointer moved since the caller looked, nothing is
+    /// written and the reason is returned.
     pub fn update_all(
         &mut self,
         updates: &[&RefUpdate],
@@ -255,13 +378,16 @@ impl Meta {
                 |r| r.get(0),
             )?;
             tx.execute(
-                "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, peeled) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, side_deps, pack_complete, peeled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     u.refname,
                     seq,
                     new.tip.hex(),
                     new.pack.map(|p| p.hex()),
-                    new.trunk_dep,
+                    new.deps.trunk,
+                    join_oids(&new.deps.packs),
+                    new.pack_complete,
                     new.peeled.map(|p| p.hex())
                 ],
             )?;
@@ -271,13 +397,37 @@ impl Meta {
                 params![u.refname, id],
             )?;
             let trunk_seq = (u.refname == self.trunk).then_some(seq);
-            let mut ins = tx.prepare_cached(
-                "INSERT INTO commits (oid, version, trunk_seq, parents) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (oid) DO UPDATE SET trunk_seq = COALESCE(commits.trunk_seq, excluded.trunk_seq)",
-            )?;
-            for (oid, parents) in new.commits {
-                let parents: Vec<String> = parents.iter().map(Oid::hex).collect();
-                ins.execute(params![oid.hex(), id, trunk_seq, parents.join(" ")])?;
+            {
+                let mut ins = tx.prepare_cached(
+                    "INSERT INTO commits (oid, version, trunk_seq, parents) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (oid) DO UPDATE SET trunk_seq = COALESCE(commits.trunk_seq, excluded.trunk_seq)",
+                )?;
+                for (oid, parents) in new.commits {
+                    ins.execute(params![oid.hex(), id, trunk_seq, join_oids(parents)])?;
+                }
+            }
+            if let Some(pack) = new.pack {
+                tx.execute(
+                    "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
+                    params![
+                        pack.hex(),
+                        new.pack_deps.trunk,
+                        join_oids(&new.pack_deps.packs)
+                    ],
+                )?;
+                // Prefer the trunk location of an object: trunk ranges are already
+                // part of every fetch plan, so depending on them costs nothing extra.
+                let mut ins = tx.prepare_cached(
+                    "INSERT INTO objects (oid, pack, trunk_seq) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (oid) DO UPDATE SET
+                       pack = CASE WHEN objects.trunk_seq IS NULL AND excluded.trunk_seq IS NOT NULL
+                                   THEN excluded.pack ELSE objects.pack END,
+                       trunk_seq = COALESCE(objects.trunk_seq, excluded.trunk_seq)",
+                )?;
+                let pack = pack.hex();
+                for oid in new.objects {
+                    ins.execute(params![oid.hex(), pack, trunk_seq])?;
+                }
             }
             out.push(Some(Version {
                 id,
@@ -285,7 +435,8 @@ impl Meta {
                 seq,
                 tip: new.tip,
                 pack: new.pack,
-                trunk_dep: new.trunk_dep,
+                deps: new.deps.clone(),
+                pack_complete: new.pack_complete,
                 peeled: new.peeled,
             }));
         }
@@ -293,12 +444,15 @@ impl Meta {
         Ok(Ok(out))
     }
 
-    /// A compaction cover: `Some(pack)` if the cover exists (`pack` is `None` when the
-    /// covered versions carried no objects).
-    pub fn cover(&self, level: u32, start: u64) -> rusqlite::Result<Option<Option<Oid>>> {
+    pub fn cover(&self, level: u32, start: u64) -> rusqlite::Result<Option<Cover>> {
         self.conn
-            .prepare_cached("SELECT pack FROM covers WHERE level = ?1 AND start = ?2")?
-            .query_row(params![level, start], |r| opt_oid_col(r, 0))
+            .prepare_cached("SELECT pack, side_deps FROM covers WHERE level = ?1 AND start = ?2")?
+            .query_row(params![level, start], |r| {
+                Ok(Cover {
+                    pack: opt_oid_col(r, 0)?,
+                    packs: oids_col(r, 1)?,
+                })
+            })
             .optional()
     }
 
@@ -310,11 +464,30 @@ impl Meta {
         )
     }
 
-    pub fn put_cover(&self, level: u32, start: u64, pack: Option<Oid>) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO covers (level, start, pack) VALUES (?1, ?2, ?3)",
-            params![level, start, pack.map(|p| p.hex())],
+    /// Record a cover and, if it produced a new pack, that pack's dependencies.
+    pub fn put_cover(
+        &mut self,
+        level: u32,
+        start: u64,
+        cover: &Cover,
+        trunk_dep: u64,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        if let Some(pack) = cover.pack {
+            tx.execute(
+                "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
+                params![pack.hex(), trunk_dep, join_oids(&cover.packs)],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO covers (level, start, pack, side_deps) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                level,
+                start,
+                cover.pack.map(|p| p.hex()),
+                join_oids(&cover.packs)
+            ],
         )?;
-        Ok(())
+        tx.commit()
     }
 }

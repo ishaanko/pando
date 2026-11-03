@@ -4,15 +4,18 @@ use axum::serve::ListenerExt;
 use pando::express::{self, Express, Origin};
 use pando::object::Oid;
 use pando::planner;
-use pando::server::App;
+use pando::server::{Advertise, Config, Repo};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 struct Server {
+    /// Base URL of the server.
+    base: String,
+    /// URL of the default test repository.
     url: String,
-    app: Arc<App>,
+    server: Arc<pando::server::Server>,
     dir: TempDir,
 }
 
@@ -42,19 +45,29 @@ fn serve_in_background(listener: std::net::TcpListener, router: axum::Router) {
 
 impl Server {
     fn start() -> Server {
-        Server::start_with_express(0).0
+        Server::start_with(0, |_| {}).0
+    }
+
+    fn start_configured(configure: impl FnOnce(&mut Config)) -> Server {
+        Server::start_with(0, configure).0
+    }
+
+    fn start_with_express(n: usize) -> (Server, Vec<PathBuf>) {
+        Server::start_with(n, |_| {})
     }
 
     /// Start Pando plus `n` Express nodes that fill their caches from Pando.
     /// Returns the Express cache directories.
-    fn start_with_express(n: usize) -> (Server, Vec<PathBuf>) {
+    fn start_with(n: usize, configure: impl FnOnce(&mut Config)) -> (Server, Vec<PathBuf>) {
         let dir = TempDir::new().unwrap();
         let (listener, url) = bind();
         let nodes: Vec<_> = (0..n).map(|_| bind()).collect();
-        let urls = nodes.iter().map(|(_, u)| u.clone()).collect();
-        let (app, router) =
-            pando::server::open(&dir.path().join("data"), "refs/heads/main", &url, urls).unwrap();
-        serve_in_background(listener, router);
+        let mut cfg = Config::new(dir.path().join("data"), &url);
+        cfg.express = nodes.iter().map(|(_, u)| u.clone()).collect();
+        cfg.compact_every = None;
+        configure(&mut cfg);
+        let server = pando::server::Server::new(cfg).unwrap();
+        serve_in_background(listener, server.router());
         let mut caches = Vec::new();
         for (i, (listener, _)) in nodes.into_iter().enumerate() {
             let cache = dir.path().join(format!("express-{i}"));
@@ -66,14 +79,24 @@ impl Server {
             serve_in_background(listener, express::router(Arc::new(express)));
             caches.push(cache);
         }
+        let repo_url = format!("{url}/repo.git");
         (
             Server {
-                url: format!("{url}/repo.git"),
-                app,
+                base: url,
+                url: repo_url,
+                server,
                 dir,
             },
             caches,
         )
+    }
+
+    /// The default test repository (exists after the first push).
+    fn repo(&self) -> Arc<Repo> {
+        self.server
+            .repo("repo")
+            .unwrap()
+            .expect("repository exists")
     }
 
     /// A fresh working directory for a client.
@@ -82,13 +105,14 @@ impl Server {
     }
 
     fn compact(&self) -> usize {
-        pando::compact::run(&self.app.meta, &self.app.store).unwrap()
+        let r = self.repo();
+        pando::compact::run(&r.meta, &r.store).unwrap()
     }
 
     /// Number of objects in the pack behind a ref's current version.
     fn pack_objects(&self, refname: &str) -> usize {
         let v = self
-            .app
+            .repo()
             .meta
             .lock()
             .unwrap()
@@ -96,11 +120,11 @@ impl Server {
             .unwrap()
             .unwrap();
         v.pack
-            .map_or(0, |p| self.app.store.read_idx(&p).unwrap().len())
+            .map_or(0, |p| self.repo().store.read_idx(&p).unwrap().len())
     }
 
     fn trunk_seq(&self) -> u64 {
-        self.app
+        self.repo()
             .meta
             .lock()
             .unwrap()
@@ -205,7 +229,7 @@ fn push_then_clone_and_fetch_inline_and_by_uri() {
         git(repo, &["fsck", "--strict"]);
     }
     let trunk_pack = s
-        .app
+        .repo()
         .meta
         .lock()
         .unwrap()
@@ -238,7 +262,8 @@ fn push_then_clone_and_fetch_inline_and_by_uri() {
         git(repo, &["fsck", "--strict"]);
     }
     // The incremental fetch sent only the three new trunk packs.
-    let m = s.app.meta.lock().unwrap();
+    let r = s.repo();
+    let m = r.meta.lock().unwrap();
     let plan = planner::plan(
         &m,
         &[m.trunk_head().unwrap().unwrap().tip],
@@ -268,7 +293,7 @@ fn side_branch_packs_depend_only_on_trunk() {
     let stale = s.path("stale");
     init(&stale);
     let v3 = s
-        .app
+        .repo()
         .meta
         .lock()
         .unwrap()
@@ -290,7 +315,7 @@ fn side_branch_packs_depend_only_on_trunk() {
     );
 
     let topic = s
-        .app
+        .repo()
         .meta
         .lock()
         .unwrap()
@@ -298,8 +323,12 @@ fn side_branch_packs_depend_only_on_trunk() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        topic.trunk_dep, 5,
-        "pack is recorded against the trunk version at push time"
+        topic.deps,
+        pando::meta::Deps {
+            trunk: 3,
+            packs: vec![]
+        },
+        "the pack needs exactly trunk up to the client's base, and no other pack"
     );
 
     // A reader that wants only the topic gets its pack plus trunk up to its dependency.
@@ -314,8 +343,9 @@ fn side_branch_packs_depend_only_on_trunk() {
 }
 
 #[test]
-fn per_ref_ordering_and_conflicts() {
-    let s = Server::start();
+fn trunk_only_mode_ordering_and_conflicts() {
+    // Trunk-only advertisement: side branches are invisible to pushers.
+    let s = Server::start_configured(|c| c.advertise = Advertise::Trunk);
     let a = s.path("a");
     init(&a);
     git(&a, &["remote", "add", "origin", &s.url]);
@@ -394,7 +424,7 @@ fn compaction_keeps_catch_up_fetches_small() {
     assert_eq!(s.trunk_seq(), 20);
     let behind = clone(&s, "behind", false); // will be moved back to trunk v3 below
     let v3 = s
-        .app
+        .repo()
         .meta
         .lock()
         .unwrap()
@@ -412,11 +442,12 @@ fn compaction_keeps_catch_up_fetches_small() {
     assert_eq!(s.compact(), 6);
     assert_eq!(s.compact(), 0, "compaction is idempotent");
     {
-        let m = s.app.meta.lock().unwrap();
+        let r = s.repo();
+        let m = r.meta.lock().unwrap();
         // (0, 20] = L2 [1..16] + L1 [17..20].
-        assert_eq!(planner::cover_trunk(&m, 0, 20).unwrap().len(), 2);
+        assert_eq!(planner::cover_trunk(&m, 0, 20).unwrap().0.len(), 2);
         // (3, 20] = v4 + L1 [5..8], [9..12], [13..16], [17..20].
-        assert_eq!(planner::cover_trunk(&m, 3, 20).unwrap().len(), 5);
+        assert_eq!(planner::cover_trunk(&m, 3, 20).unwrap().0.len(), 5);
     }
 
     for uris in [false, true] {
@@ -480,7 +511,7 @@ fn express_nodes_cache_packs_and_resume_ranges() {
         .collect();
     let packs: Vec<Oid> = (1..=6)
         .filter_map(|i| {
-            s.app
+            s.repo()
                 .meta
                 .lock()
                 .unwrap()
@@ -490,7 +521,7 @@ fn express_nodes_cache_packs_and_resume_ranges() {
                 .pack
         })
         .collect();
-    let nodes: Vec<String> = s.app.express.clone();
+    let nodes: Vec<String> = s.server.express_nodes();
     for p in &packs {
         let owner = nodes
             .iter()
@@ -505,7 +536,7 @@ fn express_nodes_cache_packs_and_resume_ranges() {
 
     // Range requests let an interrupted download resume.
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let full = std::fs::read(s.app.store.pack_path(&packs[0])).unwrap();
+    let full = std::fs::read(s.repo().store.pack_path(&packs[0])).unwrap();
     let url = format!(
         "{}/pack/{}.pack",
         express::pick_node(&nodes, &packs[0]),
@@ -538,7 +569,7 @@ fn side_commits_pushed_with_trunk_stay_off_trunk() {
     // One push, one pack, two refs.
     git(&a, &["push", "-q", &s.url, "main", "feature"]);
     let row = s
-        .app
+        .repo()
         .meta
         .lock()
         .unwrap()
@@ -655,8 +686,18 @@ fn decoder_matches_git_on_deep_delta_chains() {
         .chain(Oid::from_hex(&git(repo, &["rev-parse", "t"])))
         .collect();
     assert_eq!(parsed.oids, expected);
-    assert!(parsed.external_refs().is_empty(), "a full pack references nothing outside itself");
+    assert!(
+        parsed.external_refs().is_empty(),
+        "a full pack references nothing outside itself"
+    );
     assert_eq!(parsed.commits.len(), 120);
-    let name = pack.file_stem().unwrap().to_str().unwrap().strip_prefix("pack-").unwrap().to_string();
+    let name = pack
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("pack-")
+        .unwrap()
+        .to_string();
     assert_eq!(parsed.hash.hex(), name);
 }

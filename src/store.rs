@@ -76,7 +76,19 @@ impl BlobStore {
         fs::read(self.pack_path(hash))
     }
 
+    /// Map a stored pack into memory. Packs are immutable, so the mapping is stable.
+    pub fn map_pack(&self, hash: &Oid) -> io::Result<memmap2::Mmap> {
+        map_file(&self.pack_path(hash))
+    }
+
     pub fn read_idx(&self, hash: &Oid) -> io::Result<Vec<IdxEntry>> {
         pack::decode_idx(&fs::read(self.idx_path(hash))?)
     }
+}
+
+/// Memory-map a file that nobody modifies while it is mapped.
+pub fn map_file(path: &Path) -> io::Result<memmap2::Mmap> {
+    let file = fs::File::open(path)?;
+    // SAFETY: packs and staged files are written once and never modified in place.
+    unsafe { memmap2::Mmap::map(&file) }
 }

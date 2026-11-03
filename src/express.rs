@@ -8,10 +8,9 @@
 //! rendezvous hashing, so each node caches a stable slice of the pack space.
 
 use crate::object::Oid;
-use crate::store::BlobStore;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -24,10 +23,13 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
+/// Finds a pack on this machine by repository name and hash.
+pub type LocalPacks = Arc<dyn Fn(&str, &Oid) -> Option<PathBuf> + Send + Sync>;
+
 pub enum Origin {
-    /// Read packs straight from a blob store on this machine.
-    Local(Arc<BlobStore>),
-    /// Fill from another node's `/pack/` endpoint.
+    /// Read packs straight from blob stores on this machine.
+    Local(LocalPacks),
+    /// Fill from another node's `/<repo>.git/pack/` endpoint.
     Remote {
         base: String,
         client: reqwest::Client,
@@ -54,10 +56,10 @@ impl Express {
     }
 
     /// A local path holding the pack, filling the cache if needed.
-    async fn local_path(&self, hash: Oid) -> anyhow::Result<Option<PathBuf>> {
+    async fn local_path(&self, repo: &str, hash: Oid) -> anyhow::Result<Option<PathBuf>> {
         let Some(dir) = &self.cache else {
             return Ok(match &self.origin {
-                Origin::Local(store) => Some(store.pack_path(&hash)).filter(|p| p.exists()),
+                Origin::Local(find) => find(repo, &hash).filter(|p| p.exists()),
                 Origin::Remote { .. } => anyhow::bail!("remote origin requires a cache directory"),
             });
         };
@@ -70,14 +72,14 @@ impl Express {
         let filled = if path.exists() {
             Ok(true)
         } else {
-            self.fill(hash, &path).await
+            self.fill(repo, hash, &path).await
         };
         self.fills.lock().unwrap().remove(&hash);
         Ok(filled?.then_some(path))
     }
 
     /// Copy one pack from the origin into the cache, verifying its trailer hash.
-    async fn fill(&self, hash: Oid, dest: &std::path::Path) -> anyhow::Result<bool> {
+    async fn fill(&self, repo: &str, hash: Oid, dest: &std::path::Path) -> anyhow::Result<bool> {
         static FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dest.with_extension(format!("tmp-{}-{n}", std::process::id()));
@@ -94,8 +96,11 @@ impl Express {
             }
         };
         match &self.origin {
-            Origin::Local(store) => {
-                let Ok(bytes) = tokio::fs::read(store.pack_path(&hash)).await else {
+            Origin::Local(find) => {
+                let Some(path) = find(repo, &hash) else {
+                    return Ok(false);
+                };
+                let Ok(bytes) = tokio::fs::read(path).await else {
                     return Ok(false);
                 };
                 put(&bytes, &mut sha);
@@ -103,7 +108,7 @@ impl Express {
             }
             Origin::Remote { base, client } => {
                 let resp = client
-                    .get(format!("{base}/pack/{hash}.pack"))
+                    .get(format!("{base}/{repo}.git/pack/{hash}.pack"))
                     .send()
                     .await?;
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -127,22 +132,33 @@ impl Express {
 }
 
 pub fn router(express: Arc<Express>) -> Router {
-    Router::new()
-        .route("/pack/{file}", get(get_pack))
-        .with_state(express)
+    Router::new().fallback(get(get_pack)).with_state(express)
 }
 
-/// GET /pack/<hash>.pack, with `Range: bytes=N-` support so interrupted downloads
-/// can resume.
+/// Split `/<repo>.git/pack/<hash>.pack` into the repository name and pack hash.
+pub fn parse_pack_path(path: &str) -> Option<(&str, Oid)> {
+    let (repo, file) = path.rsplit_once("/pack/")?;
+    let hash = Oid::from_hex(file.strip_suffix(".pack")?)?;
+    let repo = repo.trim_start_matches('/');
+    Some((repo.strip_suffix(".git").unwrap_or(repo), hash))
+}
+
 async fn get_pack(
     State(x): State<Arc<Express>>,
-    Path(file): Path<String>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let Some(hash) = file.strip_suffix(".pack").and_then(Oid::from_hex) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let path = match x.local_path(hash).await {
+    match parse_pack_path(uri.path()) {
+        Some((repo, hash)) => serve(&x, repo, hash, &headers).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Serve one pack, with `Range: bytes=N-` support so interrupted downloads can
+/// resume. Pack URLs are capability URLs: the 160-bit hash is only learned from an
+/// authorized fetch.
+pub async fn serve(x: &Express, repo: &str, hash: Oid, headers: &HeaderMap) -> Response {
+    let path = match x.local_path(repo, hash).await {
         Ok(Some(p)) => p,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -150,7 +166,7 @@ async fn get_pack(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-    match serve_file(path, &headers).await {
+    match serve_file(path, headers).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(%hash, "express read failed: {e}");

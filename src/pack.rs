@@ -130,7 +130,8 @@ impl ParsedPack {
 fn object_refs(kind: Kind, data: &[u8]) -> Result<Vec<Oid>, PackError> {
     Ok(match kind {
         Kind::Commit => {
-            let tree = crate::object::commit_tree(data).ok_or_else(|| bad("commit without tree"))?;
+            let tree =
+                crate::object::commit_tree(data).ok_or_else(|| bad("commit without tree"))?;
             let mut refs = vec![tree];
             refs.extend(commit_parents(data));
             refs
@@ -147,20 +148,20 @@ fn object_refs(kind: Kind, data: &[u8]) -> Result<Vec<Oid>, PackError> {
 }
 
 /// A parsed object header: type code, inflated size, header length, delta base.
-struct Header {
-    code: u8,
-    size: usize,
-    len: usize,
-    base: Base,
+pub(crate) struct Header {
+    pub code: u8,
+    pub size: usize,
+    pub len: usize,
+    pub base: Base,
 }
 
-enum Base {
+pub(crate) enum Base {
     None,
     Offset(u64),
     Oid(Oid),
 }
 
-fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
+pub(crate) fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
     let mut pos = offset;
     let byte = |pos: usize| {
         buf.get(pos)
@@ -213,7 +214,11 @@ pub fn inflate(input: &[u8], size: usize) -> Result<(Vec<u8>, usize), PackError>
 
 /// Inflate one zlib stream of exactly `size` bytes through a fixed buffer, handing each
 /// chunk to `sink`. Returns how many compressed bytes the stream used.
-fn inflate_with(input: &[u8], size: usize, mut sink: impl FnMut(&[u8])) -> Result<usize, PackError> {
+fn inflate_with(
+    input: &[u8],
+    size: usize,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<usize, PackError> {
     if size > MAX_OBJECT_SIZE {
         return Err(PackError::TooLarge);
     }
@@ -324,14 +329,20 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     }
 
     // Pass 2: resolve deltas depth first from each base.
-    let by_offset: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, r)| (r.offset, i)).collect();
+    let by_offset: HashMap<u64, usize> = raws
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.offset, i))
+        .collect();
     let mut children_by_index: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut children_by_oid: HashMap<Oid, Vec<usize>> = HashMap::new();
     for (i, r) in raws.iter().enumerate() {
         match r.base {
             Base::None => {}
             Base::Offset(off) => {
-                let base = *by_offset.get(&off).ok_or_else(|| bad("delta base offset is not an object"))?;
+                let base = *by_offset
+                    .get(&off)
+                    .ok_or_else(|| bad("delta base offset is not an object"))?;
                 children_by_index.entry(base).or_default().push(i);
             }
             Base::Oid(oid) => children_by_oid.entry(oid).or_default().push(i),
@@ -386,7 +397,10 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     let mut tags = HashMap::new();
     for (r, res) in raws.iter().zip(&resolved) {
         let (kind, oid) = res.unwrap();
-        entries.push(IdxEntry { offset: r.offset, oid });
+        entries.push(IdxEntry {
+            offset: r.offset,
+            oid,
+        });
         oids.insert(oid);
         match kind {
             // Commit refs are [tree, parents...]; tag refs are [target].
@@ -399,7 +413,14 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             _ => {}
         }
     }
-    Ok(ParsedPack { hash, entries, oids, commits, tags, refs })
+    Ok(ParsedPack {
+        hash,
+        entries,
+        oids,
+        commits,
+        tags,
+        refs,
+    })
 }
 
 /// A SHA-1 primed with the loose-object header, ready for the object's bytes.
@@ -550,7 +571,7 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-fn encode_type_size(code: u8, mut size: u64, out: &mut Vec<u8>) {
+pub(crate) fn encode_type_size(code: u8, mut size: u64, out: &mut Vec<u8>) {
     let mut c = (code << 4) | (size & 15) as u8;
     size >>= 4;
     while size != 0 {

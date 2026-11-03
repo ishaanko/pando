@@ -5,7 +5,7 @@
 //! up to `MAX_LEVEL`. Lower levels are never deleted: every level stays servable, and
 //! the planner picks whichever mix covers a client's range in the fewest packs.
 
-use crate::meta::Meta;
+use crate::meta::{Cover, Meta};
 use crate::object::Oid;
 use crate::pack;
 use crate::planner::{FANOUT, MAX_LEVEL, span};
@@ -27,23 +27,32 @@ pub fn run(meta: &Mutex<Meta>, store: &BlobStore) -> anyhow::Result<usize> {
             .map_or(1, |last| last + s);
         while start + s - 1 <= head {
             let mut parts = Vec::new();
+            let mut side = Vec::new();
             {
                 let m = meta.lock().unwrap();
                 for i in 0..FANOUT {
                     let at = start + i * sub;
                     let part = if level == 1 {
-                        m.trunk_version(at)?.map(|v| v.pack)
+                        m.trunk_version(at)?.map(|v| (v.pack, v.deps.packs))
                     } else {
-                        m.cover(level - 1, at)?
+                        m.cover(level - 1, at)?.map(|c| (c.pack, c.packs))
                     };
-                    match part {
-                        Some(p) => parts.extend(p),
-                        None => return Ok(written), // lower level not built yet
-                    }
+                    let Some((pack, deps)) = part else {
+                        return Ok(written); // lower level not built yet
+                    };
+                    parts.extend(pack);
+                    side.extend(deps);
                 }
             }
+            // Members are inside the cover; anything else stays a dependency.
+            side.retain(|p| !parts.contains(p));
+            side.sort();
+            side.dedup();
             let pack = splice(store, &parts)?;
-            meta.lock().unwrap().put_cover(level, start, pack)?;
+            let cover = Cover { pack, packs: side };
+            meta.lock()
+                .unwrap()
+                .put_cover(level, start, &cover, start - 1)?;
             tracing::info!(level, start, end = start + s - 1, ?pack, "compacted");
             written += 1;
             start += s;
