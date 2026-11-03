@@ -5,7 +5,7 @@
 //! Each repository's metadata is snapshotted with SQLite's `VACUUM INTO`. Packs never
 //! change once written, so they are hard-linked (or copied across filesystems) after
 //! the snapshot. A pack that gc deletes in between was already unreachable in the
-//! snapshot, so it can be skipped.
+//! snapshot, so it is skipped and forgotten in the copy, as gc forgot it.
 
 use crate::meta::Meta;
 use crate::object::Oid;
@@ -42,6 +42,8 @@ pub fn backup(data: &Path, out: &Path) -> anyhow::Result<Summary> {
             .prepare("SELECT hash FROM packs")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        drop(snapshot);
+        let mut skipped = Vec::new();
         for hash in packs {
             let mut copied = true;
             for ext in ["pack", "pidx"] {
@@ -53,8 +55,21 @@ pub fn backup(data: &Path, out: &Path) -> anyhow::Result<Summary> {
             if copied {
                 summary.packs += 1;
             } else {
-                summary.skipped += 1;
+                skipped.extend(Oid::from_hex(&hash));
             }
+        }
+        if !skipped.is_empty() {
+            // gc deleted these after the snapshot: forget them in the copy too.
+            for hash in &skipped {
+                for ext in ["pack", "pidx"] {
+                    let _ = fs::remove_file(dst.join(format!("blobs/packs/{hash}.{ext}")));
+                }
+            }
+            let mut meta = Meta::open(dst.join("meta.db"), "refs/heads/main")?;
+            let store = BlobStore::open(dst.join("blobs"))?;
+            crate::gc::drop_packs(&mut meta, &store, &skipped)
+                .map_err(|e| anyhow::anyhow!("{name}: {e:#}"))?;
+            summary.skipped += skipped.len();
         }
         copy_dir(&src.join("hooks"), &dst.join("hooks"))?;
         summary.repos += 1;
@@ -94,17 +109,22 @@ pub fn restore(from: &Path, data: &Path) -> anyhow::Result<Summary> {
     Ok(summary)
 }
 
-/// Problems found in a data directory: live packs that are missing or (with `full`)
-/// corrupt, and refs whose tips are not stored.
+/// Problems found in a data directory: packs the metadata knows that are missing or
+/// (with `full`) corrupt, and refs whose tips are not stored.
 pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
     let mut problems = Vec::new();
     for name in repo_names(data)? {
         let dir = data.join("repos").join(format!("{name}.git"));
         let meta = Meta::open(dir.join("meta.db"), "refs/heads/main")?;
         let store = BlobStore::open(dir.join("blobs"))?;
-        let mut live: Vec<Oid> = crate::gc::live_packs(&meta)?.into_iter().collect();
-        live.sort();
-        for hash in live {
+        let mut known: Vec<Oid> = meta
+            .conn
+            .prepare("SELECT hash FROM packs")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|h| h.ok().and_then(|h| Oid::from_hex(&h)))
+            .collect();
+        known.sort();
+        for hash in known {
             if !store.has(&hash) || !store.pack_path(&hash).exists() {
                 problems.push(format!("{name}: pack {hash} is missing"));
                 continue;

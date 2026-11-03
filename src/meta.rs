@@ -522,8 +522,10 @@ impl Meta {
     ) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         let hex = pack.hex();
+        // Pushed again after gc marked it: it is wanted after all.
         tx.execute(
-            "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
+            "INSERT INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)
+             ON CONFLICT (hash) DO UPDATE SET dead_since = NULL",
             params![hex, deps.trunk, join_oids(&deps.packs)],
         )?;
         {
@@ -667,6 +669,9 @@ impl Meta {
             return Ok(Ok(()));
         }
         let old = self.trunk_head()?;
+        if !branch.starts_with("refs/heads/") {
+            return Ok(Err(format!("{branch} is not a branch")));
+        }
         let Some(new) = self.current(branch)? else {
             if old.is_none() {
                 // Nothing pushed yet: just choose the name.
@@ -679,6 +684,9 @@ impl Meta {
             }
             return Ok(Err(format!("no such branch {branch}")));
         };
+        if new.peeled.is_some() {
+            return Ok(Err(format!("{branch} does not point at a commit")));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

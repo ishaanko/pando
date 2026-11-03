@@ -238,11 +238,17 @@ pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<O
                 continue 'outer;
             }
         }
-        let v = meta
-            .trunk_version(at + 1)?
-            .ok_or(PlanError::NotOurRef(Oid::ZERO))?;
-        packs.extend(v.pack);
-        deps.extend(v.deps.packs);
+        match meta.trunk_version(at + 1)? {
+            Some(v) => {
+                packs.extend(v.pack);
+                deps.extend(v.deps.packs);
+            }
+            // gc removes earlier-epoch versions that nothing needed. Such a gap lies
+            // above every position anything still depends on, so it holds nothing
+            // this range needs.
+            None if at + 1 < meta.epoch_start => {}
+            None => return Err(PlanError::NotOurRef(Oid::ZERO)),
+        }
         at += 1;
     }
     Ok((packs, deps))

@@ -2368,3 +2368,175 @@ fn oversized_and_stalled_fetch_requests_do_not_block_the_server() {
     });
     assert!(text.contains("ERR"), "{text}");
 }
+
+#[test]
+fn gc_between_trunk_rewrites_keeps_the_repository_servable() {
+    for switch_branch in [false, true] {
+        let s = Server::start();
+        let a = s.path("a");
+        init(&a);
+        git(&a, &["remote", "add", "origin", &s.url]);
+        let c1 = commit(&a, "f", "1");
+        git(&a, &["push", "-q", "origin", "main"]);
+        commit(&a, "f", "2");
+        git(&a, &["push", "-q", "origin", "main"]);
+        git(&a, &["reset", "-q", "--hard", &c1]);
+        commit(&a, "f", "3");
+        git(&a, &["push", "-qf", "origin", "main"]);
+        // Removes chain version 2, which nothing needs any more.
+        pando::gc::run(&s.repo(), std::time::Duration::ZERO).unwrap();
+        if switch_branch {
+            git(&a, &["checkout", "-qb", "next"]);
+            commit(&a, "g", "next");
+            git(&a, &["push", "-q", "origin", "next"]);
+            s.repo()
+                .meta
+                .lock()
+                .unwrap()
+                .set_trunk("refs/heads/next")
+                .unwrap()
+                .unwrap();
+        } else {
+            commit(&a, "f", "4");
+            git(&a, &["push", "-q", "origin", "main"]);
+            git(&a, &["reset", "-q", "--hard", "HEAD~1"]);
+            commit(&a, "f", "5");
+            git(&a, &["push", "-qf", "origin", "main"]);
+        }
+        let c = clone(&s, "c", true);
+        git(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "HEAD"), 3);
+    }
+}
+
+#[test]
+fn gc_never_deletes_a_pack_pushed_again_meanwhile() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "1");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["checkout", "-qb", "b"]);
+    commit(&a, "g", "branch");
+    git(&a, &["push", "-q", "origin", "b"]);
+    git(&a, &["push", "-q", "origin", "--delete", "b"]);
+
+    // Hold the re-push of `b` (an identical pack) inside its pre-receive hook while
+    // gc deletes the old copy.
+    let sync = s.path("sync");
+    std::fs::create_dir_all(&sync).unwrap();
+    write_hook(
+        &s.dir.path().join("data/hooks/pre-receive"),
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\ntouch {0}/started\nwhile [ ! -f {0}/go ]; do sleep 0.05; done\n",
+            sync.display()
+        ),
+    );
+    let a2 = a.clone();
+    let pusher = std::thread::spawn(move || git_cmd(&a2, &["push", "-q", "origin", "b"]));
+    while !sync.join("started").exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let r = pando::gc::run(&s.repo(), std::time::Duration::ZERO).unwrap();
+    assert_eq!(r.deleted, 1, "{r:?}");
+    std::fs::write(sync.join("go"), "").unwrap();
+    assert!(pusher.join().unwrap().status.success());
+    assert!(
+        pando::backup::verify(&s.dir.path().join("data"), true)
+            .unwrap()
+            .is_empty()
+    );
+    let c = clone(&s, "c", false);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "origin/b"), 2);
+    // The re-pushed pack is live again, not left marked.
+    assert_eq!(
+        pando::gc::run(&s.repo(), std::time::Duration::ZERO)
+            .unwrap()
+            .deleted,
+        0
+    );
+}
+
+#[test]
+fn backups_forget_packs_gc_deleted_during_the_copy() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 1..=4 {
+        commit(&a, "f", &format!("{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    let v4 = git(&a, &["rev-parse", "HEAD"]);
+    let repo = s.repo();
+    let p4 = repo
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(4)
+        .unwrap()
+        .unwrap()
+        .pack
+        .unwrap();
+    git(&a, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&a, "f", "x");
+    git(&a, &["push", "-qf", "origin", "main"]);
+    // As if gc deleted v4's pack between the backup's snapshot and its copy.
+    repo.store.delete(&p4).unwrap();
+    let out = s.path("backup");
+    let b = pando::backup::backup(&s.dir.path().join("data"), &out).unwrap();
+    assert_eq!(b.skipped, 1);
+    let data2 = s.path("data2");
+    pando::backup::restore(&out, &data2).unwrap();
+
+    let (listener, url) = bind();
+    let mut cfg = Config::new(data2, &url);
+    cfg.compact_every = None;
+    cfg.gc_every = None;
+    serve_in_background(listener, pando::server::Server::new(cfg).unwrap().router());
+    let url = format!("{url}/repo.git");
+    git(&a, &["checkout", "-q", "--detach", &v4]);
+    commit(&a, "g", "on old v4");
+    git(&a, &["push", "-q", &url, "HEAD:refs/heads/side"]);
+    let c = s.path("c");
+    git(
+        s.dir.path(),
+        &["clone", "-q", "--mirror", &url, c.to_str().unwrap()],
+    );
+    git(&c, &["fsck", "--no-progress"]);
+}
+
+#[test]
+fn trunk_only_mode_accepts_fast_forwards_after_a_rewrite() {
+    let s = Server::start_configured(|cfg| cfg.advertise = Advertise::Trunk);
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "1");
+    let x = commit(&a, "f", "2");
+    git(&a, &["push", "-q", "origin", "main"]);
+    commit(&a, "f", "3");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["push", "-q", "origin", &format!("{x}:refs/heads/b")]);
+    git(&a, &["reset", "-q", "--hard", &x]);
+    commit(&a, "f", "Y");
+    git(&a, &["push", "-qf", "origin", "main"]);
+    commit(&a, "f", "Z");
+    git(&a, &["push", "-q", "origin", "HEAD:refs/heads/b"]);
+}
+
+#[test]
+fn only_branches_can_become_the_default() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "1");
+    git(&a, &["tag", "-am", "t", "v1"]);
+    git(&a, &["push", "-q", &s.url, "main", "v1"]);
+    let repo = s.repo();
+    let mut meta = repo.meta.lock().unwrap();
+    assert!(meta.set_trunk("refs/tags/v1").unwrap().is_err());
+    assert!(meta.set_trunk("refs/heads/nope").unwrap().is_err());
+}

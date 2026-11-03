@@ -16,6 +16,7 @@ use crate::meta::{CHAIN, Meta};
 use crate::object::Oid;
 use crate::planner::span;
 use crate::server::Repo;
+use crate::store::BlobStore;
 use rusqlite::{OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,34 +89,34 @@ fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
             }
         }
         tx.commit()?;
+        let Some(grace) = grace else {
+            return Ok(report);
+        };
         if !doomed.is_empty() {
-            forget(&mut meta, repo, &live, &doomed)?;
+            forget(&mut meta, &repo.store, &live, &doomed)?;
         }
-    }
-    let Some(grace) = grace else {
-        return Ok(report);
-    };
-    for hash in &doomed {
-        report.bytes += repo.store.delete(hash)?;
-        report.deleted += 1;
-    }
-    // Pack files no metadata knows about (a push that failed after storing its pack),
-    // once they are old enough that no push can still be indexing them.
-    let known: HashSet<Oid> = {
-        let meta = repo.meta.lock().unwrap();
-        let mut stmt = meta.conn.prepare("SELECT hash FROM packs")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?
-            .filter_map(|h| h.ok().and_then(|h| Oid::from_hex(&h)))
-            .collect()
-    };
-    let orphan_age = grace.max(Duration::from_secs(600));
-    for (hash, written) in repo.store.list()? {
-        if !known.contains(&hash) && written.elapsed().is_ok_and(|e| e >= orphan_age) {
-            report.bytes += repo.store.delete(&hash)?;
+        // Files go while the lock is held: a push publishes its pack under the same
+        // lock, so a pack pushed again right now cannot be deleted under it.
+        for hash in &doomed {
+            report.bytes += repo.store.delete(hash)?;
             report.deleted += 1;
         }
+        // Pack files no metadata knows about (a push that failed after storing its
+        // pack), once old enough.
+        let known: HashSet<Oid> = {
+            let mut stmt = meta.conn.prepare("SELECT hash FROM packs")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .filter_map(|h| h.ok().and_then(|h| Oid::from_hex(&h)))
+                .collect()
+        };
+        for (hash, written) in repo.store.list()? {
+            if !known.contains(&hash) && written.elapsed().is_ok_and(|e| e >= orphan_age(grace)) {
+                report.bytes += repo.store.delete(&hash)?;
+                report.deleted += 1;
+            }
+        }
+        repo.store.clean_staging(orphan_age(grace))?;
     }
-    repo.store.clean_staging(orphan_age)?;
     crate::metrics::GC_PACKS_DELETED.add(report.deleted as u64);
     crate::metrics::GC_BYTES_DELETED.add(report.bytes);
     if report.marked + report.deleted > 0 {
@@ -124,9 +125,9 @@ fn collect(repo: &Repo, grace: Option<Duration>) -> anyhow::Result<Report> {
     Ok(report)
 }
 
-/// Every pack something live needs (what `verify` checks and `backup` must copy).
-pub fn live_packs(meta: &Meta) -> anyhow::Result<HashSet<Oid>> {
-    Ok(Live::compute(meta)?.packs)
+/// How old an unindexed pack file or staging file must be before it is removed.
+fn orphan_age(grace: Duration) -> Duration {
+    grace.max(Duration::from_secs(600))
 }
 
 /// What is reachable from the refs.
@@ -230,7 +231,17 @@ impl Live {
 }
 
 /// Drop `doomed` packs from the metadata, re-homing objects that live packs also hold.
-fn forget(meta: &mut Meta, repo: &Repo, live: &Live, doomed: &[Oid]) -> anyhow::Result<()> {
+/// Remove packs from the metadata of a copy (a backup) that does not have them.
+/// Fails if any of them is still needed.
+pub fn drop_packs(meta: &mut Meta, store: &BlobStore, packs: &[Oid]) -> anyhow::Result<()> {
+    let live = Live::compute(meta)?;
+    if let Some(p) = packs.iter().find(|p| live.packs.contains(p)) {
+        anyhow::bail!("pack {p} is still needed");
+    }
+    forget(meta, store, &live, packs)
+}
+
+fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> anyhow::Result<()> {
     let dead: HashSet<Oid> = doomed.iter().copied().collect();
     let hexes: Vec<String> = doomed.iter().map(Oid::hex).collect();
 
@@ -249,7 +260,7 @@ fn forget(meta: &mut Meta, repo: &Repo, live: &Live, doomed: &[Oid]) -> anyhow::
     let mut home: HashMap<Oid, Oid> = HashMap::new();
     if !orphans.is_empty() {
         for pack in &live.packs {
-            let Ok(idx) = repo.store.read_idx(pack) else {
+            let Ok(idx) = store.read_idx(pack) else {
                 continue;
             };
             for e in idx {

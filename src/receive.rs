@@ -176,9 +176,13 @@ fn push(
 
     let mut unpack: Result<(), String> = Ok(());
     let mut parsed: Option<ParsedPack> = None;
+    let mut staged: Option<Staged> = None;
     if commands.iter().any(|c| !c.new.is_zero()) {
         match receive_pack_data(&repo.store, r, delimited) {
-            Ok(p) => parsed = Some(p),
+            Ok((p, s)) => {
+                parsed = Some(p);
+                staged = Some(s);
+            }
             Err(e) => unpack = Err(format!("{e}")),
         }
     }
@@ -190,10 +194,7 @@ fn push(
         repo,
         user,
         options: &options,
-        pack: parsed
-            .as_ref()
-            .filter(|p| !p.entries.is_empty())
-            .map(|p| repo.store.pack_path(&p.hash)),
+        pack: staged.as_ref().map(|s| s.0.clone()),
     };
     let updates = |only_ok: Option<&[Result<(), String>]>| -> Vec<hooks::Update> {
         commands
@@ -258,6 +259,11 @@ fn push(
                         .collect()
                 }
                 Ok((pack_deps, planned)) => {
+                    if let (Some(p), Some(s)) = (&parsed, &staged)
+                        && !p.entries.is_empty()
+                    {
+                        repo.store.publish(&s.0, &p.hash, &p.entries)?;
+                    }
                     let statuses = apply(
                         &mut meta,
                         &commands,
@@ -356,18 +362,23 @@ fn choose_trunk<'a>(preferred: &str, commands: &'a [Command]) -> Option<&'a str>
 }
 
 /// Stream the pack into staging, decode it once, and publish it to blob storage.
+/// A received pack waiting in staging. The file is removed on every exit path
+/// (panics included) unless it was published.
+struct Staged(std::path::PathBuf);
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Stream the pack into staging and decode it. Publishing happens later, under the
+/// metadata lock, so gc never deletes a pack between its publication and its index.
 fn receive_pack_data(
     store: &BlobStore,
     r: &mut dyn BufRead,
     delimited: bool,
-) -> anyhow::Result<ParsedPack> {
-    /// Removes the staging file on every exit path, panics included.
-    struct Staged(std::path::PathBuf);
-    impl Drop for Staged {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+) -> anyhow::Result<(ParsedPack, Staged)> {
     let staged = Staged(store.staging_path());
     let mut file = std::fs::File::create(&staged.0)?;
     if delimited {
@@ -379,10 +390,7 @@ fn receive_pack_data(
     let map = map_file(&staged.0)?;
     metrics::PUSH_BYTES.add(map.len() as u64);
     let parsed = pack::parse(&map)?;
-    if !parsed.entries.is_empty() {
-        store.publish(&staged.0, &parsed.hash, &parsed.entries)?;
-    }
-    Ok(parsed)
+    Ok((parsed, staged))
 }
 
 /// What a validated command will do.
@@ -691,12 +699,10 @@ fn is_ancestor(
 ) -> rusqlite::Result<bool> {
     let target = current.tip;
     let target_is_trunk_head = meta.is_trunk(&current.refname);
-    let target_on_trunk =
-        target_is_trunk_head || meta.commit(&target)?.and_then(|c| c.trunk_seq).is_some();
     // Every trunk commit is reachable from the trunk head, so the head cannot be
-    // strictly behind one; nor can a commit that is not on trunk.
-    let skip =
-        |row: &CommitRow| row.trunk_seq.is_some() && (target_is_trunk_head || !target_on_trunk);
+    // strictly behind one. (Trunk commits can descend from anything, after a rewrite
+    // or a merge, so nothing else is pruned.)
+    let skip = |row: &CommitRow| row.trunk_seq.is_some() && target_is_trunk_head;
     Ok(!reach(meta, pack, new, &HashSet::from([target]), skip)?.is_empty())
 }
 
