@@ -311,7 +311,7 @@ pub fn decode_idx(buf: &[u8]) -> io::Result<Vec<IdxEntry>> {
         return Err(invalid());
     }
     Ok(body
-        .chunks_exact(28)
+        .as_chunks::<28>().0.iter()
         .map(|c| IdxEntry {
             offset: u64::from_be_bytes(c[..8].try_into().unwrap()),
             oid: Oid::from_slice(&c[8..]).unwrap(),

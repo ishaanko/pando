@@ -147,13 +147,12 @@ pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<Vec<Oid>, PlanEr
     'outer: while at < want {
         for level in (1..=MAX_LEVEL).rev() {
             let s = span(level);
-            if at % s == 0 && at + s <= want {
-                if let Some(pack) = meta.cover(level, at + 1)? {
+            if at.is_multiple_of(s) && at + s <= want
+                && let Some(pack) = meta.cover(level, at + 1)? {
                     packs.extend(pack);
                     at += s;
                     continue 'outer;
                 }
-            }
         }
         let v = meta.trunk_version(at + 1)?.ok_or_else(|| PlanError::NotOurRef(Oid::ZERO))?;
         packs.extend(v.pack);
