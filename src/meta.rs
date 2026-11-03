@@ -611,6 +611,21 @@ impl Meta {
                 "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
                 params![u.refname, id],
             )?;
+            // Packs gc marked dead that this version needs are live again.
+            let mut revive: Vec<Oid> = new.deps.packs.iter().copied().chain(new.pack).collect();
+            while let Some(p) = revive.pop() {
+                let deps: Option<String> = tx
+                    .prepare_cached(
+                        "UPDATE packs SET dead_since = NULL
+                         WHERE hash = ?1 AND dead_since IS NOT NULL RETURNING side_deps",
+                    )?
+                    .query_row([p.hex()], |r| r.get(0))
+                    .optional()?;
+                revive.extend(
+                    deps.iter()
+                        .flat_map(|d| d.split_whitespace().filter_map(Oid::from_hex)),
+                );
+            }
             if on_trunk && let Some(pack) = new.pack {
                 // Trunk now reaches these: they get a trunk position (and move to this
                 // pack, which holds them) unless an earlier version of this epoch had
