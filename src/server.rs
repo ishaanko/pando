@@ -56,6 +56,10 @@ pub struct Config {
     pub public_read: bool,
     /// Background compaction period. `None` disables the background compactor.
     pub compact_every: Option<Duration>,
+    /// Garbage collection period. `None` disables background collection.
+    pub gc_every: Option<Duration>,
+    /// How long a pack stays unreachable before it is deleted.
+    pub gc_grace: Duration,
     /// Secret for signing pack URLs, shared with Express nodes. Random when unset.
     pub url_secret: Option<String>,
 }
@@ -71,6 +75,8 @@ impl Config {
             auth: None,
             public_read: false,
             compact_every: Some(Duration::from_secs(30)),
+            gc_every: Some(Duration::from_secs(3600)),
+            gc_grace: Duration::from_secs(3600),
             url_secret: None,
         }
     }
@@ -196,11 +202,13 @@ impl Server {
             store: BlobStore::open(dir.join("blobs"))?,
             compact: Notify::new(),
         });
-        if let (Some(every), Ok(rt)) = (
-            self.cfg.compact_every,
-            tokio::runtime::Handle::try_current(),
-        ) {
-            rt.spawn(compactor(repo.clone(), every));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            if let Some(every) = self.cfg.compact_every {
+                rt.spawn(compactor(repo.clone(), every));
+            }
+            if let Some(every) = self.cfg.gc_every {
+                rt.spawn(collector(repo.clone(), every, self.cfg.gc_grace));
+            }
         }
         repos.insert(name.to_string(), repo.clone());
         Ok(Some(repo))
@@ -236,6 +244,19 @@ async fn compactor(repo: Arc<Repo>, every: Duration) {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::error!(repo = %repo.name, "compaction failed: {e:#}"),
             Err(e) => tracing::error!(repo = %repo.name, "compaction panicked: {e}"),
+        }
+    }
+}
+
+/// Collect garbage every `every`.
+async fn collector(repo: Arc<Repo>, every: Duration, grace: Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        let r = repo.clone();
+        match tokio::task::spawn_blocking(move || crate::gc::run(&r, grace)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::error!(repo = %repo.name, "gc failed: {e:#}"),
+            Err(e) => tracing::error!(repo = %repo.name, "gc panicked: {e}"),
         }
     }
 }

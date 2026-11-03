@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod compact;
 pub mod express;
+pub mod gc;
 pub mod generate;
 pub mod meta;
 pub mod object;

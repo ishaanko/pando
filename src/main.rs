@@ -51,6 +51,13 @@ enum Cmd {
         /// Upper bound between compaction passes, in seconds.
         #[arg(long, default_value_t = 30)]
         compact_interval: u64,
+        /// Seconds between garbage collection passes (0 disables).
+        #[arg(long, default_value_t = 3600)]
+        gc_interval: u64,
+        /// Seconds an unreachable pack is kept before deletion. Keep it at least as long
+        /// as signed pack URLs live (one hour).
+        #[arg(long, default_value_t = 3600)]
+        gc_grace: u64,
         /// Secret for signing pack URLs when --auth-file is set. Give Express nodes the
         /// same value. Random per process when unset.
         #[arg(long, env = "PANDO_URL_SECRET")]
@@ -90,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
             public_read,
             express,
             compact_interval,
+            gc_interval,
+            gc_grace,
             url_secret,
         } => {
             let auth = auth_file.as_deref().map(Auth::load).transpose()?;
@@ -106,6 +115,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.public_read = public_read;
             cfg.express = express;
             cfg.compact_every = Some(Duration::from_secs(compact_interval));
+            cfg.gc_every = (gc_interval > 0).then(|| Duration::from_secs(gc_interval));
+            cfg.gc_grace = Duration::from_secs(gc_grace);
             cfg.url_secret = url_secret;
             let server = Server::new(cfg)?;
             let router = server.router();

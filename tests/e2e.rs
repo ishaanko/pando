@@ -65,6 +65,7 @@ impl Server {
         let mut cfg = Config::new(dir.path().join("data"), &url);
         cfg.express = nodes.iter().map(|(_, u)| u.clone()).collect();
         cfg.compact_every = None;
+        cfg.gc_every = None;
         configure(&mut cfg);
         let server = pando::server::Server::new(cfg).unwrap();
         serve_in_background(listener, server.router());
@@ -1767,4 +1768,88 @@ fn ssh_clones_fetches_and_pushes_with_keys() {
         &["ls-remote", &format!("{base}/missing.git")],
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+}
+
+/// Every object id in any stored pack of the default repository.
+fn stored_objects(s: &Server) -> std::collections::HashSet<String> {
+    let repo = s.repo();
+    let mut out = std::collections::HashSet::new();
+    for (hash, _) in repo.store.list().unwrap() {
+        for e in repo.store.read_idx(&hash).unwrap() {
+            out.insert(e.oid.hex());
+        }
+    }
+    out
+}
+
+#[test]
+fn gc_deletes_unreachable_packs_and_keeps_everything_else_servable() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..6 {
+        commit(&a, "f", &format!("v{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    // A leaked secret in trunk version 7, compacted into a cover, then a version 8.
+    commit(&a, "secret", "hunter2");
+    let secret = git(&a, &["rev-parse", "HEAD:secret"]);
+    git(&a, &["push", "-q", "origin", "main"]);
+    commit(&a, "f", "v7");
+    git(&a, &["push", "-q", "origin", "main"]);
+    s.compact();
+    // A branch built on version 3, and a branch that will be deleted.
+    git(&a, &["checkout", "-qb", "keep", "main~5"]);
+    commit(&a, "k", "keep");
+    git(&a, &["push", "-q", "origin", "keep"]);
+    git(&a, &["checkout", "-qb", "doomed", "main"]);
+    commit(&a, "d", "doomed");
+    let doomed = git(&a, &["rev-parse", "HEAD:d"]);
+    git(&a, &["push", "-q", "origin", "doomed"]);
+    let old = clone(&s, "old", false);
+    git(&a, &["checkout", "-q", "main"]);
+
+    // Nothing is garbage yet.
+    let repo = s.repo();
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert_eq!((r.marked, r.deleted), (0, 0));
+
+    // Drop the secret from trunk and delete the branch that contains it.
+    git(&a, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&a, "f", "clean");
+    git(&a, &["push", "-qf", "origin", "main"]);
+    git(&a, &["push", "-q", "origin", "--delete", "doomed"]);
+    assert!(stored_objects(&s).contains(&secret));
+
+    // Within the grace period, packs are only marked.
+    let r = pando::gc::run(&repo, std::time::Duration::from_secs(3600)).unwrap();
+    assert!(r.marked > 0 && r.deleted == 0, "{r:?}");
+    assert!(stored_objects(&s).contains(&secret));
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert!(r.deleted > 0, "{r:?}");
+    let left = stored_objects(&s);
+    assert!(!left.contains(&secret), "the secret survived gc");
+    assert!(!left.contains(&doomed));
+
+    // Everything still reachable is still served, to new and old clones alike.
+    for (name, uris) in [("c1", false), ("c2", true)] {
+        let c = clone(&s, name, uris);
+        git(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "HEAD"), 7);
+        assert_eq!(count(&c, "origin/keep"), 4);
+    }
+    git(&old, &["fetch", "-q", "--prune"]);
+    git(&old, &["fsck", "--no-progress"]);
+    // Pushing and compacting keep working afterwards, and a second gc is a no-op.
+    for i in 0..4 {
+        commit(&a, "f", &format!("after{i}"));
+        git(&a, &["push", "-q", "origin", "main"]);
+    }
+    s.compact();
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert_eq!(r.deleted, 0, "{r:?}");
+    let c = clone(&s, "c3", true);
+    git(&c, &["fsck", "--no-progress"]);
+    assert_eq!(count(&c, "HEAD"), 11);
 }

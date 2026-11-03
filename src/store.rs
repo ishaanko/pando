@@ -86,6 +86,55 @@ impl BlobStore {
     }
 }
 
+impl BlobStore {
+    /// Every stored pack, with when it was written.
+    pub fn list(&self) -> io::Result<Vec<(Oid, std::time::SystemTime)>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.root.join("packs"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(hash) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".pack"))
+                .and_then(Oid::from_hex)
+            else {
+                continue;
+            };
+            out.push((hash, entry.metadata()?.modified()?));
+        }
+        Ok(out)
+    }
+
+    /// Delete a pack and its index. Readers that already opened it keep working.
+    pub fn delete(&self, hash: &Oid) -> io::Result<u64> {
+        let size = fs::metadata(self.pack_path(hash)).map_or(0, |m| m.len());
+        // Index first: its presence is what marks a pack as complete.
+        for path in [self.idx_path(hash), self.pack_path(hash)] {
+            match fs::remove_file(path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(size)
+    }
+
+    /// Remove staging files older than `age` (left by interrupted pushes).
+    pub fn clean_staging(&self, age: std::time::Duration) -> io::Result<()> {
+        for entry in fs::read_dir(self.root.join("tmp"))? {
+            let entry = entry?;
+            let old = entry
+                .metadata()?
+                .modified()?
+                .elapsed()
+                .is_ok_and(|e| e >= age);
+            if old {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Memory-map a file that nobody modifies while it is mapped.
 pub fn map_file(path: &Path) -> io::Result<memmap2::Mmap> {
     let file = fs::File::open(path)?;
