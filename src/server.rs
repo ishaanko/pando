@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -62,6 +62,10 @@ pub struct Config {
     pub gc_grace: Duration,
     /// Secret for signing pack URLs, shared with Express nodes. Random when unset.
     pub url_secret: Option<String>,
+    /// URLs that get a POST after every push that moves refs (see `hooks.rs`).
+    pub webhooks: Vec<String>,
+    /// Signs webhook bodies when set.
+    pub webhook_secret: Option<String>,
 }
 
 impl Config {
@@ -78,6 +82,8 @@ impl Config {
             gc_every: Some(Duration::from_secs(3600)),
             gc_grace: Duration::from_secs(3600),
             url_secret: None,
+            webhooks: Vec::new(),
+            webhook_secret: None,
         }
     }
 }
@@ -85,6 +91,10 @@ impl Config {
 /// One repository.
 pub struct Repo {
     pub name: String,
+    /// `<data>/repos/<name>.git`
+    pub dir: PathBuf,
+    /// Set once the repository is deleted or renamed; holders of this handle stop.
+    pub closed: std::sync::atomic::AtomicBool,
     pub meta: Mutex<Meta>,
     pub store: BlobStore,
     /// Signalled after trunk moves, to wake the compactor.
@@ -97,6 +107,8 @@ pub struct Server {
     /// Serves this server's own packs; also the origin for remote Express nodes.
     local: Express,
     pub signer: UrlSigner,
+    /// For webhooks.
+    pub http: reqwest::Client,
 }
 
 impl Server {
@@ -120,6 +132,7 @@ impl Server {
             repos: Mutex::new(HashMap::new()),
             local,
             signer,
+            http: crate::http_client(),
         }))
     }
 
@@ -155,6 +168,7 @@ impl Server {
         match auth.check(headers) {
             Some(id) if id.allows(repo, need) => Ok(Some(id.name.clone())),
             Some(id) if id.can_see(repo) => {
+                crate::metrics::ACCESS_DENIED.inc();
                 tracing::warn!(who = id.name, repo, ?need, "denied: insufficient access");
                 Err(Denied::Forbidden(format!(
                     "{} cannot {} {repo}",
@@ -167,6 +181,7 @@ impl Server {
                 )))
             }
             Some(id) => {
+                crate::metrics::ACCESS_DENIED.inc();
                 tracing::warn!(who = id.name, repo, "denied: repository not in scope");
                 Err(Denied::Forbidden(format!(
                     "{} cannot access {repo}",
@@ -174,8 +189,92 @@ impl Server {
                 )))
             }
             None if need == Access::Read && self.cfg.public_read => Ok(None),
+            // Git asks without credentials first, so this is routine, not a failure.
             None => Err(Denied::Unauthenticated),
         }
+    }
+
+    /// Every repository on disk, sorted by name.
+    pub fn list_repos(&self) -> anyhow::Result<Vec<String>> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                match rel.strip_suffix(".git") {
+                    Some(name) if path.join("meta.db").exists() => out.push(name.to_string()),
+                    _ => walk(root, &path, out)?,
+                }
+            }
+            Ok(())
+        }
+        let root = self.cfg.data.join("repos");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out)?;
+        out.retain(|n| valid_repo_name(n));
+        out.sort();
+        Ok(out)
+    }
+
+    /// Take a repository out of service: wait for metadata work in flight, mark it
+    /// closed, and move its directory with `relocate`. Holds the repository map, so
+    /// nobody reopens it meanwhile.
+    fn retire(
+        &self,
+        name: &str,
+        relocate: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        let mut repos = self.repos.lock().unwrap();
+        let dir = self.cfg.data.join("repos").join(format!("{name}.git"));
+        if !valid_repo_name(name) || !dir.join("meta.db").exists() {
+            return Ok(false);
+        }
+        let open = repos.remove(name);
+        let _quiet = open.as_ref().map(|r| r.meta.lock().unwrap());
+        if let Some(r) = &open {
+            r.closed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        relocate(&dir)?;
+        Ok(true)
+    }
+
+    /// Delete a repository and everything in it. Returns false if it did not exist.
+    pub fn delete_repo(&self, name: &str) -> anyhow::Result<bool> {
+        let trash = self.cfg.data.join("trash");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dest = trash.join(format!("{}-{nanos}", name.replace('/', "%")));
+        let deleted = self.retire(name, |dir| {
+            std::fs::create_dir_all(&trash)?;
+            Ok(std::fs::rename(dir, &dest)?)
+        })?;
+        if deleted {
+            std::fs::remove_dir_all(&dest)?;
+            tracing::info!(repo = name, "deleted repository");
+        }
+        Ok(deleted)
+    }
+
+    /// Rename a repository. Fails if the new name is taken.
+    pub fn rename_repo(&self, from: &str, to: &str) -> anyhow::Result<bool> {
+        anyhow::ensure!(valid_repo_name(to), "invalid repository name {to:?}");
+        let dest = self.cfg.data.join("repos").join(format!("{to}.git"));
+        anyhow::ensure!(!dest.exists(), "repository {to} already exists");
+        let renamed = self.retire(from, |dir| {
+            std::fs::create_dir_all(dest.parent().unwrap())?;
+            Ok(std::fs::rename(dir, &dest)?)
+        })?;
+        if renamed {
+            tracing::info!(from, to, "renamed repository");
+        }
+        Ok(renamed)
     }
 
     /// An existing repository.
@@ -198,6 +297,8 @@ impl Server {
         std::fs::create_dir_all(&dir)?;
         let repo = Arc::new(Repo {
             name: name.to_string(),
+            dir: dir.clone(),
+            closed: Default::default(),
             meta: Mutex::new(Meta::open(dir.join("meta.db"), &self.cfg.trunk)?),
             store: BlobStore::open(dir.join("blobs"))?,
             compact: Notify::new(),
@@ -235,10 +336,19 @@ impl IntoResponse for Denied {
     }
 }
 
+impl Repo {
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Compact a repository after trunk moves, and at least every `every`.
 async fn compactor(repo: Arc<Repo>, every: Duration) {
     loop {
         let _ = tokio::time::timeout(every, repo.compact.notified()).await;
+        if repo.is_closed() {
+            return;
+        }
         let r = repo.clone();
         match tokio::task::spawn_blocking(move || crate::compact::run(&r.meta, &r.store)).await {
             Ok(Ok(_)) => {}
@@ -252,6 +362,9 @@ async fn compactor(repo: Arc<Repo>, every: Duration) {
 async fn collector(repo: Arc<Repo>, every: Duration, grace: Duration) {
     loop {
         tokio::time::sleep(every).await;
+        if repo.is_closed() {
+            return;
+        }
         let r = repo.clone();
         match tokio::task::spawn_blocking(move || crate::gc::run(&r, grace)).await {
             Ok(Ok(_)) => {}
@@ -299,6 +412,18 @@ fn split_path(path: &str) -> Option<(&str, Endpoint)> {
 async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    match path.as_str() {
+        "/healthz" => return "ok\n".into_response(),
+        "/metrics" => {
+            return (
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                crate::metrics::render(),
+            )
+                .into_response();
+        }
+        p if p.starts_with("/api/") => return crate::admin::handle(server, req).await,
+        _ => {}
+    }
     if method == Method::GET
         && let Some((repo, hash)) = express::parse_pack_path(&path)
     {

@@ -228,6 +228,7 @@ async fn serve_file(path: PathBuf, headers: &HeaderMap) -> std::io::Result<Respo
         .header(header::CONTENT_TYPE, "application/x-git-packed-objects")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+    crate::metrics::PACK_BYTES_SERVED.add(len - start.unwrap_or(0));
     if let Some(start) = start {
         file.seek(SeekFrom::Start(start)).await?;
         resp = resp

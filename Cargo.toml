@@ -14,10 +14,12 @@ flate2 = "1.1.10"
 futures-util = "0.3.34"
 hex = "0.4.3"
 memmap2 = "0.9.12"
-reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }
 russh = { version = "0.65.0", default-features = false, features = ["flate2", "ring", "rsa"] }
 sha1 = "0.11.0"
+sha2 = "0.11"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io", "io-util"] }

@@ -74,7 +74,7 @@ impl Server {
             let cache = dir.path().join(format!("express-{i}"));
             let origin = Origin::Remote {
                 base: url.clone(),
-                client: reqwest::Client::new(),
+                client: pando::http_client(),
             };
             let express = Express::new(origin, Some(cache.clone()), None).unwrap();
             serve_in_background(listener, express::router(Arc::new(express)));
@@ -544,7 +544,7 @@ fn express_nodes_cache_packs_and_resume_ranges() {
         packs[0]
     );
     let tail = rt.block_on(async {
-        let r = reqwest::Client::new()
+        let r = pando::http_client()
             .get(&url)
             .header("Range", "bytes=10-")
             .send()
@@ -1852,4 +1852,214 @@ fn gc_deletes_unreachable_packs_and_keeps_everything_else_servable() {
     let c = clone(&s, "c3", true);
     git(&c, &["fsck", "--no-progress"]);
     assert_eq!(count(&c, "HEAD"), 11);
+}
+
+/// One HTTP request from a test. Returns the status and body.
+fn http(method: &str, url: &str, token: Option<&str>) -> (u16, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut req = pando::http_client().request(method.parse().unwrap(), url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    })
+}
+
+fn write_hook(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn hooks_guard_pushes_and_webhooks_report_them() {
+    // A webhook receiver that records what it gets.
+    let received: Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    let (listener, hook_url) = bind();
+    let sink = received.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let sink = sink.clone();
+        async move {
+            let sig = headers
+                .get("x-pando-signature-256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            sink.lock().unwrap().push((sig, body));
+            "ok"
+        }
+    });
+    serve_in_background(listener, app);
+
+    let s = Server::start_configured(|cfg| {
+        cfg.auth = Some(pando::auth::Auth::parse("boss tb write\ndev td write\n").unwrap());
+        cfg.webhooks = vec![format!("{hook_url}/push")];
+        cfg.webhook_secret = Some("shh".into());
+    });
+    let data = s.dir.path().join("data");
+    write_hook(
+        &data.join("hooks/pre-receive"),
+        "#!/bin/sh\n\
+         while read old new ref; do\n\
+           if [ \"$ref\" = refs/heads/protected ] && [ \"$PANDO_USER\" != boss ]; then\n\
+             echo \"protected is read-only for $PANDO_USER\"; exit 1\n\
+           fi\n\
+         done\n",
+    );
+    write_hook(
+        &data.join("hooks/post-receive"),
+        "#!/bin/sh\n\
+         { echo \"$PANDO_REPO $PANDO_USER $GIT_PUSH_OPTION_COUNT $GIT_PUSH_OPTION_0\"; cat; } >> post.log\n\
+         echo post-receive saw the push\n",
+    );
+    let url = |who: &str, tok: &str| s.url.replace("http://", &format!("http://{who}:{tok}@"));
+    let a = s.path("a");
+    init(&a);
+    let main = commit(&a, "f", "1");
+    git(&a, &["push", "-q", &url("dev", "td"), "main"]);
+
+    let out = git_cmd(&a, &["push", &url("dev", "td"), "main:protected"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("remote: protected is read-only for dev"),
+        "{err}"
+    );
+    assert!(err.contains("pre-receive hook declined"), "{err}");
+
+    let out = git_cmd(
+        &a,
+        &[
+            "push",
+            "-o",
+            "ci.skip",
+            &url("boss", "tb"),
+            "main:protected",
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("remote: post-receive saw the push"), "{err}");
+
+    let log = std::fs::read_to_string(data.join("repos/repo.git/post.log")).unwrap();
+    assert!(log.contains("repo dev 0"), "{log}");
+    assert!(log.contains("repo boss 1 ci.skip"), "{log}");
+    assert!(log.contains(&format!("{} {main} refs/heads/protected", "0".repeat(40))));
+
+    // Two pushes moved refs: two signed deliveries.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while received.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let got = received.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "{got:?}");
+    for (sig, body) in &got {
+        let want = hex::encode(pando::auth::hmac_sha256(b"shh", body.as_bytes()));
+        assert_eq!(sig, &format!("sha256={want}"));
+    }
+    let boss = got
+        .iter()
+        .find(|(_, b)| b.contains("\"pusher\":\"boss\""))
+        .unwrap();
+    assert!(boss.1.contains(&format!(
+        r#""ref":"refs/heads/protected","before":"{}","after":"{main}""#,
+        "0".repeat(40)
+    )));
+}
+
+#[test]
+fn admin_api_manages_repositories() {
+    let s = Server::start_configured(|cfg| {
+        cfg.auth = Some(
+            pando::auth::Auth::parse("root ta admin\nlead tl admin team/*\nw tw write\n").unwrap(),
+        );
+    });
+    assert_eq!(
+        http("GET", &format!("{}/healthz", s.base), None),
+        (200, "ok\n".into())
+    );
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "1");
+    git(&a, &["checkout", "-qb", "next"]);
+    commit(&a, "f", "2");
+    let push = |repo: &str| {
+        let u = format!("{}/{repo}.git", s.base).replace("http://", "http://w:tw@");
+        git(&a, &["push", "-q", &u, "main", "next"]);
+    };
+    for r in ["repo", "team/x", "team/y"] {
+        push(r);
+    }
+    let api = |path: &str| format!("{}/api/repos{path}", s.base);
+
+    let (code, body) = http("GET", &api(""), Some("ta"));
+    assert_eq!(code, 200);
+    assert_eq!(
+        body,
+        r#"[{"name":"repo","head":"refs/heads/main","refs":2},{"name":"team/x","head":"refs/heads/main","refs":2},{"name":"team/y","head":"refs/heads/main","refs":2}]"#
+    );
+    let (_, body) = http("GET", &api(""), Some("tl"));
+    assert!(
+        !body.contains("\"repo\"") && body.contains("team/x"),
+        "{body}"
+    );
+    assert_eq!(http("GET", &api(""), Some("tw")).0, 403);
+    assert_eq!(http("DELETE", &api("/repo"), Some("tl")).0, 403);
+
+    // Default branch.
+    assert_eq!(
+        http("PUT", &api("/repo/head?branch=next"), Some("ta")).0,
+        204
+    );
+    let c = s.path("c");
+    let authed = s.url.replace("http://", "http://w:tw@");
+    git(s.dir.path(), &["clone", "-q", &authed, c.to_str().unwrap()]);
+    assert_eq!(git(&c, &["symbolic-ref", "HEAD"]), "refs/heads/next");
+    assert_eq!(count(&c, "HEAD"), 2);
+    assert_eq!(
+        http("PUT", &api("/repo/head?branch=nope"), Some("ta")).0,
+        400
+    );
+
+    // Rename and delete.
+    assert_eq!(
+        http("POST", &api("/team/x/rename?to=team/z"), Some("tl")).0,
+        204
+    );
+    assert_eq!(
+        http("POST", &api("/team/y/rename?to=team/z"), Some("tl")).0,
+        400
+    );
+    let z = s.path("z");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            &format!("{}/team/z.git", s.base).replace("http://", "http://w:tw@"),
+            z.to_str().unwrap(),
+        ],
+    );
+    git(&z, &["fsck", "--no-progress"]);
+    assert_eq!(http("DELETE", &api("/team/y"), Some("tl")).0, 204);
+    assert_eq!(http("DELETE", &api("/team/y"), Some("tl")).0, 404);
+    let (_, body) = http("GET", &api(""), Some("ta"));
+    assert!(body.contains("team/z") && !body.contains("team/x") && !body.contains("team/y"));
+    // A pushed name that was deleted starts over as a new repository.
+    push("team/y");
+
+    let (code, body) = http("POST", &api("/repo/gc"), Some("ta"));
+    assert_eq!(code, 200);
+    assert!(body.starts_with(r#"{"live":"#), "{body}");
+    let (_, metrics) = http("GET", &format!("{}/metrics", s.base), None);
+    let pushes: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("pando_pushes_total "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(pushes >= 4, "{metrics}");
 }

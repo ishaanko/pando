@@ -217,6 +217,7 @@ fn run(
     r: &mut dyn std::io::BufRead,
     w: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    crate::metrics::SSH_SESSIONS.inc();
     let (push, name) = parse_command(command)?;
     let need = if push { Access::Write } else { Access::Read };
     let user = match (&server.cfg.auth, key) {

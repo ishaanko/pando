@@ -230,6 +230,27 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// HMAC (RFC 2104) over SHA-256.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.map(|x| x ^ b);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(msg)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
 /// HMAC (RFC 2104) over SHA-1.
 fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
     use sha1::{Digest, Sha1};
@@ -274,6 +295,15 @@ mod tests {
         assert!(auth.identities[0].allows("anything/at/all", Access::Admin));
         assert!(Auth::parse("me tok1 owner\n").is_err());
         assert!(Auth::parse("me ssh-ed25519 notbase64 write\n").is_err());
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hex::encode(mac),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 
     #[test]

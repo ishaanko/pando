@@ -62,6 +62,13 @@ enum Cmd {
         /// same value. Random per process when unset.
         #[arg(long, env = "PANDO_URL_SECRET")]
         url_secret: Option<String>,
+        /// POST a JSON description of every push that moves refs to this URL
+        /// (repeatable).
+        #[arg(long)]
+        webhook: Vec<String>,
+        /// Sign webhook bodies (HMAC-SHA256 in X-Pando-Signature-256).
+        #[arg(long, env = "PANDO_WEBHOOK_SECRET")]
+        webhook_secret: Option<String>,
     },
     /// Serve packs from a local cache, filling from an origin Pando or Express node.
     Express {
@@ -100,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
             gc_interval,
             gc_grace,
             url_secret,
+            webhook,
+            webhook_secret,
         } => {
             let auth = auth_file.as_deref().map(Auth::load).transpose()?;
             if auth.is_none() {
@@ -118,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.gc_every = (gc_interval > 0).then(|| Duration::from_secs(gc_interval));
             cfg.gc_grace = Duration::from_secs(gc_grace);
             cfg.url_secret = url_secret;
+            cfg.webhooks = webhook;
+            cfg.webhook_secret = webhook_secret;
             let server = Server::new(cfg)?;
             let router = server.router();
             if let Some(addr) = ssh_listen {
@@ -145,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let origin = Origin::Remote {
                 base: origin.trim_end_matches('/').to_string(),
-                client: reqwest::Client::new(),
+                client: pando::http_client(),
             };
             let signer = url_secret.map(|s| UrlSigner::new(s.as_bytes()));
             let router = express::router(Arc::new(Express::new(origin, Some(cache), signer)?));

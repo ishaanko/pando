@@ -6,7 +6,6 @@
 //! gets the same packs spliced into one inline pack. Shallow and filtered (partial
 //! clone) requests are the exception: `generate.rs` writes a fresh pack for them.
 
-use crate::express;
 use crate::generate::{self, Generated};
 use crate::meta::Meta;
 use crate::object::Oid;
@@ -14,6 +13,7 @@ use crate::pack::{self, IdxEntry};
 use crate::pktline::{self, Packet, SidebandWriter};
 use crate::planner::{self, Plan, PlanError};
 use crate::server::{AGENT, Repo, Server, blocking, body_reader, git_response};
+use crate::{express, metrics};
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -151,6 +151,7 @@ pub async fn handle(
             _ => session_v0(&repo, &mut body, &mut out, true),
         };
         if let Err(e) = result {
+            metrics::FETCH_ERRORS.inc();
             tracing::error!(repo = %repo.name, "upload-pack: {e:#}");
             let mut err = Vec::new();
             pktline::line(&mut err, format!("ERR {e}\n"));
@@ -319,6 +320,7 @@ fn fetch(
     args: &FetchArgs,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     let plan = plan_for(repo, &args.wants, &args.haves)?;
     let generated = if generate::needed(args) {
         Some(Generated::prepare(repo, args)?)
@@ -369,7 +371,10 @@ fn fetch(
         }
         pktline::line(&mut head, "packfile\n");
         out.write_all(&head)?;
-        return send_packfile(out, Some(pktline::MAX_PAYLOAD - 1), |data| g.write(data));
+        let sent = send_packfile(out, Some(pktline::MAX_PAYLOAD - 1), |data| g.write(data));
+        metrics::FETCHES.inc();
+        metrics::FETCH_TIME.observe(started.elapsed());
+        return sent;
     }
 
     let nodes = server.express_nodes();
@@ -414,9 +419,12 @@ fn fetch(
     out.write_all(&head)?;
 
     let packs = if use_uris { &[][..] } else { &plan.packs[..] };
-    send_packfile(out, Some(pktline::MAX_PAYLOAD - 1), |data| {
+    let sent = send_packfile(out, Some(pktline::MAX_PAYLOAD - 1), |data| {
         write_stored_packs(repo, packs, data)
-    })
+    });
+    metrics::FETCHES.inc();
+    metrics::FETCH_TIME.observe(started.elapsed());
+    sent
 }
 
 /// One v0/v1 upload-pack negotiation. Over HTTP (`stateless`) each request carries
@@ -428,6 +436,7 @@ fn session_v0(
     out: &mut dyn Write,
     stateless: bool,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     // Wants, capabilities, shallow lines, deepen and filter requests, up to a flush.
     let mut args: Vec<String> = Vec::new();
     let mut caps: HashSet<String> = HashSet::new();
@@ -597,10 +606,13 @@ fn session_v0(
         }
         out.write_all(&full)?;
         tracing::info!(repo = %repo.name, wants = base.wants.len(), haves = haves.len(), packs = plan.packs.len(), "fetch (v0)");
-        return send_packfile(out, band, |data| match &generated {
+        let sent = send_packfile(out, band, |data| match &generated {
             Some(g) => g.write(data),
             None => write_stored_packs(repo, &plan.packs, data),
         });
+        metrics::FETCHES.inc();
+        metrics::FETCH_TIME.observe(started.elapsed());
+        return sent;
     }
 }
 

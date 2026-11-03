@@ -12,6 +12,7 @@ use crate::pack::{self, ParsedPack};
 use crate::pktline::{self, Packet};
 use crate::server::{AGENT, Advertise, Repo, Server, blocking, body_reader, git_response};
 use crate::store::{BlobStore, map_file};
+use crate::{hooks, metrics};
 use axum::extract::Request;
 use axum::response::Response;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -135,7 +136,7 @@ fn push(
     r: &mut dyn BufRead,
     delimited: bool,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
-    let _ = user;
+    let started = std::time::Instant::now();
     let mut commands = Vec::new();
     let mut caps = HashSet::new();
     while let Some(Packet::Data(line)) = pktline::read(r)? {
@@ -182,13 +183,59 @@ fn push(
         }
     }
 
+    // Hook output, shown to the pusher.
+    let mut messages: Vec<u8> = Vec::new();
+    let hook_push = hooks::Push {
+        server,
+        repo,
+        user,
+        options: &options,
+        pack: parsed
+            .as_ref()
+            .filter(|p| !p.entries.is_empty())
+            .map(|p| repo.store.pack_path(&p.hash)),
+    };
+    let updates = |only_ok: Option<&[Result<(), String>]>| -> Vec<hooks::Update> {
+        commands
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| only_ok.is_none_or(|s| s[*i].is_ok()))
+            .map(|(_, c)| hooks::Update {
+                old: c.old,
+                new: c.new,
+                refname: &c.refname,
+            })
+            .collect()
+    };
+    let mut declined = None;
+    if unpack.is_ok() && !commands.is_empty() {
+        match hooks::run(&hook_push, "pre-receive", &updates(None)) {
+            Ok(Some((ok, out))) => {
+                messages.extend(out);
+                if !ok {
+                    declined = Some("pre-receive hook declined");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(repo = %repo.name, "pre-receive: {e:#}");
+                declined = Some("pre-receive hook failed to run");
+            }
+        }
+    }
+
     let mut trunk_moved = false;
-    let statuses: Vec<Result<(), String>> = match unpack {
-        Err(_) => commands
+    let statuses: Vec<Result<(), String>> = match (&unpack, declined) {
+        (Err(_), _) => commands
             .iter()
             .map(|_| Err("unpacker error".to_string()))
             .collect(),
-        Ok(()) => {
+        (Ok(()), Some(why)) => commands.iter().map(|_| Err(why.to_string())).collect(),
+        (Ok(()), None) if repo.is_closed() => commands
+            .iter()
+            .map(|_| Err("repository was moved or deleted".to_string()))
+            .collect(),
+        (Ok(()), None) => {
             let mut meta = repo.meta.lock().unwrap();
             if !meta.trunk_fixed()?
                 && let Some(trunk) = choose_trunk(&server.cfg.trunk, &commands)
@@ -231,11 +278,26 @@ fn push(
     for (c, s) in commands.iter().zip(&statuses) {
         match s {
             Ok(()) => {
-                tracing::info!(repo = %repo.name, r#ref = %c.refname, old = %c.old, new = %c.new, "push ok")
+                metrics::REFS_UPDATED.inc();
+                tracing::info!(repo = %repo.name, r#ref = %c.refname, old = %c.old, new = %c.new, user, "push ok")
             }
-            Err(e) => tracing::info!(repo = %repo.name, r#ref = %c.refname, "push rejected: {e}"),
+            Err(e) => {
+                metrics::REFS_REJECTED.inc();
+                tracing::info!(repo = %repo.name, r#ref = %c.refname, user, "push rejected: {e}")
+            }
         }
     }
+    let moved = updates(Some(&statuses));
+    if !moved.is_empty() {
+        match hooks::run(&hook_push, "post-receive", &moved) {
+            Ok(Some((_, out))) => messages.extend(out),
+            Ok(None) => {}
+            Err(e) => tracing::error!(repo = %repo.name, "post-receive: {e:#}"),
+        }
+        hooks::notify(server, &repo.name, user, &moved);
+    }
+    metrics::PUSHES.inc();
+    metrics::PUSH_TIME.observe(started.elapsed());
 
     let mut report = Vec::new();
     match &unpack {
@@ -254,6 +316,7 @@ fn push(
     }
     if caps.contains("side-band-64k") && !report.is_empty() {
         let mut framed = Vec::new();
+        pktline::sideband(&mut framed, 2, &messages);
         pktline::sideband(&mut framed, 1, &report);
         pktline::flush(&mut framed);
         report = framed;
@@ -298,7 +361,9 @@ fn receive_pack_data(
         anyhow::bail!("pack larger than {MAX_PUSH_BYTES} bytes");
     }
     drop(file);
-    let parsed = pack::parse(&map_file(&staged.0)?)?;
+    let map = map_file(&staged.0)?;
+    metrics::PUSH_BYTES.add(map.len() as u64);
+    let parsed = pack::parse(&map)?;
     if !parsed.entries.is_empty() {
         store.publish(&staged.0, &parsed.hash, &parsed.entries)?;
     }
