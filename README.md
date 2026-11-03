@@ -73,13 +73,13 @@ keep fetching. Same workload against stock `git http-backend` on a bare reposito
 
 | | git http-backend | pando |
 | --- | --- | --- |
-| Side-branch push p50 | 1045 ms | 446 ms |
-| Side-branch push p99 | 1827 ms | 948 ms |
-| Trunk push p50 | 40 ms | 15 ms |
-| Trunk push p99 | 580 ms | 317 ms |
-| Trunk fetch p50 | 24 ms | 14 ms |
-| Trunk fetch p99 | 660 ms | 557 ms |
-| Throughput | 75 pushes/s | 171 pushes/s |
+| Side-branch push p50 | 1103 ms | 475 ms |
+| Side-branch push p99 | 1890 ms | 863 ms |
+| Trunk push p50 | 42 ms | 15 ms |
+| Trunk push p99 | 901 ms | 268 ms |
+| Trunk fetch p50 | 26 ms | 15 ms |
+| Trunk fetch p99 | 879 ms | 529 ms |
+| Throughput | 72 pushes/s | 164 pushes/s |
 
 Reproduce with `cargo run --release --example swarm -- git 256 5` and
 `cargo run --release --example swarm -- pando 256 5`.
