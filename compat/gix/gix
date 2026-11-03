@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Compat helper entry point wrapping the gitoxide `gix` CLI. gix has no push: exit 3 (unsupported).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cache="${PANDO_COMPAT_CACHE:-$here/../.cache}"
+gix="$cache/gix/gix"
+
+# Isolate from the user's git config; gix needs a committer identity to write reflogs.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+export GIT_COMMITTER_NAME=compat GIT_COMMITTER_EMAIL=compat@example.invalid
+# ssh transport shells out to `ssh`.
+if [ -n "${PANDO_SSH_KEY:-}" ]; then
+  export GIT_SSH_COMMAND="ssh -i $PANDO_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+fi
+
+# gix refuses to answer a 401 with credentials over plain http (and any userinfo in the URL
+# triggers that), so strip user:token@ from http URLs and send basic auth up front as an extra
+# header. The header is stored in the clone's local config so `fetch` finds it again.
+auth_header=""
+strip_userinfo() { # url -> sets $url, $auth_header
+  url="$1"
+  if [[ "$url" =~ ^http://([^:@/]+):([^@/]+)@(.*)$ ]]; then
+    auth_header="Authorization: Basic $(printf '%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" | base64 -w0)"
+    url="http://${BASH_REMATCH[3]}"
+  fi
+}
+
+case "${1:-}" in
+  clone) [ $# -eq 3 ] || { echo "usage: gix clone <url> <dir>" >&2; exit 2; }
+         strip_userinfo "$2"
+         if [ -n "$auth_header" ]; then
+           "$gix" -c "http.extraHeader=$auth_header" clone "$url" "$3"
+           git -C "$3" config http.extraHeader "$auth_header"
+         else
+           "$gix" clone "$url" "$3"
+         fi ;;
+  fetch) [ $# -eq 2 ] || { echo "usage: gix fetch <dir>" >&2; exit 2; }
+         cd "$2" && exec "$gix" fetch -r origin ;;
+  push)  echo "gix: push is not supported by gitoxide" >&2; exit 3 ;;
+  *)     echo "usage: gix clone <url> <dir> | fetch <dir> | push ..." >&2; exit 2 ;;
+esac

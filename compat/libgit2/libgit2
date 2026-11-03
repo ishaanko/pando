@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Compat helper entry point: runs libgit2.py from the pygit2 venv that setup.sh builds.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cache="${PANDO_COMPAT_CACHE:-$here/../.cache}"
+exec "$cache/venv/bin/python" -I "$here/libgit2.py" "$@"

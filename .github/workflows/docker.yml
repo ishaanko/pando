@@ -1,0 +1,96 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TOKEN: ci-write-token-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pando:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write auth file and SSH key
+        run: |
+          mkdir -p "$RUNNER_TEMP/auth"
+          ssh-keygen -q -t ed25519 -N '' -C ci -f "$RUNNER_TEMP/id_ed25519"
+          # `<name> <token> <access>` and `<name> <ssh-public-key> <access>`
+          # (key type and base64 body, without the trailing comment).
+          {
+            echo "ci-http $TOKEN write"
+            echo "ci-ssh $(cut -d' ' -f1,2 "$RUNNER_TEMP/id_ed25519.pub") write"
+          } > "$RUNNER_TEMP/auth/tokens"
+          # The container runs as uid 10001; the file only needs to be readable.
+          chmod 644 "$RUNNER_TEMP/auth/tokens"
+
+      - name: Start container
+        run: |
+          docker run -d --name pando -p 8080:8080 -p 2222:2222 \
+            -v "$RUNNER_TEMP/auth/tokens:/etc/pando/tokens:ro" \
+            pando:ci \
+            serve --data /data --listen 0.0.0.0:8080 --ssh-listen 0.0.0.0:2222 \
+                  --auth-file /etc/pando/tokens
+
+      - name: Wait for /healthz
+        run: |
+          for i in $(seq 1 60); do
+            if [ "$(curl -s http://127.0.0.1:8080/healthz)" = ok ]; then exit 0; fi
+            sleep 1
+          done
+          echo "pando did not become healthy" >&2
+          exit 1
+
+      - name: Make a small repo
+        run: |
+          git init -q -b main "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/src"
+          git config user.name ci
+          git config user.email ci@example.com
+          echo hello > hello.txt
+          git add hello.txt
+          git commit -q -m "first"
+          echo world >> hello.txt
+          git commit -q -am "second"
+
+      - name: Push and clone over HTTP
+        run: |
+          git -C "$RUNNER_TEMP/src" push "http://u:$TOKEN@127.0.0.1:8080/demo.git" main
+          git clone -q "http://u:$TOKEN@127.0.0.1:8080/demo.git" "$RUNNER_TEMP/clone-http"
+          test "$(git -C "$RUNNER_TEMP/src" rev-parse HEAD)" = "$(git -C "$RUNNER_TEMP/clone-http" rev-parse HEAD)"
+
+      - name: Push and clone over SSH
+        env:
+          GIT_SSH_COMMAND: ssh -i ${{ runner.temp }}/id_ed25519 -p 2222 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        run: |
+          echo more >> "$RUNNER_TEMP/src/hello.txt"
+          git -C "$RUNNER_TEMP/src" commit -q -am "third"
+          git -C "$RUNNER_TEMP/src" push ssh://git@127.0.0.1:2222/demo.git main
+          git clone -q ssh://git@127.0.0.1:2222/demo.git "$RUNNER_TEMP/clone-ssh"
+          test "$(git -C "$RUNNER_TEMP/src" rev-parse HEAD)" = "$(git -C "$RUNNER_TEMP/clone-ssh" rev-parse HEAD)"
+          # The commit pushed over SSH is visible over HTTP too (same store).
+          git -C "$RUNNER_TEMP/clone-http" pull -q
+          test "$(git -C "$RUNNER_TEMP/src" rev-parse HEAD)" = "$(git -C "$RUNNER_TEMP/clone-http" rev-parse HEAD)"
+
+      - name: Container logs
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs pando

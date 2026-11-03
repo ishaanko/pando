@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Compat helper entry point wrapping the JGit command line (jgit.sh from Maven Central).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cache="${PANDO_COMPAT_CACHE:-$here/../.cache}"
+
+# JGit's ssh transport (Apache MINA) reads ~/.ssh/config, so run with a throwaway HOME.
+home="$(mktemp -d)"
+trap 'rm -rf "$home"' EXIT
+if [ -n "${PANDO_SSH_KEY:-}" ]; then
+  mkdir -m 700 "$home/.ssh"
+  cat > "$home/.ssh/config" <<CFG
+Host *
+  IdentityFile $PANDO_SSH_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+CFG
+fi
+export HOME="$home" JAVA_TOOL_OPTIONS="-Duser.home=$home"
+export JGIT_CMD="$cache/jgit/jgit.sh"
+jgit() { "$JGIT_CMD" "$@" > "$home/out" 2> "$home/err" || { cat "$home/err" >&2; cat "$home/out" >&2; return 1; }; }
+
+case "${1:-}" in
+  clone) [ $# -eq 3 ] || { echo "usage: jgit clone <url> <dir>" >&2; exit 2; }
+         jgit clone "$2" "$3" ;;
+  fetch) [ $# -eq 2 ] || { echo "usage: jgit fetch <dir>" >&2; exit 2; }
+         cd "$2" && jgit fetch origin ;;
+  push)  [ $# -ge 3 ] || { echo "usage: jgit push <dir> <refspec>..." >&2; exit 2; }
+         dir="$2"; shift 2; cd "$dir" && jgit push origin "$@"
+         # jgit exits 0 even when refs are rejected; its status lines then start with " !" or " X".
+         if grep -hE '^ [!X] ' "$home/out" "$home/err" >&2; then exit 1; fi ;;
+  *)     echo "usage: jgit clone <url> <dir> | fetch <dir> | push <dir> <refspec>..." >&2; exit 2 ;;
+esac

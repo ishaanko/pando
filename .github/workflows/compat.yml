@@ -1,0 +1,29 @@
+name: compat
+
+# Real non-`git` Git clients (go-git, libgit2, JGit, gitoxide) and git 2.26 against Pando.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PANDO_COMPAT_CACHE: ${{ github.workspace }}/compat/.cache
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Headers for building git 2.26 from source (smart http needs libcurl).
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev zlib1g-dev
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.PANDO_COMPAT_CACHE }}
+          key: compat-${{ runner.os }}-${{ hashFiles('compat/setup.sh', 'compat/gogit/go.sum') }}
+      - name: Install clients
+        run: compat/setup.sh "$PANDO_COMPAT_CACHE" | sed 's/^export //' | tee -a "$GITHUB_ENV"
+      - run: cargo test --test compat -- --nocapture
+        env:
+          PANDO_COMPAT_REQUIRE: "1"

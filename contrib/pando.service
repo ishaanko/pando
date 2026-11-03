@@ -1,0 +1,62 @@
+[Unit]
+Description=Pando Git server
+Documentation=https://github.com/ishaanko/pando
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secrets (PANDO_URL_SECRET, PANDO_WEBHOOK_SECRET) go here; the leading "-"
+# makes the file optional.
+EnvironmentFile=-/etc/pando/env
+# Put --public-url, --webhook etc. here if you need them.
+ExecStart=/usr/local/bin/pando serve \
+    --data /var/lib/pando \
+    --listen 127.0.0.1:8080 \
+    --ssh-listen 0.0.0.0:2222 \
+    --auth-file %d/tokens
+Restart=on-failure
+RestartSec=2
+
+# Storage and identity. /var/lib/pando is owned by the transient user.
+DynamicUser=yes
+StateDirectory=pando
+StateDirectoryMode=0700
+# The tokens file stays root-only (chmod 600); systemd hands the service a copy
+# in its credentials directory, which %d expands to in ExecStart (systemd 250+).
+LoadCredential=tokens:/etc/pando/tokens
+
+# Sandboxing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Graceful shutdown on SIGTERM; give in-flight pushes time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
