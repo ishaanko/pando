@@ -624,3 +624,39 @@ fn clone_with_many_branches_sends_gzipped_request() {
     assert_eq!(git(&b, &["branch", "-r"]).lines().count(), 42); // 40 + main + HEAD
     git(&b, &["fsck", "--strict"]);
 }
+
+#[test]
+fn decoder_matches_git_on_deep_delta_chains() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    init(repo);
+    let mut text = String::new();
+    for i in 0..120 {
+        text.push_str(&format!("line {i} {}\n", "x".repeat(i % 17)));
+        std::fs::write(repo.join("big.txt"), &text).unwrap();
+        std::fs::create_dir_all(repo.join(format!("d{}", i % 5))).unwrap();
+        std::fs::write(repo.join(format!("d{}/f", i % 5)), i.to_string()).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", &i.to_string()]);
+    }
+    git(repo, &["tag", "-a", "t", "-m", "tag"]);
+    git(repo, &["repack", "-adfq", "--depth=50", "--window=50"]);
+    let pack_dir = repo.join(".git/objects/pack");
+    let pack = std::fs::read_dir(&pack_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "pack"))
+        .unwrap();
+    let parsed = pando::pack::parse(&std::fs::read(&pack).unwrap()).unwrap();
+
+    let expected: std::collections::HashSet<Oid> = git(repo, &["rev-list", "--objects", "--all"])
+        .lines()
+        .filter_map(|l| Oid::from_hex(&l[..40]))
+        .chain(Oid::from_hex(&git(repo, &["rev-parse", "t"])))
+        .collect();
+    assert_eq!(parsed.oids, expected);
+    assert!(parsed.external_refs().is_empty(), "a full pack references nothing outside itself");
+    assert_eq!(parsed.commits.len(), 120);
+    let name = pack.file_stem().unwrap().to_str().unwrap().strip_prefix("pack-").unwrap().to_string();
+    assert_eq!(parsed.hash.hex(), name);
+}

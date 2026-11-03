@@ -82,6 +82,40 @@ impl Kind {
     }
 }
 
+/// Tree entries use this mode for submodules; the id names a commit in another
+/// repository, so it is not a reference Pando can or should resolve.
+pub const GITLINK_MODE: u32 = 0o160000;
+
+/// The root tree of a commit (the `tree <hex>` header line).
+pub fn commit_tree(body: &[u8]) -> Option<Oid> {
+    header_lines(body)
+        .find_map(|line| line.strip_prefix(b"tree "))
+        .and_then(|hex| Oid::from_hex(std::str::from_utf8(hex).ok()?))
+}
+
+/// `(mode, id)` for each entry of a tree object: `<octal mode> <name>\0<20-byte id>`.
+pub fn tree_entries(mut body: &[u8]) -> Option<Vec<(u32, Oid)>> {
+    let mut out = Vec::new();
+    while !body.is_empty() {
+        let space = body.iter().position(|&b| b == b' ')?;
+        let mode = u32::from_str_radix(std::str::from_utf8(&body[..space]).ok()?, 8).ok()?;
+        let nul = space + body[space..].iter().position(|&b| b == 0)?;
+        let oid = Oid::from_slice(body.get(nul + 1..nul + 21)?)?;
+        out.push((mode, oid));
+        body = &body[nul + 21..];
+    }
+    Some(out)
+}
+
+/// Committer timestamp (seconds since the epoch) of a commit.
+pub fn commit_time(body: &[u8]) -> Option<i64> {
+    let line = header_lines(body).find_map(|line| line.strip_prefix(b"committer "))?;
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.rsplitn(3, ' ');
+    let _tz = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
 /// Parent ids from a commit body (the `parent <hex>` header lines).
 pub fn commit_parents(body: &[u8]) -> Vec<Oid> {
     header_lines(body)
