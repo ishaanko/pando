@@ -428,21 +428,33 @@ fn reachable_commits(odb: &Odb, tips: &[Oid]) -> anyhow::Result<HashSet<Oid>> {
     Ok(seen)
 }
 
-/// Write a self-contained pack of `objects`, copying whole stored objects byte for
-/// byte and recompressing only those stored as deltas.
+/// Write a self-contained pack of `objects`, copying stored bytes where possible:
+/// whole objects as they are, and deltas whose base is also being sent as ref-deltas.
+/// Only deltas against objects left out are expanded and recompressed.
 fn write_pack(odb: &Odb, objects: &[Oid], out: &mut dyn Write) -> anyhow::Result<()> {
+    let sending: HashSet<&Oid> = objects.iter().collect();
     let mut w = HashingWriter::new(out);
     w.write_all(b"PACK\0\0\0\x02")?;
     w.write_all(&(objects.len() as u32).to_be_bytes())?;
+    let mut head = Vec::new();
     for oid in objects {
         if let Some(raw) = odb.raw_whole(oid) {
             w.write_all(raw)?;
             continue;
         }
+        head.clear();
+        if let Some((base, size, delta)) = odb.raw_delta(oid)
+            && sending.contains(&base)
+        {
+            encode_type_size(REF_DELTA, size as u64, &mut head);
+            head.extend_from_slice(&base.0);
+            w.write_all(&head)?;
+            w.write_all(delta)?;
+            continue;
+        }
         let (kind, data) = odb
             .read(oid)?
             .ok_or_else(|| anyhow::anyhow!("missing object {oid}"))?;
-        let mut head = Vec::new();
         encode_type_size(kind as u8, data.len() as u64, &mut head);
         w.write_all(&head)?;
         let mut z = ZlibEncoder::new(&mut w, Compression::fast());
@@ -452,3 +464,6 @@ fn write_pack(odb: &Odb, objects: &[Oid], out: &mut dyn Write) -> anyhow::Result
     w.finish()?;
     Ok(())
 }
+
+/// Pack type code of a delta against an object named by id.
+const REF_DELTA: u8 = 7;

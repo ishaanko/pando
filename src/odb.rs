@@ -21,6 +21,8 @@ struct Pack {
     map: Mmap,
     /// Object start offsets in pack order; an entry ends where the next begins.
     offsets: Vec<u64>,
+    /// The object at each offset.
+    oids: Vec<Oid>,
 }
 
 pub struct Odb {
@@ -39,9 +41,12 @@ impl Odb {
             for e in &idx {
                 index.entry(e.oid).or_insert((i, e.offset));
             }
+            let mut by_offset: Vec<(u64, Oid)> = idx.iter().map(|e| (e.offset, e.oid)).collect();
+            by_offset.sort();
             packs.push(Pack {
                 map: store.map_pack(hash)?,
-                offsets: idx.iter().map(|e| e.offset).collect(),
+                offsets: by_offset.iter().map(|e| e.0).collect(),
+                oids: by_offset.iter().map(|e| e.1).collect(),
             });
         }
         Ok(Odb {
@@ -76,6 +81,23 @@ impl Odb {
         let i = pack.offsets.binary_search(&off).ok()?;
         let end = pack.offsets.get(i + 1).map_or(body.len() as u64, |n| *n);
         Some(&body[off as usize..end as usize])
+    }
+
+    /// An object stored as a delta: its base, the delta's inflated size, and the
+    /// compressed delta bytes, so it can be copied into a new pack as a ref-delta.
+    pub fn raw_delta(&self, oid: &Oid) -> Option<(Oid, usize, &[u8])> {
+        let &(p, off) = self.index.get(oid)?;
+        let pack = &self.packs[p];
+        let body = &pack.map[..pack.map.len() - 20];
+        let h = pack::read_header(body, off as usize).ok()?;
+        let base = match h.base {
+            Base::None => return None,
+            Base::Oid(b) => b,
+            Base::Offset(b) => pack.oids[pack.offsets.binary_search(&b).ok()?],
+        };
+        let i = pack.offsets.binary_search(&off).ok()?;
+        let end = pack.offsets.get(i + 1).map_or(body.len() as u64, |n| *n);
+        Some((base, h.size, &body[off as usize + h.len..end as usize]))
     }
 
     fn read_at(&self, p: usize, off: u64) -> Result<Object, PackError> {
