@@ -20,7 +20,8 @@
 //! so deleting, renaming and backing up a repository carry them along. An upload is
 //! streamed to `<repo>.git/lfs/tmp/`, checked against its oid and size, synced, and
 //! only then renamed into place. Objects are never garbage collected: like other LFS
-//! servers, Pando keeps every object it accepted.
+//! servers, Pando keeps every object it accepted. Gc only sweeps staging files that an
+//! interrupted upload left behind.
 
 use crate::auth::Access;
 use crate::server::{Denied, Repo, Server, valid_repo_name};
@@ -621,6 +622,11 @@ impl Drop for Staged {
 fn io_error(repo: &str, e: io::Error) -> Response {
     tracing::error!(repo, "lfs: {e}");
     message(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// Remove upload staging files older than `age` from a repository directory.
+pub fn clean_staging(repo_dir: &Path, age: std::time::Duration) -> io::Result<()> {
+    crate::store::remove_stale(&repo_dir.join("lfs/tmp"), age)
 }
 
 /// Every object stored in a repository directory, as (oid, path), sorted.

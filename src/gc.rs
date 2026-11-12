@@ -114,6 +114,7 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
             }
         }
         repo.store.clean_staging(orphan_age(grace))?;
+        crate::lfs::clean_staging(&repo.dir, orphan_age(grace))?;
     }
     if report.deleted > 0 {
         crate::fetch_cache::clear(&repo.dir);
