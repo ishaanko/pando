@@ -3026,3 +3026,251 @@ fn lfs_objects_survive_backup_and_restore() {
     let problems = pando::backup::verify(&backup, true).unwrap();
     assert!(problems.iter().any(|p| p.contains(&oid)), "{problems:?}");
 }
+
+/// Cached generated answers in the default test repository.
+fn cached_answers(s: &Server) -> Vec<PathBuf> {
+    let dir = s.dir.path().join("data/repos/repo.git/fetch-cache");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|d| d.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    out.retain(|p| p.extension().is_some_and(|e| e == "answer"));
+    out.sort();
+    out
+}
+
+/// Fetch cache (hits, misses) of a test server.
+fn cache_counts(s: &Server) -> (u64, u64) {
+    s.server.fetch_cache.counts()
+}
+
+/// Clone with extra arguments over the given protocol version; checks the result.
+fn clone_with(s: &Server, name: &str, proto: &str, args: &[&str]) -> PathBuf {
+    let dest = s.path(name);
+    let v = format!("protocol.version={proto}");
+    let mut all = vec!["-c", &v, "clone", "-q"];
+    all.extend(args);
+    all.extend([s.url.as_str(), dest.to_str().unwrap()]);
+    git(s.dir.path(), &all);
+    git(&dest, &["fsck", "--no-progress"]);
+    dest
+}
+
+/// Incompressible bytes, different for each seed.
+fn noise(seed: u32, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2654435761) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+#[test]
+fn identical_shallow_and_partial_clones_generate_once() {
+    let s = Server::start();
+    let keys = TempDir::new().unwrap();
+    let (_, ssh) = ssh_key(keys.path(), "k");
+    let ssh_url = format!("{}/repo.git", start_ssh(&s.server));
+    let a = s.path("a");
+    init(&a);
+    std::fs::create_dir_all(a.join("dir")).unwrap();
+    for i in 0..5 {
+        std::fs::write(a.join("dir/g"), format!("g{i}")).unwrap();
+        git(&a, &["add", "."]);
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["push", "-q", &s.url, "main"]);
+
+    // --depth 1 over v2 and v0, HTTP and SSH: one generation between them.
+    for proto in ["2", "0"] {
+        let c = clone_with(&s, &format!("http-v{proto}"), proto, &["--depth", "1"]);
+        assert_eq!(count(&c, "HEAD"), 1);
+        let c = s.path(&format!("ssh-v{proto}"));
+        let v = format!("protocol.version={proto}");
+        let args = ["-c", &v, "clone", "-q", "--depth", "1", &ssh_url];
+        git_ssh_ok(
+            s.dir.path(),
+            &ssh,
+            &[&args[..], &[c.to_str().unwrap()]].concat(),
+        );
+        git(&c, &["fsck", "--no-progress"]);
+        assert_eq!(count(&c, "HEAD"), 1);
+    }
+    let (hits, misses) = cache_counts(&s);
+    assert_eq!(misses, 1);
+    assert!(hits >= 3, "{hits} hits");
+    assert_eq!(cached_answers(&s).len(), 1);
+
+    // A partial clone is cached too, and the objects it left out still arrive on
+    // demand, without going through the cache.
+    let p = clone_with(&s, "partial", "2", &["--filter=blob:none"]);
+    let p0 = clone_with(&s, "partial-v0", "0", &["--filter=blob:none"]);
+    assert_eq!(cache_counts(&s).1, 2);
+    for d in [&p, &p0] {
+        assert!(missing_objects(d) > 0);
+        let root = git(d, &["rev-list", "--max-parents=0", "HEAD"]);
+        git(d, &["checkout", "-q", &root]);
+        assert_eq!(std::fs::read_to_string(d.join("dir/g")).unwrap(), "g0");
+        git(d, &["log", "-p", "-q", "main"]);
+        git(d, &["fsck", "--no-progress"]);
+    }
+    assert_eq!(cache_counts(&s).1, 2);
+    assert_eq!(cached_answers(&s).len(), 2);
+}
+
+#[test]
+fn fetch_cache_keys_on_every_input() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    for i in 0..6 {
+        std::fs::write(a.join("big"), noise(i, 4000)).unwrap();
+        git(&a, &["add", "big"]);
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["branch", "topic", "main~2"]);
+    git(&a, &["branch", "old", "main~3"]);
+    git(&a, &["push", "-q", "origin", "main", "topic", "old"]);
+
+    let requests: [&[&str]; 8] = [
+        &["--depth", "1"],
+        &["--depth", "2"],
+        &["--depth", "1", "--branch", "topic"],
+        &["--filter=blob:none"],
+        &["--filter=blob:limit=1k"],
+        &["--depth", "1", "--filter=blob:none"],
+        &["--shallow-since", "2000-01-01"],
+        &["--shallow-exclude", "old", "--branch", "main"],
+    ];
+    for (i, args) in requests.iter().enumerate() {
+        clone_with(&s, &format!("c{i}"), "2", args);
+        assert_eq!(cache_counts(&s), (0, i as u64 + 1), "{args:?}");
+    }
+    // The same name, resolving to another commit, is another request.
+    git(&a, &["push", "-qf", "origin", "main~1:old"]);
+    let c = clone_with(&s, "moved", "2", requests[7]);
+    assert_eq!(count(&c, "HEAD"), 1);
+    assert_eq!(cache_counts(&s), (0, 9));
+
+    // Fetches into a shallow or partial clone carry shallow commits or haves, and
+    // bypass the cache.
+    commit(&a, "f", "more");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&s.path("c0"), &["fetch", "-q", "--depth", "1"]);
+    git(&s.path("c3"), &["fetch", "-q"]);
+    assert_eq!(cache_counts(&s), (0, 9));
+    assert_eq!(cached_answers(&s).len(), 9);
+}
+
+#[test]
+fn concurrent_identical_clones_generate_once() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    for i in 0..20 {
+        std::fs::write(a.join("big"), noise(i, 200_000)).unwrap();
+        git(&a, &["add", "big"]);
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["push", "-q", &s.url, "main"]);
+
+    std::thread::scope(|scope| {
+        for i in 0..8 {
+            let s = &s;
+            scope.spawn(move || clone_with(s, &format!("c{i}"), "2", &["--depth", "1"]));
+        }
+    });
+    assert_eq!(cache_counts(&s), (7, 1));
+}
+
+#[test]
+fn fetch_cache_evicts_least_recently_served() {
+    let s = Server::start_configured(|cfg| cfg.fetch_cache_max_size = 250_000);
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "base");
+    for b in 0..3 {
+        git(&a, &["checkout", "-q", "--orphan", &format!("b{b}")]);
+        git(&a, &["rm", "-rqf", "."]);
+        std::fs::write(a.join("noise"), noise(b, 100_000)).unwrap();
+        git(&a, &["add", "noise"]);
+        commit(&a, "f", &format!("b{b}"));
+    }
+    git(&a, &["push", "-q", &s.url, "main", "b0", "b1", "b2"]);
+
+    let fill = |b: u32| {
+        let before = cached_answers(&s);
+        clone_with(
+            &s,
+            &format!("c{b}-{}", before.len()),
+            "2",
+            &["--depth", "1", "--branch", &format!("b{b}")],
+        );
+        let after = cached_answers(&s);
+        after.into_iter().find(|p| !before.contains(p))
+    };
+    let e0 = fill(0).unwrap();
+    let e1 = fill(1).unwrap();
+    assert_eq!(fill(0), None); // a hit, which makes b0 the most recently served
+    let e2 = fill(2).unwrap();
+    assert_eq!(cached_answers(&s), {
+        let mut v = vec![e0, e2];
+        v.sort();
+        v
+    });
+    assert!(!e1.exists());
+    let total: u64 = cached_answers(&s)
+        .iter()
+        .map(|p| p.metadata().unwrap().len())
+        .sum();
+    assert!(total <= 250_000, "{total} bytes cached");
+}
+
+#[test]
+fn cached_answers_do_not_outlive_deleted_branches() {
+    let s = Server::start();
+    let keys = TempDir::new().unwrap();
+    let (_, ssh) = ssh_key(keys.path(), "k");
+    let ssh_url = format!("{}/repo.git", start_ssh(&s.server));
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(&a, &["checkout", "-qb", "secret"]);
+    let secret = commit(&a, "f", "secret");
+    git(&a, &["push", "-q", "origin", "secret"]);
+    clone_with(&s, "c", "2", &["--depth", "1", "--branch", "secret"]);
+    let [entry] = &cached_answers(&s)[..] else {
+        panic!("expected one cached answer")
+    };
+    let saved = std::fs::read(entry).unwrap();
+
+    git(&a, &["push", "-q", "origin", ":secret"]);
+    let r = pando::gc::run(&s.repo(), std::time::Duration::ZERO).unwrap();
+    assert!(r.deleted > 0);
+    assert!(cached_answers(&s).is_empty(), "gc clears the cache");
+
+    // Even with the answer put back, the dropped commit is refused.
+    std::fs::write(entry, saved).unwrap();
+    let x = s.path("x");
+    init(&x);
+    for proto in ["2", "0"] {
+        let v = format!("protocol.version={proto}");
+        let err = git_fails(&x, &["-c", &v, "fetch", "--depth", "1", &s.url, &secret]);
+        assert!(err.contains("not our ref"), "v{proto}: {err}");
+        let out = git_ssh(
+            &x,
+            &ssh,
+            &["-c", &v, "fetch", "--depth", "1", &ssh_url, &secret],
+        );
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not our ref"), "ssh v{proto}: {err}");
+    }
+    assert_eq!(cache_counts(&s).0, 0);
+}

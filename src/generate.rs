@@ -9,7 +9,17 @@
 //! and write a fresh pack of exactly those commits with their trees, minus what the
 //! client already has or filtered out. Objects stored whole are copied without
 //! recompressing.
+//!
+//! Fresh clones (no haves, no shallow commits) of commits and tags repeat, so their
+//! answers go through the fetch cache (`fetch_cache.rs`): the pack is generated to a
+//! file once and every identical request is served from it. The key hashes every
+//! input of the answer: wants, haves, client shallow commits, the deepen arguments
+//! with `deepen-not` names resolved to commits, the parsed filter, and the Pando
+//! version. Objects are content addressed and a commit's history never changes, so an
+//! answer keyed this way stays exact as the repository grows. Fetches with haves and
+//! the on-demand blob fetches of partial clones rarely repeat and are not cached.
 
+use crate::fetch_cache::{Entry, FetchCache, Lookup};
 use crate::object::{
     GITLINK_MODE, Kind, Oid, commit_parents, commit_time, commit_tree, tree_entries,
 };
@@ -20,6 +30,7 @@ use crate::server::Repo;
 use crate::upload::FetchArgs;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 
@@ -186,6 +197,131 @@ pub fn needed(args: &FetchArgs) -> bool {
     args.deepen.is_some() || !args.shallow.is_empty() || args.filter.is_some()
 }
 
+/// The answer to a fetch that stored packs cannot give: a pack, and where the client's
+/// history now stops.
+pub enum Answer {
+    Fresh(Box<Generated>),
+    Cached(Entry),
+}
+
+impl Answer {
+    /// Answer a fetch that [`needed`] a fresh pack, from `cache` when the request is
+    /// cacheable. Concurrent identical requests wait for one generation.
+    pub fn prepare(cache: &FetchCache, repo: &Repo, args: &FetchArgs) -> anyhow::Result<Answer> {
+        let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
+        let (not_tips, cacheable) = {
+            let meta = repo.meta.lock().unwrap();
+            let not_tips = resolve_not(&meta, args)?;
+            // Fresh clones of commits and tags. Not partial clones' on-demand fetches,
+            // which want blobs and trees.
+            let mut cacheable = cache.enabled() && args.haves.is_empty() && args.shallow.is_empty();
+            for want in &args.wants {
+                cacheable =
+                    cacheable && (meta.commit(want)?.is_some() || meta.tag_target(want)?.is_some());
+            }
+            if cacheable {
+                // A hit must not outlive the metadata: refuse what a fetch planned
+                // now would refuse (wants gc has dropped).
+                planner::plan(&meta, &args.wants, &[]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            (not_tips, cacheable)
+        };
+        if !cacheable {
+            let g = Generated::prepare(repo, args, filter, &not_tips)?;
+            return Ok(Answer::Fresh(Box::new(g)));
+        }
+        let key = cache_key(args, filter.as_ref(), &not_tips);
+        let fill = match cache.lookup(&repo.dir, &key) {
+            Lookup::Hit(entry) => return Ok(Answer::Cached(entry)),
+            Lookup::Fill(fill) => fill,
+        };
+        let g = Generated::prepare(repo, args, filter, &not_tips)?;
+        match fill.store(g.shallow(), g.unshallow(), |out| g.write(out)) {
+            Ok(entry) => Ok(Answer::Cached(entry)),
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, "fetch cache fill failed: {e:#}");
+                Ok(Answer::Fresh(Box::new(g)))
+            }
+        }
+    }
+
+    /// Commits that become (or stay) the client's shallow boundary.
+    pub fn shallow(&self) -> &[Oid] {
+        match self {
+            Answer::Fresh(g) => g.shallow(),
+            Answer::Cached(e) => &e.shallow,
+        }
+    }
+
+    /// Commits that stop being shallow on the client.
+    pub fn unshallow(&self) -> &[Oid] {
+        match self {
+            Answer::Fresh(g) => g.unshallow(),
+            Answer::Cached(e) => &e.unshallow,
+        }
+    }
+
+    /// Write the pack.
+    pub fn write(self, out: &mut dyn Write) -> anyhow::Result<()> {
+        match self {
+            Answer::Fresh(g) => g.write(out),
+            Answer::Cached(e) => Ok(out.write_all(e.pack())?),
+        }
+    }
+}
+
+/// The cache key of a generated answer: a hash of everything [`Generated::prepare`]
+/// reads besides the objects themselves, which are content addressed. Sets are sorted
+/// so that equal requests share a key whatever order the client used.
+fn cache_key(args: &FetchArgs, filter: Option<&Filter>, not_tips: &[Oid]) -> Oid {
+    let mut text = format!("pando {} generated fetch\n", env!("CARGO_PKG_VERSION"));
+    for (label, oids) in [
+        ("want", &args.wants[..]),
+        ("have", &args.haves),
+        ("shallow", &args.shallow),
+        ("deepen-not", not_tips),
+    ] {
+        let mut oids = oids.to_vec();
+        oids.sort();
+        oids.dedup();
+        for oid in oids {
+            text += &format!("{label} {oid}\n");
+        }
+    }
+    let d = args.deepen.as_ref();
+    let deepen = d.map(|d| (d.depth, d.since, d.relative));
+    text += &format!("deepen {deepen:?}\nfilter {filter:?}\n");
+    Oid(Sha1::digest(text.as_bytes()).into())
+}
+
+/// The commits `deepen-not` names stand for, resolved the way git resolves short
+/// names. They depend on the current refs, so they are resolved for every request.
+fn resolve_not(meta: &crate::meta::Meta, args: &FetchArgs) -> anyhow::Result<Vec<Oid>> {
+    let mut not_tips = Vec::new();
+    for name in args.deepen.iter().flat_map(|d| &d.not) {
+        let candidates = [
+            name.clone(),
+            format!("refs/{name}"),
+            format!("refs/tags/{name}"),
+            format!("refs/heads/{name}"),
+            format!("refs/remotes/{name}"),
+            format!("refs/remotes/{name}/HEAD"),
+        ];
+        let mut found = None;
+        for full in &candidates {
+            if let Some(v) = meta.current(full)? {
+                found = Some(v);
+                break;
+            }
+        }
+        match found {
+            Some(v) => not_tips.push(v.peeled.unwrap_or(v.tip)),
+            None => anyhow::bail!("deepen-not: unknown ref {name}"),
+        }
+    }
+    Ok(not_tips)
+}
+
 /// A fresh pack, planned but not yet written.
 pub struct Generated {
     odb: Odb,
@@ -194,37 +330,16 @@ pub struct Generated {
 }
 
 impl Generated {
-    /// Plan the pack: load the stored packs that hold the wants' history and walk it.
-    pub fn prepare(repo: &Repo, args: &FetchArgs) -> anyhow::Result<Generated> {
-        let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
-        let (odb, not_tips) = {
-            let meta = repo.meta.lock().unwrap();
-            let mut not_tips = Vec::new();
-            for name in args.deepen.iter().flat_map(|d| &d.not) {
-                // Resolve a short name the way git does.
-                let candidates = [
-                    name.clone(),
-                    format!("refs/{name}"),
-                    format!("refs/tags/{name}"),
-                    format!("refs/heads/{name}"),
-                    format!("refs/remotes/{name}"),
-                    format!("refs/remotes/{name}/HEAD"),
-                ];
-                let mut found = None;
-                for full in &candidates {
-                    if let Some(v) = meta.current(full)? {
-                        found = Some(v);
-                        break;
-                    }
-                }
-                match found {
-                    Some(v) => not_tips.push(v.peeled.unwrap_or(v.tip)),
-                    None => anyhow::bail!("deepen-not: unknown ref {name}"),
-                }
-            }
-            (open_odb(repo, &meta, args)?, not_tips)
-        };
-        let walk = Walk::new(&odb, args, &not_tips)?;
+    /// Plan the pack: load the stored packs that hold the wants' history (and the
+    /// `deepen-not` commits') and walk it.
+    fn prepare(
+        repo: &Repo,
+        args: &FetchArgs,
+        filter: Option<Filter>,
+        not_tips: &[Oid],
+    ) -> anyhow::Result<Generated> {
+        let odb = open_odb(repo, &repo.meta.lock().unwrap(), args, not_tips)?;
+        let walk = Walk::new(&odb, args, not_tips)?;
         tracing::info!(
             repo = %repo.name,
             commits = walk.send.len(),
@@ -252,9 +367,15 @@ impl Generated {
     }
 }
 
-/// The stored packs holding everything the wants need. A fetch of nothing but blobs
-/// (a partial clone filling in what it left out) reads just the packs holding them.
-fn open_odb(repo: &Repo, meta: &crate::meta::Meta, args: &FetchArgs) -> anyhow::Result<Odb> {
+/// The stored packs holding everything the wants and `not_tips` need, so the walk
+/// sees the same history whatever the pack layout. A fetch of nothing but blobs (a
+/// partial clone filling in what it left out) reads just the packs holding them.
+fn open_odb(
+    repo: &Repo,
+    meta: &crate::meta::Meta,
+    args: &FetchArgs,
+    not_tips: &[Oid],
+) -> anyhow::Result<Odb> {
     if args.deepen.is_none() && args.shallow.is_empty() {
         let mut direct = Vec::new();
         for want in &args.wants {
@@ -273,7 +394,8 @@ fn open_odb(repo: &Repo, meta: &crate::meta::Meta, args: &FetchArgs) -> anyhow::
             return Ok(odb);
         }
     }
-    let plan = planner::plan(meta, &args.wants, &[]).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tips = [&args.wants[..], not_tips].concat();
+    let plan = planner::plan(meta, &tips, &[]).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Odb::open(&repo.store, &plan.packs)?)
 }
 

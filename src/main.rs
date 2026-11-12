@@ -72,6 +72,10 @@ enum Cmd {
         /// Largest pack a single push may send (e.g. 500M, 8G).
         #[arg(long, value_parser = parse_size, default_value = "2G")]
         max_push_size: u64,
+        /// Disk budget for cached shallow and partial clone answers, across all
+        /// repositories (e.g. 10G; 0 turns the cache off).
+        #[arg(long, value_parser = parse_size, default_value = "1G")]
+        fetch_cache_max_size: u64,
     },
     /// Copy a data directory (consistent while the server runs).
     Backup {
@@ -140,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
             webhook,
             webhook_secret,
             max_push_size,
+            fetch_cache_max_size,
         } => {
             let auth = auth_file.as_deref().map(LiveAuth::open).transpose()?;
             if auth.is_none() {
@@ -161,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.webhooks = webhook;
             cfg.webhook_secret = webhook_secret;
             cfg.max_push_bytes = max_push_size;
+            cfg.fetch_cache_max_size = fetch_cache_max_size;
             let server = Server::new(cfg)?;
             if server.cfg.auth.is_some() {
                 tokio::spawn(reload_on_hangup(server.clone()));

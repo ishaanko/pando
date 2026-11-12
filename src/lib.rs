@@ -5,6 +5,7 @@ pub mod auth;
 pub mod backup;
 pub mod compact;
 pub mod express;
+pub mod fetch_cache;
 pub mod gc;
 pub mod generate;
 pub mod hooks;

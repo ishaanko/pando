@@ -11,6 +11,7 @@
 
 use crate::auth::{Access, LiveAuth, UrlSigner};
 use crate::express::{self, Express};
+use crate::fetch_cache::FetchCache;
 use crate::meta::Meta;
 use crate::store::BlobStore;
 use crate::{receive, upload};
@@ -72,6 +73,9 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     /// Largest pack a push may send, in bytes.
     pub max_push_bytes: u64,
+    /// Disk budget for cached shallow and filtered fetch answers, across all
+    /// repositories (see `fetch_cache.rs`). 0 turns the cache off.
+    pub fetch_cache_max_size: u64,
 }
 
 impl Config {
@@ -92,6 +96,7 @@ impl Config {
             webhooks: Vec::new(),
             webhook_secret: None,
             max_push_bytes: 2 << 30,
+            fetch_cache_max_size: 1 << 30,
         }
     }
 }
@@ -117,6 +122,7 @@ pub struct Server {
     pub signer: UrlSigner,
     /// For webhooks.
     pub http: reqwest::Client,
+    pub fetch_cache: FetchCache,
 }
 
 impl Server {
@@ -135,7 +141,9 @@ impl Server {
             Some(s) => UrlSigner::new(s.as_bytes()),
             None => UrlSigner::random()?,
         };
+        let fetch_cache = FetchCache::open(&cfg.data, cfg.fetch_cache_max_size)?;
         let server = Arc::new(Server {
+            fetch_cache,
             cfg,
             repos: Mutex::new(HashMap::new()),
             local,

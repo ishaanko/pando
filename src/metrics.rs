@@ -54,6 +54,14 @@ impl Timer {
 
 pub static FETCHES: Counter = Counter::new("pando_fetches_total", "Fetches served.");
 pub static FETCH_ERRORS: Counter = Counter::new("pando_fetch_errors_total", "Fetches that failed.");
+pub static FETCH_CACHE_HITS: Counter = Counter::new(
+    "pando_fetch_cache_hits_total",
+    "Shallow or filtered fetches answered from the fetch cache.",
+);
+pub static FETCH_CACHE_MISSES: Counter = Counter::new(
+    "pando_fetch_cache_misses_total",
+    "Shallow or filtered fetches generated into the fetch cache.",
+);
 pub static PUSHES: Counter = Counter::new("pando_pushes_total", "Pushes received.");
 pub static REFS_UPDATED: Counter =
     Counter::new("pando_refs_updated_total", "Ref updates accepted.");
@@ -105,6 +113,8 @@ pub fn render() -> String {
     for c in [
         &FETCHES,
         &FETCH_ERRORS,
+        &FETCH_CACHE_HITS,
+        &FETCH_CACHE_MISSES,
         &PUSHES,
         &REFS_UPDATED,
         &REFS_REJECTED,

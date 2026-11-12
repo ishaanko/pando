@@ -107,6 +107,9 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
         }
         repo.store.clean_staging(orphan_age(grace))?;
     }
+    if report.deleted > 0 {
+        crate::fetch_cache::clear(&repo.dir);
+    }
     crate::metrics::GC_PACKS_DELETED.add(report.deleted as u64);
     crate::metrics::GC_BYTES_DELETED.add(report.bytes);
     if report.marked + report.deleted > 0 {

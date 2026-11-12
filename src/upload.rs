@@ -4,9 +4,12 @@
 //! A fetch is answered from stored packs chosen by the planner. v2 clients that ask
 //! for `packfile-uris` get links to Express plus an empty inline pack; everyone else
 //! gets the same packs spliced into one inline pack. Shallow and filtered (partial
-//! clone) requests are the exception: `generate.rs` writes a fresh pack for them.
+//! clone) requests are the exception: `generate.rs` writes a fresh pack for them, or
+//! reads back the one it wrote for an identical earlier request (the fetch cache),
+//! on both protocol paths. Wants are always planned against current metadata first,
+//! so a cached answer is never served for a commit gc has dropped.
 
-use crate::generate::{self, Generated};
+use crate::generate::{self, Answer};
 use crate::meta::Meta;
 use crate::object::Oid;
 use crate::pack::{self, IdxEntry};
@@ -169,7 +172,7 @@ pub async fn handle(
         let mut out = ChannelWriter { tx: tx.clone() };
         let result = match version {
             Version::V2 => command(&server, &repo, &mut body, &mut out).map(|_| ()),
-            _ => session_v0(&repo, &mut body, &mut out, true),
+            _ => session_v0(&server, &repo, &mut body, &mut out, true),
         };
         if let Err(e) = result {
             metrics::FETCH_ERRORS.inc();
@@ -225,7 +228,7 @@ fn converse(
     }
     out.write_all(&v0_advertisement(&repo.meta.lock().unwrap(), version)?)?;
     out.flush()?;
-    session_v0(repo, r, out, false)
+    session_v0(server, repo, r, out, false)
 }
 
 /// Forwards writes to an HTTP response body.
@@ -362,7 +365,7 @@ fn fetch(
     let started = std::time::Instant::now();
     let plan = plan_for(repo, &args.wants, &args.haves)?;
     let generated = if generate::needed(args) {
-        Some(Generated::prepare(repo, args)?)
+        Some(Answer::prepare(&server.fetch_cache, repo, args)?)
     } else {
         None
     };
@@ -397,7 +400,7 @@ fn fetch(
         pktline::delim(&mut head);
     }
 
-    if let Some(g) = &generated {
+    if let Some(g) = generated {
         if !g.shallow().is_empty() || !g.unshallow().is_empty() {
             pktline::line(&mut head, "shallow-info\n");
             for c in g.shallow() {
@@ -470,6 +473,7 @@ fn fetch(
 /// the wants and every have so far and gets one round of answers; over SSH the rounds
 /// share one connection. The client ends with `done`, and gets the pack.
 fn session_v0(
+    server: &Server,
     repo: &Repo,
     r: &mut dyn BufRead,
     out: &mut dyn Write,
@@ -513,11 +517,11 @@ fn session_v0(
         None
     };
     let deepening = base.deepen.is_some();
-    let shallow_info = |args: &FetchArgs, out: &mut Vec<u8>| -> anyhow::Result<Option<Generated>> {
+    let shallow_info = |args: &FetchArgs, out: &mut Vec<u8>| -> anyhow::Result<Option<Answer>> {
         if !generate::needed(args) {
             return Ok(None);
         }
-        let g = Generated::prepare(repo, args)?;
+        let g = Answer::prepare(&server.fetch_cache, repo, args)?;
         if deepening {
             for c in g.shallow() {
                 pktline::line(out, format!("shallow {c}\n"));
@@ -626,7 +630,7 @@ fn session_v0(
         let generated = if stateless || !deepening {
             shallow_info(&fetch_args, &mut full)?
         } else if generate::needed(&fetch_args) {
-            Some(Generated::prepare(repo, &fetch_args)?)
+            Some(Answer::prepare(&server.fetch_cache, repo, &fetch_args)?)
         } else {
             None
         };
@@ -647,7 +651,7 @@ fn session_v0(
         }
         out.write_all(&full)?;
         tracing::info!(repo = %repo.name, wants = base.wants.len(), haves = haves.len(), packs = plan.packs.len(), "fetch (v0)");
-        let sent = send_packfile(out, band, |data| match &generated {
+        let sent = send_packfile(out, band, |data| match generated {
             Some(g) => g.write(data),
             None => write_stored_packs(repo, &plan.packs, data),
         });
