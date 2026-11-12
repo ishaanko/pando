@@ -26,7 +26,13 @@ curl localhost:8080/healthz   # ok
 Data lives in `/var/lib/pando` (`StateDirectory`, owned by a transient user). Back it
 up with `pando backup --data /var/lib/pando --out DIR` (run as root, or stop the
 unit first for a quiet copy). Edit `ExecStart` to add `--public-url`, `--webhook`,
-`--public-read`, `--gc-interval` and friends, then `systemctl daemon-reload && systemctl restart pando`.
+`--public-read`, `--gc-interval`, `--object-format`, `--max-push-size` and friends,
+then `systemctl daemon-reload && systemctl restart pando`.
+
+Pando re-reads its auth file when it changes, but this unit hands the service a copy
+of `/etc/pando/tokens` made when it starts (a systemd credential), so with this unit a
+token change needs `systemctl restart pando`. Where `--auth-file` points at the file
+itself, as in Docker below, edits apply within a few seconds.
 
 ## TLS
 
@@ -63,3 +69,7 @@ docker run -d --name pando -p 8080:8080 -p 2222:2222 \
 
 The container runs as uid 10001. A named volume works as is; for a bind mount,
 `chown 10001 DIR` first. Passing arguments replaces the default `serve` command.
+
+Docker pins a single mounted file to the inode it had at start, and most editors save
+by replacing the file. To change tokens without restarting the container, mount the
+directory instead (`-v "$PWD/auth:/etc/pando:ro"`) or write the file in place.
