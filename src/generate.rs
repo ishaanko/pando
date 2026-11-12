@@ -30,7 +30,6 @@ use crate::server::Repo;
 use crate::upload::FetchArgs;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 
@@ -231,7 +230,7 @@ impl Answer {
             return Ok(Answer::Fresh(Box::new(g)));
         }
         let key = cache_key(args, filter.as_ref(), &not_tips);
-        let fill = match cache.lookup(&repo.dir, &key) {
+        let fill = match cache.lookup(&repo.dir, repo.format, &key) {
             Lookup::Hit(entry) => return Ok(Answer::Cached(entry)),
             Lookup::Fill(fill) => fill,
         };
@@ -291,7 +290,10 @@ fn cache_key(args: &FetchArgs, filter: Option<&Filter>, not_tips: &[Oid]) -> Oid
     let d = args.deepen.as_ref();
     let deepen = d.map(|d| (d.depth, d.since, d.relative));
     text += &format!("deepen {deepen:?}\nfilter {filter:?}\n");
-    Oid(Sha1::digest(text.as_bytes()).into())
+    // A file name, not an object id: SHA-1 whatever the repository's format.
+    let mut key = crate::object::Format::Sha1.hasher();
+    key.update(text.as_bytes());
+    key.finish()
 }
 
 /// The commits `deepen-not` names stand for, resolved the way git resolves short
@@ -386,7 +388,7 @@ fn open_odb(
                 None => anyhow::bail!("not our ref {want}"),
             }
         }
-        let odb = Odb::open(&repo.store, &direct)?;
+        let odb = Odb::open(&repo.store, repo.format, &direct)?;
         let mut all_blobs = true;
         for want in &args.wants {
             all_blobs &= matches!(odb.read(want)?, Some((Kind::Blob, _)));
@@ -397,7 +399,7 @@ fn open_odb(
     }
     let tips = [&args.wants[..], not_tips].concat();
     let plan = planner::plan(meta, &tips, &[]).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(Odb::open(&repo.store, &plan.packs)?)
+    Ok(Odb::open(&repo.store, repo.format, &plan.packs)?)
 }
 
 /// Which commits to send and where the new shallow boundary is.
@@ -617,8 +619,8 @@ fn walk_tree(
         let (_, data) = odb
             .read(&tree)?
             .ok_or_else(|| anyhow::anyhow!("missing tree {tree}"))?;
-        for (mode, oid) in
-            tree_entries(&data).ok_or_else(|| anyhow::anyhow!("malformed tree {tree}"))?
+        for (mode, oid) in tree_entries(odb.format, &data)
+            .ok_or_else(|| anyhow::anyhow!("malformed tree {tree}"))?
         {
             if mode == GITLINK_MODE {
                 continue;
@@ -659,14 +661,15 @@ fn reachable_commits(odb: &Odb, tips: &[Oid]) -> anyhow::Result<HashSet<Oid>> {
 /// Write a self-contained pack of `objects`, copying stored bytes where possible:
 /// whole objects as they are, and deltas whose base is also being sent as ref-deltas.
 /// Only deltas against objects left out are expanded and recompressed. Returns the
-/// pack's hash and index. Also used by gc to trim covers (see `gc.rs`).
+/// pack's hash (in the odb's format) and index. Also used by gc to trim covers (see
+/// `gc.rs`).
 pub fn write_pack(
     odb: &Odb,
     objects: &[Oid],
     out: &mut dyn Write,
 ) -> anyhow::Result<(Oid, Vec<IdxEntry>)> {
     let sending: HashSet<&Oid> = objects.iter().collect();
-    let mut w = HashingWriter::new(out);
+    let mut w = HashingWriter::new(odb.format, out);
     w.write_all(b"PACK\0\0\0\x02")?;
     w.write_all(&(objects.len() as u32).to_be_bytes())?;
     let mut head = Vec::new();
@@ -685,7 +688,7 @@ pub fn write_pack(
             && sending.contains(&base)
         {
             encode_type_size(REF_DELTA, size as u64, &mut head);
-            head.extend_from_slice(&base.0);
+            head.extend_from_slice(base.as_bytes());
             w.write_all(&head)?;
             w.write_all(delta)?;
             continue;

@@ -146,7 +146,7 @@ impl BlobStore {
     }
 
     pub fn read_idx(&self, hash: &Oid) -> io::Result<Vec<IdxEntry>> {
-        pack::decode_idx(&fs::read(self.idx_path(hash))?)
+        pack::decode_idx(hash.format(), &fs::read(self.idx_path(hash))?)
     }
 }
 

@@ -36,10 +36,14 @@
 //! trunk settings it loads first, while the writer keeps writing. Both share the
 //! queries in [`View`]; only the writer can reach its connection to write.
 //!
+//! Object format. A repository's [`Format`] is recorded in `settings` when its
+//! database is created and never changes; databases from before SHA-256 support have
+//! none recorded and are SHA-1. Ids are stored as hex, so their width follows.
+//!
 //! SQLite is the reference backend. Nothing here needs more than single-row CAS and
 //! small transactions, so it maps onto any horizontally scalable KV store.
 
-use crate::object::Oid;
+use crate::object::{Format, Oid};
 use crate::planner::{MAX_LEVEL, span};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::ops::{Deref, DerefMut};
@@ -159,6 +163,8 @@ pub struct NewVersion<'a> {
 /// [`Snapshot`]; the connection is private, so nothing holding only a `View` can write.
 pub struct View {
     conn: Connection,
+    /// The repository's object format, fixed at creation.
+    pub format: Format,
     /// The branch that is trunk (and HEAD).
     pub trunk: String,
     /// First chain sequence number of the current epoch.
@@ -186,6 +192,7 @@ impl DerefMut for Meta {
 pub struct Readers {
     path: PathBuf,
     default_trunk: String,
+    format: Format,
     idle: Mutex<Vec<Connection>>,
 }
 
@@ -193,11 +200,13 @@ pub struct Readers {
 const MAX_IDLE_READERS: usize = 16;
 
 impl Readers {
-    /// Readers of the database at `path`, which [`Meta::open`] has created.
-    pub fn new(path: impl Into<PathBuf>, default_trunk: &str) -> Readers {
+    /// Readers of the database at `path`, which [`Meta::open`] has created (and found
+    /// to be in `format`).
+    pub fn new(path: impl Into<PathBuf>, default_trunk: &str, format: Format) -> Readers {
         Readers {
             path: path.into(),
             default_trunk: default_trunk.to_string(),
+            format,
             idle: Mutex::new(Vec::new()),
         }
     }
@@ -221,6 +230,7 @@ impl Readers {
         conn.execute_batch("BEGIN")?;
         let mut view = View {
             conn,
+            format: self.format,
             trunk: self.default_trunk.clone(),
             epoch_start: 1,
         };
@@ -349,15 +359,29 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 impl Meta {
     /// Open (or create) a repository's metadata. `default_trunk` applies until the
-    /// first push fixes the trunk ref (see [`Meta::fix_trunk`]).
-    pub fn open(path: impl AsRef<Path>, default_trunk: &str) -> rusqlite::Result<Meta> {
-        let conn = Connection::open(path)?;
+    /// first push fixes the trunk ref (see [`Meta::fix_trunk`]). A new database records
+    /// `format` as the repository's object format, in the transaction that creates
+    /// it; an existing one keeps the format it has.
+    pub fn open(
+        path: impl AsRef<Path>,
+        default_trunk: &str,
+        format: Format,
+    ) -> rusqlite::Result<Meta> {
+        let mut conn = Connection::open(path)?;
         // FULL: a committed push survives power loss, not only a crash of this process.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let new: bool = tx.query_row(
+            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE name = 'settings'",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS versions (
                id INTEGER PRIMARY KEY,
                ref TEXT NOT NULL,
@@ -406,9 +430,34 @@ impl Meta {
                PRIMARY KEY (level, start)
              );",
         )?;
-        migrate(&conn)?;
+        if new {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES ('object_format', ?1)",
+                [format.name()],
+            )?;
+        }
+        migrate(&tx)?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'object_format'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        let format = match stored {
+            None => Format::Sha1,
+            Some(name) => Format::from_name(&name).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    format!("unknown object format {name:?}").into(),
+                )
+            })?,
+        };
         let mut view = View {
             conn,
+            format,
             trunk: default_trunk.to_string(),
             epoch_start: 1,
         };
@@ -1069,7 +1118,8 @@ impl Meta {
 pub struct PackRows<'a> {
     pub hash: Oid,
     pub deps: &'a Deps,
-    pub objects: &'a [Oid],
+    /// The pack's objects, from its index.
+    pub objects: &'a [crate::pack::IdxEntry],
     pub commits: &'a std::collections::HashMap<Oid, Vec<Oid>>,
     pub tags: &'a std::collections::HashMap<Oid, Oid>,
 }
@@ -1085,8 +1135,8 @@ fn index_pack(conn: &Connection, p: &PackRows) -> rusqlite::Result<()> {
     )?;
     let mut obj =
         conn.prepare_cached("INSERT OR IGNORE INTO objects (oid, pack) VALUES (?1, ?2)")?;
-    for oid in p.objects {
-        obj.execute(params![oid.hex(), hex])?;
+    for e in p.objects {
+        obj.execute(params![e.oid.hex(), hex])?;
     }
     let mut com = conn
         .prepare_cached("INSERT OR IGNORE INTO commits (oid, pack, parents) VALUES (?1, ?2, ?3)")?;

@@ -2,7 +2,8 @@
 //! identical shallow or filtered clones, like CI jobs cloning one tip with `--depth 1`,
 //! cost one history walk instead of one each.
 //!
-//! An entry is a pack plus the `shallow`/`unshallow` lines that go with it, stored at
+//! An entry is a pack plus the `shallow`/`unshallow` commits that go with it (raw ids,
+//! as wide as the repository's object format makes them), stored at
 //! `<repo>.git/fetch-cache/<key>.answer`, where the key hashes everything the answer
 //! depends on (`generate::Answer::prepare` builds it). Entries are written to
 //! `<key>.tmp` and renamed into place, so only complete files are ever visible;
@@ -14,7 +15,7 @@
 //! limit, evicting the least recently served entries after each fill. Backups skip
 //! it, and gc clears a repository's entries when it deletes packs.
 
-use crate::object::Oid;
+use crate::object::{Format, Oid};
 use crate::server::repo_names;
 use memmap2::Mmap;
 use std::collections::HashSet;
@@ -59,6 +60,7 @@ pub enum Lookup<'a> {
 pub struct Fill<'a> {
     cache: &'a FetchCache,
     path: PathBuf,
+    format: Format,
 }
 
 impl FetchCache {
@@ -92,13 +94,13 @@ impl FetchCache {
         (self.hits.load(Relaxed), self.misses.load(Relaxed))
     }
 
-    /// The entry for `key` in the repository at `repo_dir`, or the job of filling it.
-    /// Blocks while another request is filling it.
-    pub fn lookup(&self, repo_dir: &Path, key: &Oid) -> Lookup<'_> {
+    /// The entry for `key` in the repository at `repo_dir` (in `format`), or the job
+    /// of filling it. Blocks while another request is filling it.
+    pub fn lookup(&self, repo_dir: &Path, format: Format, key: &Oid) -> Lookup<'_> {
         let path = repo_dir.join(DIR).join(format!("{key}.answer"));
         let mut filling = self.filling.lock().unwrap();
         loop {
-            if let Some(entry) = Entry::open(&path) {
+            if let Some(entry) = Entry::open(&path, format) {
                 // Served recently: the last to be evicted.
                 if let Ok(f) = fs::File::open(&path) {
                     let _ = f.set_modified(std::time::SystemTime::now());
@@ -110,7 +112,11 @@ impl FetchCache {
             if filling.insert(path.clone()) {
                 self.misses.fetch_add(1, Relaxed);
                 crate::metrics::FETCH_CACHE_MISSES.inc();
-                return Lookup::Fill(Fill { cache: self, path });
+                return Lookup::Fill(Fill {
+                    cache: self,
+                    path,
+                    format,
+                });
             }
             filling = self.filled.wait(filling).unwrap();
         }
@@ -163,7 +169,7 @@ impl Fill<'_> {
             let mut file = BufWriter::new(fs::File::create(&tmp)?);
             pack(&mut file)?;
             for oid in shallow.iter().chain(unshallow) {
-                file.write_all(&oid.0)?;
+                file.write_all(oid.as_bytes())?;
             }
             file.write_all(&(shallow.len() as u32).to_be_bytes())?;
             file.write_all(&(unshallow.len() as u32).to_be_bytes())?;
@@ -177,8 +183,8 @@ impl Fill<'_> {
             let _ = fs::remove_file(&tmp);
         }
         written?;
-        let entry =
-            Entry::open(&self.path).ok_or_else(|| anyhow::anyhow!("fetch cache entry vanished"))?;
+        let entry = Entry::open(&self.path, self.format)
+            .ok_or_else(|| anyhow::anyhow!("fetch cache entry vanished"))?;
         let (cache, path) = (self.cache, self.path.clone());
         drop(self);
         if let Err(e) = cache.evict(&path) {
@@ -197,35 +203,36 @@ impl Drop for Fill<'_> {
 
 impl Entry {
     /// A complete entry, or `None` (deleting a damaged one).
-    fn open(path: &Path) -> Option<Entry> {
+    fn open(path: &Path, format: Format) -> Option<Entry> {
         let map = crate::store::map_file(path).ok()?;
-        let entry = Entry::parse(map);
+        let entry = Entry::parse(map, format);
         if entry.is_none() {
             let _ = fs::remove_file(path);
         }
         entry
     }
 
-    fn parse(map: Mmap) -> Option<Entry> {
+    fn parse(map: Mmap, format: Format) -> Option<Entry> {
         let tail = map.len().checked_sub(16)?;
         if &map[tail + 8..] != MAGIC {
             return None;
         }
         let count = |at: usize| u32::from_be_bytes(map[at..at + 4].try_into().unwrap()) as usize;
         let (ns, nu) = (count(tail), count(tail + 4));
-        let pack_len = tail.checked_sub((ns + nu) * 20)?;
-        if pack_len < 32 || &map[..4] != b"PACK" {
+        let width = format.raw_len();
+        let pack_len = tail.checked_sub((ns + nu).checked_mul(width)?)?;
+        if pack_len < 12 + width || &map[..4] != b"PACK" {
             return None;
         }
         let oids = |from: usize, n: usize| -> Vec<Oid> {
-            map[from..from + n * 20]
-                .chunks(20)
-                .map(|c| Oid(c.try_into().unwrap()))
+            map[from..from + n * width]
+                .chunks(width)
+                .map(|c| format.oid_from_bytes(c).unwrap())
                 .collect()
         };
         Some(Entry {
             shallow: oids(pack_len, ns),
-            unshallow: oids(pack_len + ns * 20, nu),
+            unshallow: oids(pack_len + ns * width, nu),
             pack_len,
             map,
         })

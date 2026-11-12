@@ -3,14 +3,16 @@
 //! Hooks are executables, as in Git. `pre-receive` runs once a push's pack has
 //! arrived and before any ref moves; a non-zero exit rejects the whole push (use it
 //! for branch protection or policy checks). `post-receive` runs after refs moved. Both
-//! read `<old> <new> <ref>` lines on stdin, and see `PANDO_REPO`, `PANDO_USER`,
+//! read `<old> <new> <ref>` lines on stdin (full ids in the repository's object
+//! format, all zeros for a ref created or deleted), and see `PANDO_REPO`, `PANDO_USER`,
 //! `PANDO_PACK` (the pushed pack, when there is one) and Git's `GIT_PUSH_OPTION_COUNT`
 //! and `GIT_PUSH_OPTION_<n>`. Whatever they print is shown to the pusher. A
 //! repository's own `<data>/repos/<repo>.git/hooks/<name>` wins over the server-wide
 //! `<data>/hooks/<name>`.
 //!
 //! Webhooks: after a push moves refs, each `--webhook` URL gets a POST with a JSON
-//! body `{"repository", "pusher", "updates": [{"ref", "before", "after"}]}`. With a
+//! body `{"repository", "pusher", "updates": [{"ref", "before", "after"}]}`, ids as
+//! hook stdin has them. With a
 //! secret, `X-Pando-Signature-256: sha256=<hex>` carries an HMAC-SHA256 of the body
 //! (the scheme GitHub's `X-Hub-Signature-256` uses). Failed deliveries are retried.
 
@@ -163,20 +165,21 @@ pub(crate) fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Format;
 
     #[test]
     fn payload_is_json() {
         let u = [Update {
-            old: Oid::ZERO,
-            new: Oid([1; 20]),
+            old: Format::Sha256.zero(),
+            new: Oid::Sha256([1; 32]),
             refname: "refs/heads/a\"b",
         }];
         assert_eq!(
             payload("team/app", None, &u),
             format!(
                 r#"{{"repository":"team/app","pusher":null,"updates":[{{"ref":"refs/heads/a\"b","before":"{}","after":"{}"}}]}}"#,
-                Oid::ZERO,
-                Oid([1; 20])
+                Format::Sha256.zero(),
+                Oid::Sha256([1; 32])
             )
         );
     }

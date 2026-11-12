@@ -1,7 +1,11 @@
 //! The HTTP front door: repositories, authentication, and routing.
 //!
 //! Each repository lives in `<data>/repos/<name>.git/` (a metadata database and a blob
-//! store) and is created on its first push. Routes follow Git's smart HTTP layout:
+//! store) and is created on its first push, in the server's default object format
+//! (`--object-format`), or empty in either format through the admin API. Until then
+//! fetches find nothing, and a pusher is shown an empty repository in the default
+//! format without one being created, so a client git refuses for using the other
+//! format leaves nothing behind. Routes follow Git's smart HTTP layout:
 //!
 //! - `GET  /<repo>.git/info/refs?service=...`  capability / ref advertisement
 //! - `POST /<repo>.git/git-upload-pack`        fetch (see `upload.rs`)
@@ -20,6 +24,7 @@ use crate::auth::{Access, LiveAuth, UrlSigner};
 use crate::express::{self, Express};
 use crate::fetch_cache::FetchCache;
 use crate::meta::{Meta, Readers, Snapshot};
+use crate::object::Format;
 use crate::store::BlobStore;
 use crate::{receive, upload};
 use axum::Router;
@@ -80,6 +85,8 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     /// Largest pack a push may send, in bytes.
     pub max_push_bytes: u64,
+    /// Object format of repositories created by a first push.
+    pub object_format: Format,
     /// Disk budget for cached shallow and filtered fetch answers, across all
     /// repositories (see `fetch_cache.rs`). 0 turns the cache off.
     pub fetch_cache_max_size: u64,
@@ -103,6 +110,7 @@ impl Config {
             webhooks: Vec::new(),
             webhook_secret: None,
             max_push_bytes: 2 << 30,
+            object_format: Format::Sha1,
             fetch_cache_max_size: 1 << 30,
         }
     }
@@ -113,6 +121,8 @@ pub struct Repo {
     pub name: String,
     /// `<data>/repos/<name>.git`
     pub dir: PathBuf,
+    /// The object format, fixed when the repository was created.
+    pub format: Format,
     /// Set once the repository is deleted or renamed; holders of this handle stop.
     pub closed: std::sync::atomic::AtomicBool,
     /// The writer: pushes, gc, compaction and admin changes take this lock.
@@ -303,25 +313,55 @@ impl Server {
         self.open_repo(name, false)
     }
 
+    /// A repository, created in the default object format if `create` and missing.
     pub fn open_repo(&self, name: &str, create: bool) -> anyhow::Result<Option<Arc<Repo>>> {
+        let format = create.then_some(self.cfg.object_format);
+        Ok(self.open_or_create(name, format)?.map(|(repo, _)| repo))
+    }
+
+    /// Create an empty repository in `format`. Returns false if it exists already.
+    pub fn create_repo(&self, name: &str, format: Format) -> anyhow::Result<bool> {
+        anyhow::ensure!(valid_repo_name(name), "invalid repository name {name:?}");
+        let created = self.open_or_create(name, Some(format))?;
+        if created.as_ref().is_some_and(|(_, new)| *new) {
+            tracing::info!(repo = name, format = format.name(), "created repository");
+        }
+        Ok(created.is_some_and(|(_, new)| new))
+    }
+
+    /// Open a repository, or with `create` make it in that format. Also says whether
+    /// it was created just now.
+    fn open_or_create(
+        &self,
+        name: &str,
+        create: Option<Format>,
+    ) -> anyhow::Result<Option<(Arc<Repo>, bool)>> {
         if !valid_repo_name(name) {
             return Ok(None);
         }
         let mut repos = self.repos.lock().unwrap();
         if let Some(r) = repos.get(name) {
-            return Ok(Some(r.clone()));
+            return Ok(Some((r.clone(), false)));
         }
         let dir = self.cfg.data.join("repos").join(format!("{name}.git"));
-        if !dir.exists() && !create {
+        let new = !dir.join("meta.db").exists();
+        if !dir.exists() && create.is_none() {
             return Ok(None);
         }
         crate::store::create_dir_all(&dir)?;
+        let meta = Meta::open(
+            dir.join("meta.db"),
+            &self.cfg.trunk,
+            create.unwrap_or_default(),
+        )?;
+        let format = meta.format;
         let repo = Arc::new(Repo {
             name: name.to_string(),
             dir: dir.clone(),
+            format,
             closed: Default::default(),
-            meta: Mutex::new(Meta::open(dir.join("meta.db"), &self.cfg.trunk)?),
-            readers: Readers::new(dir.join("meta.db"), &self.cfg.trunk),
+            meta: Mutex::new(meta),
+            readers: Readers::new(dir.join("meta.db"), &self.cfg.trunk, format),
             queue: Mutex::new(Vec::new()),
             store: BlobStore::open(dir.join("blobs"))?,
             compact: Notify::new(),
@@ -335,7 +375,7 @@ impl Server {
             }
         }
         repos.insert(name.to_string(), repo.clone());
-        Ok(Some(repo))
+        Ok(Some((repo, new)))
     }
 }
 
@@ -594,13 +634,19 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
         Err(denied) => return denied.into_response(),
     };
 
-    let repo = match server.open_repo(name, push) {
+    // A push creates the repository; its advertisement does not (see the module docs).
+    let create = matches!(endpoint, Endpoint::ReceivePack);
+    let repo = match server.open_repo(name, create) {
         Ok(Some(r)) => r,
+        Ok(None) if push => {
+            let ad = receive::advertise(server.clone(), None).await;
+            return ad.unwrap_or_else(|e| internal_error(&path, e));
+        }
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found\n").into_response(),
         Err(e) => return internal_error(&path, e),
     };
     let result = match endpoint {
-        Endpoint::InfoRefs if push => receive::advertise(server.clone(), repo).await,
+        Endpoint::InfoRefs if push => receive::advertise(server.clone(), Some(repo)).await,
         Endpoint::InfoRefs => upload::advertise(repo, req.headers()).await,
         Endpoint::UploadPack => upload::handle(server.clone(), repo, req).await,
         Endpoint::ReceivePack => receive::handle(server.clone(), repo, user, req).await,

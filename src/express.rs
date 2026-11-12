@@ -7,6 +7,10 @@
 //! into a single origin read. Pando spreads packs across Express nodes with
 //! rendezvous hashing, so each node caches a stable slice of the pack space. With a
 //! size limit, the least recently served packs are evicted after each fill.
+//!
+//! Express knows nothing about repositories' object formats: a pack's name says it.
+//! A 40-hex name is a SHA-1 pack and a 64-hex one a SHA-256 pack, and a fill is
+//! verified with that hash.
 
 use crate::auth::UrlSigner;
 use crate::object::Oid;
@@ -153,13 +157,14 @@ impl Express {
         let n = FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dest.with_extension(format!("tmp-{}-{n}", std::process::id()));
         let mut file = tokio::fs::File::create(&tmp).await?;
-        let mut sha = Sha1::new();
+        let trailer = hash.format().raw_len();
+        let mut sha = hash.format().hasher();
         let mut tail: Vec<u8> = Vec::new();
-        let mut put = |chunk: &[u8], sha: &mut Sha1| {
-            // Hash everything except the final 20 bytes, which must equal the hash.
+        let mut put = |chunk: &[u8], sha: &mut crate::object::Hasher| {
+            // Hash everything except the trailer, which must equal the hash.
             tail.extend_from_slice(chunk);
-            if tail.len() > 20 {
-                let n = tail.len() - 20;
+            if tail.len() > trailer {
+                let n = tail.len() - trailer;
                 sha.update(&tail[..n]);
                 tail.drain(..n);
             }
@@ -192,7 +197,7 @@ impl Express {
         }
         file.flush().await?;
         file.sync_all().await?;
-        if sha.finalize().as_slice() != tail.as_slice() || tail != hash.0 {
+        if sha.finish() != hash || tail != hash.as_bytes() {
             tokio::fs::remove_file(&tmp).await.ok();
             anyhow::bail!("pack {hash} from origin failed verification");
         }
@@ -238,8 +243,8 @@ async fn get_pack(
 }
 
 /// Serve one pack, with `Range: bytes=N-` support so interrupted downloads can
-/// resume. Pack URLs are capability URLs: the 160-bit hash is only learned from an
-/// authorized fetch.
+/// resume. Pack URLs are capability URLs: the hash (160 or 256 bits) is only learned
+/// from an authorized fetch.
 pub async fn serve(
     x: &Express,
     repo: &str,
@@ -304,7 +309,7 @@ pub fn pick_node<'a>(nodes: &'a [String], hash: &Oid) -> &'a str {
         .max_by_key(|node| {
             let mut h = Sha1::new();
             h.update(node.as_bytes());
-            h.update(hash.0);
+            h.update(hash.as_bytes());
             u64::from_be_bytes(h.finalize()[..8].try_into().unwrap())
         })
         .map(String::as_str)

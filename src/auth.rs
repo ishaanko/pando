@@ -275,7 +275,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Signs pack URLs handed out in fetch responses, so a client can download exactly the
 /// packs it was authorized for, for a limited time, without credentials. Express nodes
-/// given the same secret check the same signatures.
+/// given the same secret check the same signatures. The signature covers the pack's
+/// whole hex name, so it means the same for SHA-1 and SHA-256 packs.
 pub struct UrlSigner {
     secret: Vec<u8>,
 }
@@ -417,12 +418,16 @@ mod tests {
 
     #[test]
     fn signed_urls_verify_only_for_their_pack() {
+        use crate::object::Oid;
         let s = UrlSigner::new(b"k");
-        let h = crate::object::Oid([7; 20]);
+        let h = Oid::Sha1([7; 20]);
         let q = s.sign("r", &h);
         assert!(s.verify("r", &h, &q));
         assert!(!s.verify("other", &h, &q));
-        assert!(!s.verify("r", &crate::object::Oid([8; 20]), &q));
+        assert!(!s.verify("r", &Oid::Sha1([8; 20]), &q));
+        assert!(!s.verify("r", &Oid::Sha256([7; 32]), &q));
         assert!(!UrlSigner::new(b"x").verify("r", &h, &q));
+        let h = Oid::Sha256([7; 32]);
+        assert!(s.verify("r", &h, &s.sign("r", &h)));
     }
 }

@@ -266,16 +266,15 @@ fn run(
             return Ok(w.write_all(auth.as_bytes())?);
         }
     };
-    let repo = server
-        .open_repo(&name, push)?
-        .ok_or_else(|| anyhow::anyhow!("repository '{name}' not found"))?;
+    let repo = server.open_repo(&name, false)?;
     tracing::info!(repo = name, push, user, "ssh");
     if push {
-        receive::serve_stream(server, &repo, user.as_deref(), r, w)
-    } else {
-        let version = upload::Version::from_git_protocol(protocol);
-        upload::serve_stream(server, &repo, version, r, w)
+        // A push creates a missing repository (see `receive::serve_stream`).
+        return receive::serve_stream(server, &name, repo, user.as_deref(), r, w);
     }
+    let repo = repo.ok_or_else(|| anyhow::anyhow!("repository '{name}' not found"))?;
+    let version = upload::Version::from_git_protocol(protocol);
+    upload::serve_stream(server, &repo, version, r, w)
 }
 
 #[derive(Debug, PartialEq)]

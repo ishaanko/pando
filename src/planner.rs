@@ -251,7 +251,7 @@ pub fn pieces(meta: &View, have: u64, want: u64) -> Result<Vec<Piece>, PlanError
             None if at + 1 < meta.epoch_start => {
                 at = meta.next_trunk_seq(at + 1)?.map_or(want, |next| next - 1);
             }
-            None => return Err(PlanError::NotOurRef(Oid::ZERO)),
+            None => return Err(PlanError::NotOurRef(meta.format.zero())),
         }
     }
     Ok(out)
