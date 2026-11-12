@@ -3,6 +3,9 @@ name = "pando"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
+description = "A Git server built on immutable packs and per-ref versions"
+repository = "https://github.com/ishaanko/pando"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
