@@ -5,7 +5,9 @@
 //! Each repository's metadata is snapshotted with SQLite's `VACUUM INTO`. Packs never
 //! change once written, so they are hard-linked (or copied across filesystems) after
 //! the snapshot. A pack that gc deletes in between was already unreachable in the
-//! snapshot, so it is skipped and forgotten in the copy, as gc forgot it.
+//! snapshot, so it is skipped and forgotten in the copy, as gc forgot it. LFS objects
+//! are immutable too and are linked the same way; one uploaded during the backup may
+//! or may not make it in.
 //!
 //! Both commands fsync everything they wrote before reporting success.
 
@@ -22,6 +24,7 @@ pub struct Summary {
     pub repos: usize,
     pub packs: usize,
     pub skipped: usize,
+    pub lfs_objects: usize,
 }
 
 /// Copy `data` into `out`, which must not exist yet or be empty.
@@ -73,6 +76,11 @@ pub fn backup(data: &Path, out: &Path) -> anyhow::Result<Summary> {
                 .map_err(|e| anyhow::anyhow!("{name}: {e:#}"))?;
             summary.skipped += skipped.len();
         }
+        for (oid, from) in crate::lfs::stored_objects(&src)? {
+            let to = crate::lfs::object_path(&dst, &oid);
+            fs::create_dir_all(to.parent().unwrap())?;
+            summary.lfs_objects += usize::from(link_or_copy(&from, &to)?);
+        }
         copy_dir(&src.join("hooks"), &dst.join("hooks"))?;
         summary.repos += 1;
     }
@@ -114,7 +122,8 @@ pub fn restore(from: &Path, data: &Path) -> anyhow::Result<Summary> {
 }
 
 /// Problems found in a data directory: packs the metadata knows that are missing or
-/// (with `full`) corrupt, and refs whose tips are not stored.
+/// (with `full`) corrupt, refs whose tips are not stored, and stray or (with `full`)
+/// corrupt LFS objects.
 pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
     let mut problems = Vec::new();
     for name in repo_names(data)? {
@@ -141,6 +150,9 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
             if meta.object(&v.tip)?.is_none() {
                 problems.push(format!("{name}: {} points at unknown {}", v.refname, v.tip));
             }
+        }
+        for p in crate::lfs::check(&dir, full)? {
+            problems.push(format!("{name}: {p}"));
         }
     }
     Ok(problems)
@@ -213,7 +225,7 @@ fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Copy a directory tree; immutable packs are hard-linked when possible.
+/// Copy a directory tree; immutable packs and LFS objects are hard-linked when possible.
 fn copy_tree(src: &Path, dst: &Path, summary: &mut Summary) -> anyhow::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -221,7 +233,9 @@ fn copy_tree(src: &Path, dst: &Path, summary: &mut Summary) -> anyhow::Result<()
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
         if entry.file_type()?.is_dir() {
             copy_tree(&from, &to, summary)?;
-        } else if from.extension().is_some_and(|e| e == "pack" || e == "pidx") {
+        } else if from.extension().is_some_and(|e| e == "pack" || e == "pidx")
+            || crate::lfs::valid_oid(&entry.file_name().to_string_lossy())
+        {
             link_or_copy(&from, &to)?;
             summary.packs += usize::from(from.extension().is_some_and(|e| e == "pack"));
         } else {

@@ -2611,3 +2611,418 @@ fn pushes_over_the_size_limit_are_refused_with_the_limit_named() {
         Some(tip.as_str())
     );
 }
+
+// ---------------------------------------------------------------------------------
+// Git LFS.
+
+/// A global git config with git-lfs's filters, or `None` when git-lfs is missing.
+fn lfs_config(dir: &Path) -> Option<PathBuf> {
+    let installed = Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !installed {
+        eprintln!("skipping: git lfs is not installed");
+        return None;
+    }
+    let path = dir.join("lfs-gitconfig");
+    std::fs::write(
+        &path,
+        "[user]\n\tname = t\n\temail = t@t\n[init]\n\tdefaultBranch = main\n\
+         [filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\
+         \tprocess = git-lfs filter-process\n\trequired = true\n",
+    )
+    .unwrap();
+    Some(path)
+}
+
+/// Run git with the LFS config (and an SSH command, if given).
+#[track_caller]
+fn lfs_git(config: &Path, dir: &Path, ssh: Option<&str>, args: &[&str]) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", config)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(ssh) = ssh {
+        cmd.env("GIT_SSH_COMMAND", ssh);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A repository with LFS-tracked files: a few MB of noise, an empty file and a small
+/// one, committed but not pushed. Returns the noise.
+fn lfs_repo(config: &Path, dir: &Path) -> Vec<u8> {
+    std::fs::create_dir_all(dir).unwrap();
+    lfs_git(config, dir, None, &["init", "-q"]);
+    lfs_git(config, dir, None, &["lfs", "install", "--local"]);
+    lfs_git(config, dir, None, &["lfs", "track", "*.bin"]);
+    let noise: Vec<u8> = (0..3_000_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(dir.join("big.bin"), &noise).unwrap();
+    std::fs::write(dir.join("empty.bin"), b"").unwrap();
+    std::fs::write(dir.join("small.bin"), b"small\n").unwrap();
+    lfs_git(config, dir, None, &["add", "."]);
+    lfs_git(config, dir, None, &["commit", "-qm", "lfs"]);
+    noise
+}
+
+/// The working tree files that matter, for comparing clones.
+fn lfs_files(dir: &Path) -> Vec<Vec<u8>> {
+    ["big.bin", "empty.bin", "small.bin"]
+        .iter()
+        .map(|f| std::fs::read(dir.join(f)).unwrap())
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// One raw HTTP request. Returns the status and body.
+fn request(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut req = pando::http_client()
+            .request(method.parse().unwrap(), url)
+            .body(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.bytes().await.unwrap().to_vec())
+    })
+}
+
+/// A batch API call for `objects` (oid, size).
+fn batch(
+    base: &str,
+    repo: &str,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let (status, body) = request(
+        "POST",
+        &format!("{base}/{repo}.git/info/lfs/objects/batch"),
+        token,
+        &[
+            ("Accept", "application/vnd.git-lfs+json"),
+            ("Content-Type", "application/vnd.git-lfs+json"),
+        ],
+        serde_json::to_vec(&body).unwrap(),
+    );
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn batch_one(
+    base: &str,
+    repo: &str,
+    token: &str,
+    op: &str,
+    oid: &str,
+    size: usize,
+) -> serde_json::Value {
+    let (status, body) = batch(
+        base,
+        repo,
+        Some(token),
+        serde_json::json!({"operation": op, "transfers": ["basic"], "objects": [{"oid": oid, "size": size}]}),
+    );
+    assert_eq!(status, 200, "{body}");
+    body["objects"][0].clone()
+}
+
+const LFS_TOKENS: &str = "w tok-write write\nr tok-read read\nx tok-other write other/*\n";
+
+#[test]
+fn lfs_round_trips_over_http_with_tokens() {
+    let s = Server::start_configured(|c| {
+        c.auth = Some(pando::auth::Auth::parse(LFS_TOKENS).unwrap().into())
+    });
+    let Some(config) = lfs_config(s.dir.path()) else {
+        return;
+    };
+    let with = |token: &str| s.url.replacen("http://", &format!("http://u:{token}@"), 1);
+    // The repository does not exist until the push, which runs after the LFS upload.
+    let a = s.path("a");
+    let noise = lfs_repo(&config, &a);
+    lfs_git(
+        &config,
+        &a,
+        None,
+        &["push", "-q", &with("tok-write"), "main"],
+    );
+    assert!(
+        s.dir
+            .path()
+            .join("data/repos/repo.git/lfs/objects")
+            .is_dir()
+    );
+
+    let c = s.path("c");
+    lfs_git(
+        &config,
+        s.dir.path(),
+        None,
+        &["clone", "-q", &with("tok-read"), c.to_str().unwrap()],
+    );
+    assert_eq!(lfs_files(&c), lfs_files(&a));
+    assert_eq!(std::fs::read(c.join("big.bin")).unwrap(), noise);
+
+    // Read access downloads but cannot upload; another repository's token gets nothing.
+    let oid = sha256_hex(&noise);
+    let got = batch_one(&s.base, "repo", "tok-read", "download", &oid, noise.len());
+    assert!(got["actions"]["download"]["href"].is_string(), "{got}");
+    let upload = serde_json::json!({"operation": "upload", "objects": [{"oid": sha256_hex(b"new"), "size": 3}]});
+    assert_eq!(
+        batch(&s.base, "repo", Some("tok-read"), upload.clone()).0,
+        403
+    );
+    let download = serde_json::json!({"operation": "download", "objects": [{"oid": oid, "size": noise.len()}]});
+    assert_eq!(
+        batch(&s.base, "repo", Some("tok-other"), download.clone()).0,
+        403
+    );
+    assert_eq!(batch(&s.base, "repo", Some("tok-other"), upload).0, 403);
+    assert_eq!(batch(&s.base, "repo", None, download).0, 401);
+}
+
+#[test]
+fn lfs_works_over_ssh() {
+    let keys = TempDir::new().unwrap();
+    let (writer, as_writer) = ssh_key(keys.path(), "writer");
+    let (reader, as_reader) = ssh_key(keys.path(), "reader");
+    let auth = format!("w {writer} write\nr {reader} read\n");
+    let s = Server::start_configured(|c| {
+        c.auth = Some(pando::auth::Auth::parse(&auth).unwrap().into())
+    });
+    let Some(config) = lfs_config(s.dir.path()) else {
+        return;
+    };
+    let url = format!("{}/team/app.git", start_ssh(&s.server));
+    let a = s.path("a");
+    lfs_repo(&config, &a);
+    lfs_git(&config, &a, Some(&as_writer), &["push", "-q", &url, "main"]);
+    let c = s.path("c");
+    lfs_git(
+        &config,
+        s.dir.path(),
+        Some(&as_reader),
+        &["clone", "-q", &url, c.to_str().unwrap()],
+    );
+    assert_eq!(lfs_files(&c), lfs_files(&a));
+
+    // The credential git-lfs-authenticate issues carries the key's access, no more.
+    let issue = |ssh: &str, op: &str| {
+        let mut cmd: Vec<&str> = ssh.split_whitespace().collect();
+        let port = url
+            .rsplit_once(':')
+            .unwrap()
+            .1
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        cmd.extend([
+            "-p",
+            &port,
+            "git@127.0.0.1",
+            "git-lfs-authenticate",
+            "team/app.git",
+            op,
+        ]);
+        Command::new(cmd[0]).args(&cmd[1..]).output().unwrap()
+    };
+    let out = issue(&as_reader, "upload");
+    assert!(!out.status.success());
+    let out = issue(&as_reader, "download");
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["href"], format!("{}/team/app.git/info/lfs", s.base));
+    let header = json["header"]["Authorization"].as_str().unwrap();
+    let token = header.strip_prefix("Bearer ").unwrap();
+    let upload = serde_json::json!({"operation": "upload", "objects": [{"oid": sha256_hex(b"x"), "size": 1}]});
+    let download = serde_json::json!({"operation": "download", "objects": []});
+    assert_eq!(
+        batch(&s.base, "team/app", Some(token), download.clone()).0,
+        200
+    );
+    assert_eq!(batch(&s.base, "team/app", Some(token), upload).0, 403);
+    assert_eq!(batch(&s.base, "team/other", Some(token), download).0, 401);
+}
+
+#[test]
+fn lfs_transfer_urls_are_bound_to_one_object_and_operation() {
+    let s = Server::start_configured(|c| {
+        c.auth = Some(pando::auth::Auth::parse(LFS_TOKENS).unwrap().into())
+    });
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let oid = sha256_hex(&data);
+    let other = sha256_hex(b"other");
+    let got = batch_one(&s.base, "repo", "tok-write", "upload", &oid, data.len());
+    let href = got["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let put = |url: &str, body: &[u8]| request("PUT", url, None, &[], body.to_vec()).0;
+    let object = s.dir.path().join(format!(
+        "data/repos/repo.git/lfs/objects/{}/{}/{oid}",
+        &oid[..2],
+        &oid[2..4]
+    ));
+
+    // Bytes that do not hash to the oid, or are not the declared size, leave nothing.
+    let mut wrong = data.clone();
+    wrong[7] ^= 1;
+    assert_eq!(put(&href, &wrong), 422);
+    assert_eq!(put(&href, &data[1..]), 422);
+    assert_eq!(put(&href, &[&data[..], b"!"].concat()), 422);
+    assert!(!object.exists());
+    let tmp = s.dir.path().join("data/repos/repo.git/lfs/tmp");
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+
+    // The signature covers the object, the repository, the size and the operation.
+    assert_eq!(put(&href.replace(&oid, &other), b"other"), 403);
+    assert_eq!(put(&href.replace("/repo.git/", "/other.git/"), &data), 403);
+    assert_eq!(
+        put(&href.replace("size=100000", "size=99999"), &data[1..]),
+        403
+    );
+    let sig = href.rsplit_once("sig=").unwrap().1;
+    let flipped = format!(
+        "{}{}",
+        if sig.starts_with('0') { "1" } else { "0" },
+        &sig[1..]
+    );
+    assert_eq!(put(&href.replace(sig, &flipped), &data), 403);
+    assert_eq!(request("GET", &href, None, &[], vec![]).0, 403);
+    assert_eq!(put(href.split_once("&exp=").unwrap().0, &data), 403);
+
+    assert_eq!(put(&href, &data), 200);
+    assert_eq!(std::fs::read(&object).unwrap(), data);
+    assert_eq!(put(&href, &data), 200, "uploads are idempotent");
+    let again = batch_one(&s.base, "repo", "tok-write", "upload", &oid, data.len());
+    assert!(again.get("actions").is_none(), "{again}");
+
+    // Downloads resume with Range; their URLs do not authorize uploads.
+    let got = batch_one(&s.base, "repo", "tok-read", "download", &oid, data.len());
+    let href = got["actions"]["download"]["href"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        request("GET", &href, None, &[], vec![]),
+        (200, data.clone())
+    );
+    assert_eq!(
+        request("GET", &href, None, &[("Range", "bytes=60000-")], vec![]),
+        (206, data[60000..].to_vec())
+    );
+    assert_eq!(
+        put(&href, &data),
+        400,
+        "a download URL has no size to upload against"
+    );
+    assert_eq!(
+        request("GET", &href.replace(&oid, &other), None, &[], vec![]).0,
+        403
+    );
+
+    // Per-object errors.
+    let (status, body) = batch(
+        &s.base,
+        "repo",
+        Some("tok-read"),
+        serde_json::json!({"operation": "download", "objects": [
+            {"oid": other, "size": 5}, {"oid": "../../etc/passwd", "size": 1}, {"oid": oid, "size": -1}]}),
+    );
+    assert_eq!(status, 200);
+    let codes: Vec<_> = (0..3)
+        .map(|i| body["objects"][i]["error"]["code"].clone())
+        .collect();
+    assert_eq!(codes, [404, 422, 422]);
+    let sha1 = serde_json::json!({"operation": "download", "objects": [], "hash_algo": "sha1"});
+    assert_eq!(batch(&s.base, "repo", Some("tok-read"), sha1).0, 409);
+    let (status, _) = request(
+        "GET",
+        &format!("{}/repo.git/info/lfs/objects/..%2Fmeta.db", s.base),
+        None,
+        &[],
+        vec![],
+    );
+    assert_eq!(status, 404);
+    let locks = request(
+        "POST",
+        &format!("{}/repo.git/info/lfs/locks/verify", s.base),
+        Some("tok-write"),
+        &[],
+        vec![],
+    );
+    assert_eq!(locks.0, 501);
+}
+
+#[test]
+fn lfs_objects_survive_backup_and_restore() {
+    let s = Server::start();
+    let Some(config) = lfs_config(s.dir.path()) else {
+        return;
+    };
+    let a = s.path("a");
+    lfs_repo(&config, &a);
+    lfs_git(&config, &a, None, &["push", "-q", &s.url, "main"]);
+
+    let backup = s.path("backup");
+    let b = pando::backup::backup(&s.dir.path().join("data"), &backup).unwrap();
+    assert_eq!(b.lfs_objects, 2);
+    let restored = s.path("restored");
+    pando::backup::restore(&backup, &restored).unwrap();
+    let (listener, url) = bind();
+    let mut cfg = Config::new(&restored, &url);
+    cfg.compact_every = None;
+    cfg.gc_every = None;
+    serve_in_background(listener, pando::server::Server::new(cfg).unwrap().router());
+    let c = s.path("c");
+    lfs_git(
+        &config,
+        s.dir.path(),
+        None,
+        &[
+            "clone",
+            "-q",
+            &format!("{url}/repo.git"),
+            c.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(lfs_files(&c), lfs_files(&a));
+
+    // verify --full notices a corrupt object.
+    let oid = sha256_hex(b"small\n");
+    let object = backup.join(format!(
+        "repos/repo.git/lfs/objects/{}/{}/{oid}",
+        &oid[..2],
+        &oid[2..4]
+    ));
+    std::fs::remove_file(&object).unwrap();
+    std::fs::write(&object, b"SMALL\n").unwrap();
+    assert!(pando::backup::verify(&backup, false).unwrap().is_empty());
+    let problems = pando::backup::verify(&backup, true).unwrap();
+    assert!(problems.iter().any(|p| p.contains(&oid)), "{problems:?}");
+}

@@ -7,6 +7,7 @@
 //! - `POST /<repo>.git/git-upload-pack`        fetch (see `upload.rs`)
 //! - `POST /<repo>.git/git-receive-pack`       push (see `receive.rs`)
 //! - `GET  /<repo>.git/pack/<hash>.pack`       stored packs (the local Express origin)
+//! - `/<repo>.git/info/lfs/...`                 Git LFS (see `lfs.rs`)
 
 use crate::auth::{Access, LiveAuth, UrlSigner};
 use crate::express::{self, Express};
@@ -454,6 +455,9 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
         }
         p if p.starts_with("/api/") => return crate::admin::handle(server, req).await,
         _ => {}
+    }
+    if let Some((repo, rest)) = crate::lfs::parse_path(&path) {
+        return crate::lfs::handle(server.clone(), repo, rest, req).await;
     }
     if method == Method::GET
         && let Some((repo, hash)) = express::parse_pack_path(&path)
