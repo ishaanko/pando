@@ -51,13 +51,20 @@ fn host_key(path: &Path) -> anyhow::Result<PrivateKey> {
         KeypairData::Ed25519(Ed25519Keypair::from_seed(&seed)),
         "pando host key",
     )?;
+    // Written whole and synced before it appears, so a crash cannot leave a torn key
+    // that would stop SSH from starting.
     use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
-        .open(path)?;
+        .open(&tmp)?;
     file.write_all(key.to_openssh(LineEnding::LF)?.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    crate::store::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
     tracing::info!("created SSH host key {}", path.display());
     Ok(key)
 }

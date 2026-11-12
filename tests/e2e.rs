@@ -2564,3 +2564,50 @@ fn auth_file_edits_apply_without_a_restart() {
     eventually("fixed file loaded", &|| works("tok-fixed"));
     assert!(works("tok-new"));
 }
+
+#[test]
+fn pushes_over_the_size_limit_are_refused_with_the_limit_named() {
+    let keys = TempDir::new().unwrap();
+    let (_, as_anyone) = ssh_key(keys.path(), "anyone");
+    let s = Server::start_configured(|cfg| cfg.max_push_bytes = 64 << 10);
+    let ssh_url = format!("{}/repo.git", start_ssh(&s.server));
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "small");
+    git(&a, &["push", "-q", &s.url, "main"]);
+
+    // 200 KiB that does not compress (xorshift).
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let noise: Vec<u8> = (0..200_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(a.join("noise.bin"), &noise).unwrap();
+    git(&a, &["add", "noise.bin"]);
+    git(&a, &["commit", "-qm", "big"]);
+    let err = git_fails(&a, &["push", &s.url, "main"]);
+    assert!(
+        err.contains("push limit of 64K (pando serve --max-push-size)"),
+        "{err}"
+    );
+    let out = git_ssh(&a, &as_anyone, &["push", &ssh_url, "main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("push limit of 64K (pando serve --max-push-size)"),
+        "{err}"
+    );
+
+    // Nothing moved, and a push under the limit still works.
+    git(&a, &["reset", "-q", "--hard", "HEAD~1"]);
+    let tip = commit(&a, "f", "still small");
+    git(&a, &["push", "-q", &s.url, "main"]);
+    assert_eq!(
+        git(&a, &["ls-remote", &s.url, "main"]).split('\t').next(),
+        Some(tip.as_str())
+    );
+}

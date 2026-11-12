@@ -212,9 +212,10 @@ impl Meta {
     /// first push fixes the trunk ref (see [`Meta::fix_trunk`]).
     pub fn open(path: impl AsRef<Path>, default_trunk: &str) -> rusqlite::Result<Meta> {
         let conn = Connection::open(path)?;
+        // FULL: a committed push survives power loss, not only a crash of this process.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS versions (

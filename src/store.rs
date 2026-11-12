@@ -1,11 +1,16 @@
 //! Blob storage for packs. Packs are immutable and keyed by their trailer hash, so a
 //! write is "stage, then rename into place", and readers never see partial packs.
 //! This stands in for an object store; nothing else in Pando touches pack bytes.
+//!
+//! Durability: every file is fsynced before its rename, and `packs/` after it. A pack's
+//! rename is durable before its index is written, and the index's before a write
+//! returns, so once a write returns its pack survives power loss and metadata may name
+//! it. Deletes are not synced: a pack that reappears after a crash is just garbage.
 
 use crate::object::Oid;
 use crate::pack::{self, IdxEntry};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,15 +22,16 @@ pub struct BlobStore {
 impl BlobStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<BlobStore> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("packs"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        create_dir_all(&root.join("packs"))?;
+        create_dir_all(&root.join("tmp"))?;
         Ok(BlobStore {
             root,
             staged: AtomicU64::new(0),
         })
     }
 
-    /// A fresh path to stream an incoming pack into before it is validated.
+    /// A fresh path to stream an incoming pack into before it is validated. Whoever
+    /// writes it must `sync_all` it before handing it to [`BlobStore::publish`].
     pub fn staging_path(&self) -> PathBuf {
         let n = self.staged.fetch_add(1, Ordering::Relaxed);
         self.root
@@ -45,31 +51,45 @@ impl BlobStore {
         self.idx_path(hash).exists()
     }
 
-    /// Move a validated staged pack into place along with its sidecar index. The index
-    /// is renamed last, so its presence means the pack is complete.
+    /// Move a validated, already synced staged pack into place along with its sidecar
+    /// index. The index is renamed last, so its presence means the pack is complete.
+    /// Both are durable when this returns.
     pub fn publish(&self, staged: &Path, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
         if self.has(hash) {
             return fs::remove_file(staged);
         }
-        fs::rename(staged, self.pack_path(hash))?;
+        self.install(staged, &self.pack_path(hash))?;
         self.write_idx(hash, idx)
     }
 
-    /// Store a pack built in memory (compaction output).
+    /// Store a pack built in memory (compaction output), durably.
     pub fn put(&self, hash: &Oid, bytes: &[u8], idx: &[IdxEntry]) -> io::Result<()> {
         if self.has(hash) {
             return Ok(());
         }
-        let tmp = self.staging_path();
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, self.pack_path(hash))?;
+        let tmp = self.stage(bytes)?;
+        self.install(&tmp, &self.pack_path(hash))?;
         self.write_idx(hash, idx)
     }
 
     fn write_idx(&self, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
+        let tmp = self.stage(&pack::encode_idx(idx))?;
+        self.install(&tmp, &self.idx_path(hash))
+    }
+
+    /// Write `bytes` to a fresh staging file and sync it.
+    fn stage(&self, bytes: &[u8]) -> io::Result<PathBuf> {
         let tmp = self.staging_path();
-        fs::write(&tmp, pack::encode_idx(idx))?;
-        fs::rename(&tmp, self.idx_path(hash))
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(tmp)
+    }
+
+    /// Rename a synced staging file into `packs/` and make the rename durable.
+    fn install(&self, tmp: &Path, dest: &Path) -> io::Result<()> {
+        fs::rename(tmp, dest)?;
+        sync_dir(&self.root.join("packs"))
     }
 
     pub fn read_pack(&self, hash: &Oid) -> io::Result<Vec<u8>> {
@@ -133,6 +153,35 @@ impl BlobStore {
         }
         Ok(())
     }
+}
+
+/// Flush a directory's entries (new names, renames) to disk.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// `fs::create_dir_all` that also makes every directory it creates survive power loss.
+/// Repositories are created by their first push, so their directories must be as
+/// durable as the pack and metadata inside them.
+pub fn create_dir_all(dir: &Path) -> io::Result<()> {
+    // The directories about to be created, deepest first.
+    let new: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .collect();
+    let Some(top) = new.last() else {
+        return Ok(());
+    };
+    fs::create_dir_all(dir)?;
+    let parent = top.parent().filter(|p| !p.as_os_str().is_empty());
+    for d in new
+        .iter()
+        .copied()
+        .chain([parent.unwrap_or(Path::new("."))])
+    {
+        sync_dir(d)?;
+    }
+    Ok(())
 }
 
 /// Memory-map a file that nobody modifies while it is mapped.

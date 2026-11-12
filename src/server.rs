@@ -69,6 +69,8 @@ pub struct Config {
     pub webhooks: Vec<String>,
     /// Signs webhook bodies when set.
     pub webhook_secret: Option<String>,
+    /// Largest pack a push may send, in bytes.
+    pub max_push_bytes: u64,
 }
 
 impl Config {
@@ -88,6 +90,7 @@ impl Config {
             url_secret: None,
             webhooks: Vec::new(),
             webhook_secret: None,
+            max_push_bytes: 2 << 30,
         }
     }
 }
@@ -117,7 +120,7 @@ pub struct Server {
 
 impl Server {
     pub fn new(mut cfg: Config) -> anyhow::Result<Arc<Server>> {
-        std::fs::create_dir_all(cfg.data.join("repos"))?;
+        crate::store::create_dir_all(&cfg.data.join("repos"))?;
         cfg.public_url = cfg.public_url.trim_end_matches('/').to_string();
         for node in &mut cfg.express {
             *node = node.trim_end_matches('/').to_string();
@@ -291,7 +294,7 @@ impl Server {
         if !dir.exists() && !create {
             return Ok(None);
         }
-        std::fs::create_dir_all(&dir)?;
+        crate::store::create_dir_all(&dir)?;
         let repo = Arc::new(Repo {
             name: name.to_string(),
             dir: dir.clone(),
