@@ -4,10 +4,13 @@
 //! learn every object id (resolving in-pack deltas), checks the trailer, and keeps a
 //! small sidecar index of `(offset, oid)` so the pack can later be served as-is or
 //! spliced into a larger pack without inflating it again.
+//!
+//! The repository's object format sets the width of everything id-shaped in a pack:
+//! the trailer (SHA-1 or SHA-256 of the bytes before it), ref-delta bases and tree
+//! entries, and the ids in the sidecar.
 
-use crate::object::{Kind, Oid, commit_parents, tag_target};
+use crate::object::{Format, Kind, Oid, commit_parents, object_hasher, tag_target};
 use flate2::{Decompress, FlushDecompress, Status};
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
@@ -68,63 +71,93 @@ pub struct ParsedPack {
 /// submodule links) and tag (target), with ids interned as `u32` and all edges in one
 /// array. Real histories have tens of millions of tree entries; at 4 bytes each with
 /// no per-object allocation, a large import stays in hundreds of megabytes.
-#[derive(Default)]
 struct Graph {
     ids: Vec<Oid>,
-    index: HashMap<Oid, u32>,
+    index: Index,
     in_pack: Vec<bool>,
     /// `edges[start..start + len]` for each node.
     spans: Vec<(u32, u32)>,
     edges: Vec<u32>,
 }
 
+/// Positions in `Graph::ids`, keyed by raw ids of the pack's format. Plain arrays
+/// keep the map as small and fast as before SHA-256 support (an `Oid` key is 33
+/// bytes and slowed a large import's parse by a tenth).
+enum Index {
+    Sha1(HashMap<[u8; 20], u32>),
+    Sha256(HashMap<[u8; 32], u32>),
+}
+
 impl Graph {
-    fn intern(&mut self, oid: Oid) -> u32 {
-        if let Some(&i) = self.index.get(&oid) {
-            return i;
+    fn new(format: Format) -> Graph {
+        Graph {
+            ids: Vec::new(),
+            index: match format {
+                Format::Sha1 => Index::Sha1(HashMap::new()),
+                Format::Sha256 => Index::Sha256(HashMap::new()),
+            },
+            in_pack: Vec::new(),
+            spans: Vec::new(),
+            edges: Vec::new(),
         }
-        let i = self.ids.len() as u32;
-        self.ids.push(oid);
-        self.in_pack.push(false);
-        self.spans.push((0, 0));
-        self.index.insert(oid, i);
+    }
+
+    /// The position of `oid`, added if new. It must be in the pack's format (see
+    /// `object_refs`).
+    fn intern(&mut self, oid: Oid) -> u32 {
+        let next = self.ids.len() as u32;
+        let i = match &mut self.index {
+            Index::Sha1(m) => intern_in(m, &oid, next),
+            Index::Sha256(m) => intern_in(m, &oid, next),
+        };
+        if i == next {
+            self.ids.push(oid);
+            self.in_pack.push(false);
+            self.spans.push((0, 0));
+        }
         i
     }
 
-    fn add_object(&mut self, oid: Oid) {
-        let i = self.intern(oid);
-        self.in_pack[i as usize] = true;
+    fn get(&self, oid: &Oid) -> Option<u32> {
+        match (&self.index, oid) {
+            (Index::Sha1(m), Oid::Sha1(k)) => m.get(k).copied(),
+            (Index::Sha256(m), Oid::Sha256(k)) => m.get(k).copied(),
+            _ => None,
+        }
     }
 
-    fn set_refs(&mut self, oid: Oid, refs: &[Oid]) {
-        let i = self.intern(oid) as usize;
+    /// Record the outgoing references of interned object `i`.
+    fn set_refs(&mut self, i: u32, refs: &[Oid]) {
         let start = self.edges.len() as u32;
         for r in refs {
             let r = self.intern(*r);
             self.edges.push(r);
         }
-        self.spans[i] = (start, refs.len() as u32);
+        self.spans[i as usize] = (start, refs.len() as u32);
     }
 
     fn refs(&self, i: u32) -> &[u32] {
         let (start, len) = self.spans[i as usize];
         &self.edges[start as usize..(start + len) as usize]
     }
+}
 
-    fn refs_of(&self, oid: &Oid) -> Vec<Oid> {
-        self.index
-            .get(oid)
-            .map(|&i| self.refs(i).iter().map(|&r| self.ids[r as usize]).collect())
-            .unwrap_or_default()
+/// `oid`'s position in `m`, or `next` once recorded as its position. A function of
+/// its own so the hot lookup works on a plain array key.
+fn intern_in<const N: usize>(m: &mut HashMap<[u8; N], u32>, oid: &Oid, next: u32) -> u32 {
+    let k: [u8; N] = oid.as_bytes().try_into().expect("id in the pack's format");
+    if let Some(&i) = m.get(&k) {
+        return i;
     }
+    m.insert(k, next);
+    next
 }
 
 impl ParsedPack {
     pub fn contains(&self, oid: &Oid) -> bool {
         self.graph
-            .index
             .get(oid)
-            .is_some_and(|&i| self.graph.in_pack[i as usize])
+            .is_some_and(|i| self.graph.in_pack[i as usize])
     }
 
     /// Follow a chain of annotated tags in this pack to the first non-tag object.
@@ -160,10 +193,7 @@ impl ParsedPack {
     pub fn reachable_objects(&self, tips: impl IntoIterator<Item = Oid>) -> Vec<Oid> {
         let g = &self.graph;
         let mut seen = vec![false; g.ids.len()];
-        let mut stack: Vec<u32> = tips
-            .into_iter()
-            .filter_map(|t| g.index.get(&t).copied())
-            .collect();
+        let mut stack: Vec<u32> = tips.into_iter().filter_map(|t| g.get(&t)).collect();
         let mut out = Vec::new();
         while let Some(i) = stack.pop() {
             if seen[i as usize] || !g.in_pack[i as usize] {
@@ -191,9 +221,10 @@ impl ParsedPack {
     }
 }
 
-/// Outgoing references of an object, parsed from its contents.
-fn object_refs(kind: Kind, data: &[u8]) -> Result<Vec<Oid>, PackError> {
-    Ok(match kind {
+/// Outgoing references of an object, parsed from its contents. Every one must be an
+/// id in the repository's `format`.
+fn object_refs(format: Format, kind: Kind, data: &[u8]) -> Result<Vec<Oid>, PackError> {
+    let refs = match kind {
         Kind::Commit => {
             let tree =
                 crate::object::commit_tree(data).ok_or_else(|| bad("commit without tree"))?;
@@ -202,14 +233,23 @@ fn object_refs(kind: Kind, data: &[u8]) -> Result<Vec<Oid>, PackError> {
             refs
         }
         Kind::Tag => vec![tag_target(data).ok_or_else(|| bad("tag without object line"))?],
-        Kind::Tree => crate::object::tree_entries(data)
+        Kind::Tree => crate::object::tree_entries(format, data)
             .ok_or_else(|| bad("malformed tree"))?
             .into_iter()
             .filter(|(mode, _)| *mode != crate::object::GITLINK_MODE)
             .map(|(_, oid)| oid)
             .collect(),
         Kind::Blob => Vec::new(),
-    })
+    };
+    match refs.iter().find(|r| r.format() != format) {
+        Some(r) => Err(bad(format!(
+            "{} {} names {r}, not a {} id",
+            kind.name(),
+            Oid::for_object(format, kind, data),
+            format.name()
+        ))),
+        None => Ok(refs),
+    }
 }
 
 /// A parsed object header: type code, inflated size, header length, delta base.
@@ -226,7 +266,7 @@ pub(crate) enum Base {
     Oid(Oid),
 }
 
-pub(crate) fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError> {
+pub(crate) fn read_header(format: Format, buf: &[u8], offset: usize) -> Result<Header, PackError> {
     let mut pos = offset;
     let byte = |pos: usize| {
         buf.get(pos)
@@ -254,8 +294,9 @@ pub(crate) fn read_header(buf: &[u8], offset: usize) -> Result<Header, PackError
             Base::Offset(base.ok_or_else(|| bad("delta base offset out of range"))?)
         }
         REF_DELTA => {
-            let oid = buf.get(pos..pos + 20).and_then(Oid::from_slice);
-            pos += 20;
+            let end = pos + format.raw_len();
+            let oid = buf.get(pos..end).and_then(|b| format.oid_from_bytes(b));
+            pos = end;
             Base::Oid(oid.ok_or_else(|| bad("truncated ref-delta base"))?)
         }
         1..=4 => Base::None,
@@ -316,7 +357,12 @@ fn inflate_with(
 /// Copy exactly one pack from a stream that may continue after it (SSH keeps the
 /// connection open for the status report). Objects are inflated only to find where
 /// each one ends; [`parse`] validates them afterwards. Fails past `limit` bytes.
-pub fn copy_stream(r: &mut dyn BufRead, w: &mut dyn Write, limit: u64) -> Result<u64, PackError> {
+pub fn copy_stream(
+    format: Format,
+    r: &mut dyn BufRead,
+    w: &mut dyn Write,
+    limit: u64,
+) -> Result<u64, PackError> {
     let mut copied = 0u64;
     let take = |r: &mut dyn BufRead, n: usize| -> Result<Vec<u8>, PackError> {
         let mut buf = vec![0u8; n];
@@ -354,7 +400,7 @@ pub fn copy_stream(r: &mut dyn BufRead, w: &mut dyn Write, limit: u64) -> Result
                     break;
                 }
             },
-            REF_DELTA => emit(w, &take(r, 20)?)?,
+            REF_DELTA => emit(w, &take(r, format.raw_len())?)?,
             1..=4 => {}
             _ => return Err(bad(format!("unknown object type {code}"))),
         }
@@ -376,20 +422,21 @@ pub fn copy_stream(r: &mut dyn BufRead, w: &mut dyn Write, limit: u64) -> Result
             }
         }
     }
-    emit(w, &take(r, 20)?)?;
+    emit(w, &take(r, format.raw_len())?)?;
     Ok(copied)
 }
 
-/// Decode a whole pack: verify the trailer, resolve deltas inside the pack, compute
-/// every object id, and record each object's outgoing references. Deltas against
+/// Decode a whole pack of a repository in `format`: verify the trailer, resolve deltas
+/// inside the pack, compute every object id, and record each object's outgoing
+/// references (which must be ids in `format` too). Deltas against
 /// objects outside the pack are rejected, because a stored pack must be indexable on
 /// its own when a client downloads it.
 ///
 /// Memory stays bounded by delta chains, not pack size: the first pass streams every
 /// object through a fixed buffer (hashing whole objects as it goes), and the second
 /// re-inflates only delta bases, depth first, dropping each once its chain is done.
-pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
-    if buf.len() < 32 || &buf[..4] != b"PACK" {
+pub fn parse(format: Format, buf: &[u8]) -> Result<ParsedPack, PackError> {
+    if buf.len() < 12 + format.raw_len() || &buf[..4] != b"PACK" {
         return Err(bad("missing PACK signature"));
     }
     let version = u32::from_be_bytes(buf[4..8].try_into().unwrap());
@@ -397,37 +444,45 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
         return Err(bad(format!("unsupported pack version {version}")));
     }
     let count = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
-    let body_end = buf.len() - 20;
-    if Sha1::digest(&buf[..body_end]).as_slice() != &buf[body_end..] {
+    let body_end = buf.len() - format.raw_len();
+    let mut trailer = format.hasher();
+    trailer.update(&buf[..body_end]);
+    let hash = trailer.finish();
+    if hash.as_bytes() != &buf[body_end..] {
         return Err(PackError::Checksum);
     }
-    let hash = Oid::from_slice(&buf[body_end..]).unwrap();
     let body = &buf[..body_end];
 
+    // Per-object state is kept small (ids live once, interned in the graph): a large
+    // import has millions of objects.
     struct Raw {
         offset: u64,
         data_at: usize,
         size: usize,
-        base: Base,
     }
     let mut raws: Vec<Raw> = Vec::with_capacity(count.min(MAX_PREALLOC / 64));
-    let mut resolved: Vec<Option<(Kind, Oid)>> = Vec::with_capacity(raws.capacity());
-    let mut graph = Graph::default();
+    // Each object's kind and interned id, once known.
+    let mut resolved: Vec<Option<(Kind, u32)>> = Vec::with_capacity(raws.capacity());
+    let mut graph = Graph::new(format);
     let mut budget = MIN_INFLATED_BUDGET.max(buf.len().saturating_mul(INFLATE_RATIO));
+    // Deltas waiting for their base, by the base's position or id.
+    let mut by_offset: HashMap<u64, usize> = HashMap::new();
+    let mut children_by_index: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut children_by_oid: HashMap<Oid, Vec<usize>> = HashMap::new();
 
     // Pass 1: find object boundaries; hash whole objects while streaming them.
     let mut pos = 12;
-    for _ in 0..count {
+    for i in 0..count {
         if pos >= body_end {
             return Err(bad("pack ends before its object count"));
         }
-        let h = read_header(body, pos)?;
+        let h = read_header(format, body, pos)?;
         budget = budget.checked_sub(h.size).ok_or(PackError::TooLarge)?;
         let data_at = pos + h.len;
         let kind = Kind::from_code(h.code);
         let used = match (kind, &h.base) {
             (Some(kind), Base::None) => {
-                let mut sha = object_hasher(kind, h.size);
+                let mut sha = object_hasher(format, kind, h.size);
                 // Keep the bytes only for objects whose references we need.
                 let mut keep = (kind != Kind::Blob).then(Vec::new);
                 let used = inflate_with(&body[data_at..], h.size, |c| {
@@ -436,11 +491,11 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
                         k.extend_from_slice(c);
                     }
                 })?;
-                let oid = Oid(sha.finalize().into());
+                let gi = graph.intern(sha.finish());
                 if let Some(data) = keep {
-                    graph.set_refs(oid, &object_refs(kind, &data)?);
+                    graph.set_refs(gi, &object_refs(format, kind, &data)?);
                 }
-                resolved.push(Some((kind, oid)));
+                resolved.push(Some((kind, gi)));
                 used
             }
             _ => {
@@ -448,28 +503,8 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
                 inflate_with(&body[data_at..], h.size, |_| {})?
             }
         };
-        raws.push(Raw {
-            offset: pos as u64,
-            data_at,
-            size: h.size,
-            base: h.base,
-        });
-        pos = data_at + used;
-    }
-    if pos != body_end {
-        return Err(bad("trailing bytes after last object"));
-    }
-
-    // Pass 2: resolve deltas depth first from each base.
-    let by_offset: HashMap<u64, usize> = raws
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.offset, i))
-        .collect();
-    let mut children_by_index: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut children_by_oid: HashMap<Oid, Vec<usize>> = HashMap::new();
-    for (i, r) in raws.iter().enumerate() {
-        match r.base {
+        // An offset delta's base comes earlier in the pack, so it is known by now.
+        match h.base {
             Base::None => {}
             Base::Offset(off) => {
                 let base = *by_offset
@@ -479,7 +514,20 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             }
             Base::Oid(oid) => children_by_oid.entry(oid).or_default().push(i),
         }
+        by_offset.insert(pos as u64, i);
+        raws.push(Raw {
+            offset: pos as u64,
+            data_at,
+            size: h.size,
+        });
+        pos = data_at + used;
     }
+    drop(by_offset);
+    if pos != body_end {
+        return Err(bad("trailing bytes after last object"));
+    }
+
+    // Pass 2: resolve deltas depth first from each base.
     let mut take_children = |i: usize, oid: &Oid| -> Vec<usize> {
         let mut kids = children_by_index.remove(&i).unwrap_or_default();
         kids.extend(children_by_oid.remove(oid).unwrap_or_default());
@@ -489,8 +537,8 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     // Each pending delta carries its base's bytes and kind; a delta has its base's kind.
     let mut stack: Vec<(usize, Rc<Vec<u8>>, Kind)> = Vec::new();
     for root in roots {
-        let (kind, oid) = resolved[root].unwrap();
-        let kids = take_children(root, &oid);
+        let (kind, gi) = resolved[root].unwrap();
+        let kids = take_children(root, &graph.ids[gi as usize]);
         if kids.is_empty() {
             continue;
         }
@@ -506,11 +554,12 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
             let data = apply_delta(&base, &delta)?;
             drop(base);
             budget = budget.checked_sub(data.len()).ok_or(PackError::TooLarge)?;
-            let oid = Oid::for_object(kind, &data);
+            let oid = Oid::for_object(format, kind, &data);
+            let gi = graph.intern(oid);
             if kind != Kind::Blob {
-                graph.set_refs(oid, &object_refs(kind, &data)?);
+                graph.set_refs(gi, &object_refs(format, kind, &data)?);
             }
-            resolved[k] = Some((kind, oid));
+            resolved[k] = Some((kind, gi));
             let kids = take_children(k, &oid);
             if !kids.is_empty() {
                 let data = Rc::new(data);
@@ -527,19 +576,22 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
     let mut commits = HashMap::new();
     let mut tags = HashMap::new();
     for (r, res) in raws.iter().zip(&resolved) {
-        let (kind, oid) = res.unwrap();
+        let (kind, gi) = res.unwrap();
+        let oid = graph.ids[gi as usize];
         entries.push(IdxEntry {
             offset: r.offset,
             oid,
         });
-        graph.add_object(oid);
+        graph.in_pack[gi as usize] = true;
+        let refs = graph.refs(gi);
         match kind {
             // Commit refs are [tree, parents...]; tag refs are [target].
             Kind::Commit => {
-                commits.insert(oid, graph.refs_of(&oid)[1..].to_vec());
+                let parents = refs[1..].iter().map(|&r| graph.ids[r as usize]);
+                commits.insert(oid, parents.collect());
             }
             Kind::Tag => {
-                tags.insert(oid, graph.refs_of(&oid)[0]);
+                tags.insert(oid, graph.ids[refs[0] as usize]);
             }
             _ => {}
         }
@@ -551,13 +603,6 @@ pub fn parse(buf: &[u8]) -> Result<ParsedPack, PackError> {
         tags,
         graph,
     })
-}
-
-/// A SHA-1 primed with the loose-object header, ready for the object's bytes.
-fn object_hasher(kind: Kind, size: usize) -> Sha1 {
-    let mut sha = Sha1::new();
-    sha.update(format!("{} {size}\0", kind.name()).as_bytes());
-    sha
 }
 
 /// Apply a Git delta (copy/insert instruction stream) to `base`.
@@ -631,35 +676,37 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
     Ok(out)
 }
 
-/// Serialize a sidecar index: entries in pack order, 28 bytes each.
+/// Serialize a sidecar index: entries in pack order, each an offset and an id (28
+/// bytes for SHA-1, 40 for SHA-256; the pack's name says which).
 pub fn encode_idx(entries: &[IdxEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + entries.len() * 28);
+    let width = 8 + entries.first().map_or(0, |e| e.oid.as_bytes().len());
+    let mut out = Vec::with_capacity(8 + entries.len() * width);
     out.extend_from_slice(b"PIDX");
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for e in entries {
         out.extend_from_slice(&e.offset.to_be_bytes());
-        out.extend_from_slice(&e.oid.0);
+        out.extend_from_slice(e.oid.as_bytes());
     }
     out
 }
 
-pub fn decode_idx(buf: &[u8]) -> io::Result<Vec<IdxEntry>> {
+/// Read a sidecar index of a pack in `format`.
+pub fn decode_idx(format: Format, buf: &[u8]) -> io::Result<Vec<IdxEntry>> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "bad pack sidecar index");
     if buf.len() < 8 || &buf[..4] != b"PIDX" {
         return Err(invalid());
     }
     let n = u32::from_be_bytes(buf[4..8].try_into().unwrap()) as usize;
     let body = &buf[8..];
-    if body.len() != n * 28 {
+    let width = 8 + format.raw_len();
+    if body.len() != n * width {
         return Err(invalid());
     }
     Ok(body
-        .as_chunks::<28>()
-        .0
-        .iter()
+        .chunks_exact(width)
         .map(|c| IdxEntry {
             offset: u64::from_be_bytes(c[..8].try_into().unwrap()),
-            oid: Oid::from_slice(&c[8..]).unwrap(),
+            oid: format.oid_from_bytes(&c[8..]).unwrap(),
         })
         .collect())
 }
@@ -668,24 +715,26 @@ pub fn decode_idx(buf: &[u8]) -> io::Result<Vec<IdxEntry>> {
 /// appended without buffering the pack.
 pub struct HashingWriter<W: Write> {
     inner: W,
-    sha: Sha1,
+    sha: crate::object::Hasher,
     pub written: u64,
 }
 
 impl<W: Write> HashingWriter<W> {
-    pub fn new(inner: W) -> Self {
+    /// A writer for a pack whose trailer is a hash in `format`.
+    pub fn new(format: Format, inner: W) -> Self {
         HashingWriter {
             inner,
-            sha: Sha1::new(),
+            sha: format.hasher(),
             written: 0,
         }
     }
 
     /// Write the trailer and return the pack hash plus the inner writer.
-    pub fn finish(mut self) -> io::Result<(Oid, W)> {
-        let hash = Oid(self.sha.finalize_reset().into());
-        self.inner.write_all(&hash.0)?;
-        Ok((hash, self.inner))
+    pub fn finish(self) -> io::Result<(Oid, W)> {
+        let HashingWriter { mut inner, sha, .. } = self;
+        let hash = sha.finish();
+        inner.write_all(hash.as_bytes())?;
+        Ok((hash, inner))
     }
 }
 
@@ -740,8 +789,8 @@ fn encode_ofs(mut dist: u64, out: &mut Vec<u8>) {
 }
 
 /// The smallest valid pack: header with zero objects plus trailer.
-pub fn empty_pack() -> Vec<u8> {
-    let mut w = HashingWriter::new(Vec::new());
+pub fn empty_pack(format: Format) -> Vec<u8> {
+    let mut w = HashingWriter::new(format, Vec::new());
     w.write_all(b"PACK\0\0\0\x02\0\0\0\0").unwrap();
     w.finish().unwrap().1
 }
@@ -754,8 +803,10 @@ pub fn empty_pack() -> Vec<u8> {
 /// compaction covers and for inline fetch responses to clients without packfile-uris.
 ///
 /// Output streams to `out`. Memory grows with the number of objects (the input and
-/// returned indexes, plus about 40 bytes each), never with their size.
+/// returned indexes, plus about 40 bytes each), never with their size. The packs
+/// all belong to one repository, in `format`.
 pub fn concat<W: Write>(
+    format: Format,
     packs: &[(&[u8], &[IdxEntry])],
     out: W,
 ) -> io::Result<(Oid, Vec<IdxEntry>, W)> {
@@ -768,7 +819,7 @@ pub fn concat<W: Write>(
     }
     let total = u32::try_from(first.len()).map_err(|_| io::Error::other("too many objects"))?;
 
-    let mut w = HashingWriter::new(out);
+    let mut w = HashingWriter::new(format, out);
     w.write_all(b"PACK\0\0\0\x02")?;
     w.write_all(&total.to_be_bytes())?;
     // Each entry's offset in the new pack, by input pack (u64::MAX where dropped).
@@ -777,13 +828,13 @@ pub fn concat<W: Write>(
     let mut head = Vec::with_capacity(32);
     for (p, (buf, idx)) in packs.iter().enumerate() {
         let mut offsets = vec![u64::MAX; idx.len()];
-        let body_end = buf.len() as u64 - 20;
+        let body_end = (buf.len() - format.raw_len()) as u64;
         for (i, e) in idx.iter().enumerate() {
             if first[&e.oid] != (p as u32, i as u32) {
                 continue;
             }
             let end = idx.get(i + 1).map_or(body_end, |n| n.offset);
-            let h = read_header(buf, e.offset as usize).map_err(io::Error::other)?;
+            let h = read_header(format, buf, e.offset as usize).map_err(io::Error::other)?;
             let data = &buf[e.offset as usize + h.len..end as usize];
             let here = w.written; // offset within the new pack (header included)
             head.clear();
@@ -831,13 +882,20 @@ mod tests {
 
     #[test]
     fn empty_pack_parses() {
-        let p = parse(&empty_pack()).unwrap();
-        assert!(p.entries.is_empty());
+        for format in [Format::Sha1, Format::Sha256] {
+            let pack = empty_pack(format);
+            assert_eq!(pack.len(), 12 + format.raw_len());
+            assert!(parse(format, &pack).unwrap().entries.is_empty());
+        }
+        assert!(matches!(
+            parse(Format::Sha256, &empty_pack(Format::Sha1)),
+            Err(PackError::Malformed(_))
+        ));
     }
 
     /// A pack around `objects` with a correct header count and trailer.
     fn wrap(count: u32, objects: &[u8]) -> Vec<u8> {
-        let mut w = HashingWriter::new(Vec::new());
+        let mut w = HashingWriter::new(Format::Sha1, Vec::new());
         w.write_all(b"PACK\0\0\0\x02").unwrap();
         w.write_all(&count.to_be_bytes()).unwrap();
         w.write_all(objects).unwrap();
@@ -850,7 +908,10 @@ mod tests {
         let mut obj = Vec::new();
         encode_type_size(3, 1 << 50, &mut obj);
         obj.extend_from_slice(&[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
-        assert!(matches!(parse(&wrap(1, &obj)), Err(PackError::TooLarge)));
+        assert!(matches!(
+            parse(Format::Sha1, &wrap(1, &obj)),
+            Err(PackError::TooLarge)
+        ));
 
         // A delta declaring a 2^50-byte result.
         let delta = [0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
@@ -860,7 +921,7 @@ mod tests {
         let mut obj = Vec::new();
         encode_type_size(REF_DELTA, 5, &mut obj);
         obj.extend_from_slice(&[1, 2, 3, 4, 5]);
-        assert!(parse(&wrap(1, &obj)).is_err());
+        assert!(parse(Format::Sha1, &wrap(1, &obj)).is_err());
     }
 
     #[test]

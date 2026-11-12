@@ -15,10 +15,9 @@
 //! Both commands fsync everything they wrote before reporting success.
 
 use crate::meta::Meta;
-use crate::object::Oid;
+use crate::object::{Format, Oid};
 use crate::server::repo_names;
 use crate::store::{BlobStore, map_file, sync_dir};
-use sha1::{Digest, Sha1};
 use std::fs;
 use std::path::Path;
 
@@ -73,7 +72,8 @@ pub fn backup(data: &Path, out: &Path) -> anyhow::Result<Summary> {
                     let _ = fs::remove_file(dst.join(format!("blobs/packs/{hash}.{ext}")));
                 }
             }
-            let mut meta = Meta::open(dst.join("meta.db"), "refs/heads/main")?;
+            // The snapshot exists, so it keeps its own object format.
+            let mut meta = Meta::open(dst.join("meta.db"), "refs/heads/main", Format::Sha1)?;
             let store = BlobStore::open(dst.join("blobs"))?;
             crate::gc::drop_packs(&mut meta, &store, &skipped)
                 .map_err(|e| anyhow::anyhow!("{name}: {e:#}"))?;
@@ -131,7 +131,7 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
     let mut problems = Vec::new();
     for name in repo_names(data)? {
         let dir = data.join("repos").join(format!("{name}.git"));
-        let mut meta = Meta::open(dir.join("meta.db"), "refs/heads/main")?;
+        let mut meta = Meta::open(dir.join("meta.db"), "refs/heads/main", Format::Sha1)?;
         let store = BlobStore::open(dir.join("blobs"))?;
         let mut known: Vec<Oid> = meta
             .conn()
@@ -141,6 +141,9 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
             .collect();
         known.sort();
         for hash in known {
+            if hash.format() != meta.format {
+                problems.push(format!("{name}: pack {hash} is not {}", meta.format.name()));
+            }
             if !store.has(&hash) || !store.pack_path(&hash).exists() {
                 problems.push(format!("{name}: pack {hash} is missing"));
                 continue;
@@ -174,12 +177,16 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
 }
 
 /// A pack's trailer matches its contents and its name, and its index matches it.
+/// The name says which hash the trailer is.
 fn check_pack(store: &BlobStore, hash: &Oid) -> anyhow::Result<()> {
     let map = map_file(&store.pack_path(hash))?;
-    anyhow::ensure!(map.len() >= 32, "truncated");
-    let (body, trailer) = map.split_at(map.len() - 20);
+    let width = hash.format().raw_len();
+    anyhow::ensure!(map.len() >= 12 + width, "truncated");
+    let (body, trailer) = map.split_at(map.len() - width);
+    let mut sha = hash.format().hasher();
+    sha.update(body);
     anyhow::ensure!(
-        Sha1::digest(body).as_slice() == trailer && trailer == hash.0,
+        sha.finish() == *hash && trailer == hash.as_bytes(),
         "checksum mismatch"
     );
     let count = u32::from_be_bytes(body[8..12].try_into()?) as usize;

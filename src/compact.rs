@@ -296,7 +296,8 @@ fn build(store: &BlobStore, packs: &[Oid]) -> anyhow::Result<(Option<Oid>, Optio
             let parts: Vec<(&[u8], &[pack::IdxEntry])> =
                 loaded.iter().map(|(b, i)| (&b[..], i.as_slice())).collect();
             let (path, (hash, idx)) = store.stage(|out| {
-                let (hash, idx, _) = pack::concat(&parts, out)?;
+                // Parts of one repository's trunk share its format.
+                let (hash, idx, _) = pack::concat(packs[0].format(), &parts, out)?;
                 Ok((hash, idx))
             })?;
             Ok((Some(hash), Some((path, idx))))

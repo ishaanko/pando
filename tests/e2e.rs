@@ -2,7 +2,7 @@
 
 use axum::serve::ListenerExt;
 use pando::express::{self, Express, Origin};
-use pando::object::Oid;
+use pando::object::{Format, Oid};
 use pando::planner;
 use pando::server::{Advertise, Config, Repo};
 use std::path::{Path, PathBuf};
@@ -690,7 +690,7 @@ fn decoder_matches_git_on_deep_delta_chains() {
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|x| x == "pack"))
         .unwrap();
-    let parsed = pando::pack::parse(&std::fs::read(&pack).unwrap()).unwrap();
+    let parsed = pando::pack::parse(Format::Sha1, &std::fs::read(&pack).unwrap()).unwrap();
 
     let expected: std::collections::HashSet<Oid> = git(repo, &["rev-list", "--objects", "--all"])
         .lines()
@@ -2010,7 +2010,7 @@ fn admin_api_manages_repositories() {
     assert_eq!(code, 200);
     assert_eq!(
         body,
-        r#"[{"name":"repo","head":"refs/heads/main","refs":2},{"name":"team/x","head":"refs/heads/main","refs":2},{"name":"team/y","head":"refs/heads/main","refs":2}]"#
+        r#"[{"name":"repo","head":"refs/heads/main","refs":2,"object_format":"sha1"},{"name":"team/x","head":"refs/heads/main","refs":2,"object_format":"sha1"},{"name":"team/y","head":"refs/heads/main","refs":2,"object_format":"sha1"}]"#
     );
     let (_, body) = http("GET", &api(""), Some("tl"));
     assert!(
@@ -3697,7 +3697,7 @@ fn a_cover_left_pending_by_a_crash_is_finished_later() {
         .collect();
     let (path, (hash, idx)) = repo
         .store
-        .stage(|out| pando::pack::concat(&inputs, out).map(|(h, i, _)| (h, i)))
+        .stage(|out| pando::pack::concat(Format::Sha1, &inputs, out).map(|(h, i, _)| (h, i)))
         .unwrap();
     {
         let mut m = repo.meta.lock().unwrap();
@@ -3977,7 +3977,7 @@ fn objects_stored_as_deltas_against_trimmed_ones_are_written_whole() {
     let cover = trunk_pieces(&s, 69, 70)[0].clone();
     assert_eq!((cover.level, cover.start), (2, 65));
     {
-        let odb = pando::odb::Odb::open(&repo.store, &[cover.pack.unwrap()]).unwrap();
+        let odb = pando::odb::Odb::open(&repo.store, repo.format, &[cover.pack.unwrap()]).unwrap();
         assert_eq!(odb.raw_delta(&kept).map(|d| d.0), Some(base), "not a delta");
     }
 
@@ -3985,7 +3985,7 @@ fn objects_stored_as_deltas_against_trimmed_ones_are_written_whole() {
     assert_eq!(gc(&s, 0).trimmed, 1);
     let trimmed = trunk_pieces(&s, 69, 70)[0].pack.unwrap();
     {
-        let odb = pando::odb::Odb::open(&repo.store, &[trimmed]).unwrap();
+        let odb = pando::odb::Odb::open(&repo.store, repo.format, &[trimmed]).unwrap();
         assert!(odb.raw_whole(&kept).is_some() && !odb.contains(&base));
     }
     gc(&s, 0);
@@ -4348,5 +4348,560 @@ fn clones_get_the_largest_packs_by_uri_and_the_rest_inline() {
     assert!(
         deltas.contains(" 1 "),
         "inline pack holds deltas:\n{deltas}"
+    );
+}
+
+// SHA-256 repositories: one lifecycle per area, driven by git's own SHA-256 support.
+
+/// A server whose new repositories are SHA-256.
+fn sha256_server(configure: impl FnOnce(&mut Config)) -> Server {
+    Server::start_configured(|c| {
+        c.object_format = Format::Sha256;
+        configure(c);
+    })
+}
+
+/// An empty SHA-256 client repository, with `origin` at `url` if given.
+fn init_sha256(dir: &Path, url: Option<&str>) {
+    std::fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "--object-format=sha256"]);
+    if let Some(url) = url {
+        git(dir, &["remote", "add", "origin", url]);
+    }
+}
+
+/// A clone is SHA-256 and passes `git fsck --strict`.
+#[track_caller]
+fn check_sha256(repo: &Path) {
+    assert_eq!(git(repo, &["rev-parse", "--show-object-format"]), "sha256");
+    git(repo, &["fsck", "--strict", "--no-progress"]);
+}
+
+/// Raw POST of `body` to a smart HTTP endpoint; returns status and body.
+fn post(url: &str, content_type: &str, protocol: Option<&str>, body: Vec<u8>) -> (u16, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut req = pando::http_client()
+            .post(url)
+            .header("Content-Type", content_type)
+            .body(body);
+        if let Some(p) = protocol {
+            req = req.header("Git-Protocol", p);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    })
+}
+
+fn pkt(line: &str) -> String {
+    format!("{:04x}{line}", line.len() + 4)
+}
+
+#[test]
+fn sha256_push_and_clone_by_uri_through_signed_express_and_inline() {
+    let (node, node_url) = bind();
+    let s = sha256_server(|c| {
+        c.auth = Some(
+            pando::auth::Auth::parse("me sekrit write\n")
+                .unwrap()
+                .into(),
+        );
+        c.url_secret = Some("shared".into());
+        c.express = vec![node_url.clone()];
+    });
+    let origin = Origin::Remote {
+        base: s.base.clone(),
+        client: pando::http_client(),
+    };
+    let signer = pando::auth::UrlSigner::new(b"shared");
+    let express = Express::new(origin, Some(s.path("express")), Some(signer)).unwrap();
+    serve_in_background(node, express::router(Arc::new(express)));
+    let hook_out = s.path("hook-stdin");
+    write_hook(
+        &s.dir.path().join("data/hooks/post-receive"),
+        &format!("#!/bin/sh\ncat >> {}\n", hook_out.display()),
+    );
+
+    let authed = s.url.replacen("http://", "http://me:sekrit@", 1);
+    let a = s.path("a");
+    init_sha256(&a, Some(&authed));
+    for i in 0..3 {
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["push", "-q", "origin", "main"]);
+    let head = git(&a, &["rev-parse", "HEAD"]);
+    assert_eq!(head.len(), 64);
+    // Hooks see 64-hex ids, the zero id included.
+    assert_eq!(
+        std::fs::read_to_string(&hook_out).unwrap(),
+        format!("{} {head} refs/heads/main\n", "0".repeat(64))
+    );
+
+    let repo = s.repo();
+    assert_eq!(repo.format, Format::Sha256);
+    let pack = repo
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_head()
+        .unwrap()
+        .unwrap()
+        .pack;
+    let pack = pack.unwrap();
+    assert_eq!(pack.format(), Format::Sha256);
+    assert_eq!(repo.store.read_idx(&pack).unwrap().len(), 9);
+
+    let by_uri = s.path("by-uri");
+    let inline = s.path("inline");
+    git(
+        s.dir.path(),
+        &[
+            "-c",
+            "fetch.uriprotocols=http",
+            "clone",
+            "-q",
+            &authed,
+            by_uri.to_str().unwrap(),
+        ],
+    );
+    git(
+        s.dir.path(),
+        &["clone", "-q", &authed, inline.to_str().unwrap()],
+    );
+    for c in [&by_uri, &inline] {
+        check_sha256(c);
+        assert_eq!(git(c, &["rev-parse", "HEAD"]), head);
+    }
+    assert!(downloaded_pack_names(&by_uri).contains(&pack.hex()));
+    assert!(s.path("express").join(format!("{pack}.pack")).exists());
+
+    // Express refuses unsigned URLs; signatures cover the 64-hex name.
+    let url = format!("{node_url}/repo.git/pack/{pack}.pack");
+    let status = |u: String| http("GET", &u, None).0;
+    assert_eq!(status(url.clone()), 401);
+    assert_eq!(
+        status(format!("{url}?{}", s.server.signer.sign("repo", &pack))),
+        200
+    );
+
+    // Incremental fetches both ways.
+    commit(&a, "g", "more");
+    git(&a, &["push", "-q", "origin", "main"]);
+    git(
+        &by_uri,
+        &["-c", "fetch.uriprotocols=http", "pull", "-q", "--ff-only"],
+    );
+    git(&inline, &["pull", "-q", "--ff-only"]);
+    for c in [&by_uri, &inline] {
+        check_sha256(c);
+        assert_eq!(
+            git(c, &["rev-parse", "HEAD"]),
+            git(&a, &["rev-parse", "HEAD"])
+        );
+    }
+}
+
+#[test]
+fn sha256_over_protocol_v0_v1_and_ssh() {
+    let keys = TempDir::new().unwrap();
+    let (key, as_me) = ssh_key(keys.path(), "me");
+    let s = sha256_server(|c| {
+        c.auth = Some(
+            pando::auth::Auth::parse(&format!("me {key} write\n"))
+                .unwrap()
+                .into(),
+        );
+        c.public_read = true;
+    });
+    let ssh = format!("{}/repo.git", start_ssh(&s.server));
+    // The SSH push creates the repository, in the server's default format.
+    let a = s.path("a");
+    init_sha256(&a, None);
+    commit(&a, "f", "1");
+    git(&a, &["checkout", "-qb", "topic"]);
+    commit(&a, "t", "1");
+    git(&a, &["checkout", "-q", "main"]);
+    git_ssh_ok(&a, &as_me, &["push", "-q", &ssh, "main", "topic"]);
+    assert_eq!(s.repo().format, Format::Sha256);
+
+    let over_ssh = s.path("ssh");
+    git_ssh_ok(
+        s.dir.path(),
+        &as_me,
+        &["clone", "-q", &ssh, over_ssh.to_str().unwrap()],
+    );
+    check_sha256(&over_ssh);
+    commit(&over_ssh, "f", "2");
+    git_ssh_ok(&over_ssh, &as_me, &["push", "-q", "origin", "main"]);
+    // A force push over SSH.
+    git(&over_ssh, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&over_ssh, "f", "3");
+    git_ssh_ok(&over_ssh, &as_me, &["push", "-qf", "origin", "main"]);
+
+    for v in ["0", "1"] {
+        let c = clone_with(&s, &format!("v{v}"), v, &[]);
+        check_sha256(&c);
+        assert_eq!(
+            git(&c, &["rev-parse", "HEAD"]),
+            git(&over_ssh, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(count(&c, "origin/topic"), 2);
+        // An incremental v0 fetch negotiates with 64-hex haves.
+        commit(&over_ssh, "f", &format!("after v{v}"));
+        git_ssh_ok(&over_ssh, &as_me, &["push", "-q", "origin", "main"]);
+        git(
+            &c,
+            &[
+                "-c",
+                &format!("protocol.version={v}"),
+                "pull",
+                "-q",
+                "--ff-only",
+            ],
+        );
+        check_sha256(&c);
+        assert_eq!(
+            git(&c, &["rev-parse", "HEAD"]),
+            git(&over_ssh, &["rev-parse", "HEAD"])
+        );
+    }
+}
+
+#[test]
+fn sha256_shallow_and_partial_clones_and_the_fetch_cache() {
+    let s = sha256_server(|_| {});
+    let a = s.path("a");
+    init_sha256(&a, Some(&s.url));
+    std::fs::create_dir_all(a.join("d")).unwrap();
+    for i in 0..5 {
+        std::fs::write(a.join("d/big"), noise(i, 20_000)).unwrap();
+        git(&a, &["add", "d/big"]);
+        commit(&a, "f", &format!("v{i}"));
+    }
+    git(&a, &["push", "-q", "origin", "main"]);
+
+    for v in ["2", "0"] {
+        let shallow = clone_with(
+            &s,
+            &format!("shallow{v}"),
+            v,
+            &["--depth", "1", "--no-local"],
+        );
+        check_sha256(&shallow);
+        assert_eq!(count(&shallow, "HEAD"), 1);
+        let before = cache_counts(&s);
+        let again = clone_with(&s, &format!("again{v}"), v, &["--depth", "1"]);
+        check_sha256(&again);
+        let after = cache_counts(&s);
+        assert!(
+            after.0 > before.0 && after.1 == before.1,
+            "{before:?} {after:?}"
+        );
+        git(
+            &shallow,
+            &[
+                "-c",
+                &format!("protocol.version={v}"),
+                "fetch",
+                "-q",
+                "--deepen",
+                "2",
+            ],
+        );
+        check_sha256(&shallow);
+        assert_eq!(count(&shallow, "HEAD"), 3);
+        git(
+            &shallow,
+            &[
+                "-c",
+                &format!("protocol.version={v}"),
+                "fetch",
+                "-q",
+                "--unshallow",
+            ],
+        );
+        check_sha256(&shallow);
+        assert_eq!(count(&shallow, "HEAD"), 5);
+    }
+
+    let partial = clone_with(&s, "partial", "2", &["--filter=blob:none", "--no-checkout"]);
+    assert!(missing_objects(&partial) > 0);
+    // Checking out and reading history fetch the missing blobs on demand.
+    git(&partial, &["checkout", "-q", "main"]);
+    git(&partial, &["log", "-p", "-q"]);
+    let trees = clone_with(&s, "trees", "2", &["--filter=tree:0"]);
+    check_sha256(&trees);
+    check_sha256(&partial);
+    assert!(!cached_answers(&s).is_empty());
+}
+
+#[test]
+fn sha256_trunk_rewrite_compaction_and_gc_trim() {
+    let s = sha256_server(|_| {});
+    let a = s.path("a");
+    init_sha256(&a, Some(&s.url));
+    push_trunk(&s, &a, 100, &[]);
+    s.compact();
+    let p = trunk_pieces(&s, 74, 75)[0].clone();
+    assert_eq!((p.level, p.start, p.end), (2, 65, 80));
+    assert_eq!(p.pack.unwrap().format(), Format::Sha256);
+
+    // Drop 76..100, merge what is left, and trim the cover that straddles the cut.
+    rewrite_trunk(&s, &a, 75);
+    assert_eq!(s.compact(), 1);
+    let r = gc(&s, 0);
+    assert!(r.deleted > 0 && r.trimmed == 1, "{r:?}");
+    assert_eq!(gc(&s, 0).deleted, 1);
+    let fresh = clone(&s, "fresh", true);
+    check_sha256(&fresh);
+    assert_eq!(count(&fresh, "HEAD"), 76);
+    let inline = clone(&s, "inline", false);
+    check_sha256(&inline);
+    assert_clean(&s);
+}
+
+#[test]
+fn sha256_annotated_and_nested_tags_peel() {
+    let s = sha256_server(|_| {});
+    let a = s.path("a");
+    init_sha256(&a, Some(&s.url));
+    let c = commit(&a, "f", "1");
+    git(&a, &["tag", "-am", "one", "v1"]);
+    git(&a, &["tag", "-am", "of a tag", "outer", "v1"]);
+    git(&a, &["push", "-q", "origin", "main", "v1", "outer"]);
+    let remote = git(&a, &["ls-remote", "origin"]);
+    assert!(
+        remote.contains(&format!("{c}\trefs/tags/outer^{{}}")),
+        "{remote}"
+    );
+    for v in ["2", "0"] {
+        let b = clone_with(&s, &format!("b{v}"), v, &[]);
+        check_sha256(&b);
+        assert_eq!(git(&b, &["rev-parse", "outer^{commit}"]), c);
+        assert_eq!(git(&b, &["cat-file", "-t", "outer"]), "tag");
+    }
+}
+
+#[test]
+fn sha256_backup_restore_and_full_verify() {
+    let s = sha256_server(|_| {});
+    let a = s.path("a");
+    init_sha256(&a, Some(&s.url));
+    push_trunk(&s, &a, 6, &[]);
+    s.compact();
+    let backup = s.path("backup");
+    pando::backup::backup(&s.dir.path().join("data"), &backup).unwrap();
+    let restored = s.path("restored");
+    pando::backup::restore(&backup, &restored).unwrap();
+    assert_eq!(
+        pando::backup::verify(&restored, true).unwrap(),
+        Vec::<String>::new()
+    );
+
+    // A restored repository keeps its format, whatever the new server's default.
+    let (listener, url) = bind();
+    let mut cfg = Config::new(&restored, &url);
+    cfg.compact_every = None;
+    cfg.gc_every = None;
+    serve_in_background(listener, pando::server::Server::new(cfg).unwrap().router());
+    let c = s.path("c");
+    git(
+        s.dir.path(),
+        &[
+            "clone",
+            "-q",
+            &format!("{url}/repo.git"),
+            c.to_str().unwrap(),
+        ],
+    );
+    check_sha256(&c);
+    assert_eq!(count(&c, "HEAD"), 6);
+    commit(&c, "f", "after restore");
+    git(&c, &["push", "-q", "origin", "main"]);
+
+    // verify --full notices a corrupt SHA-256 pack.
+    let packs = restored.join("repos/repo.git/blobs/packs");
+    let victim = std::fs::read_dir(&packs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "pack"))
+        .unwrap();
+    let mut bytes = std::fs::read(&victim).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(&victim, bytes).unwrap();
+    let problems = pando::backup::verify(&restored, true).unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains("checksum")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn admin_api_creates_sha256_repositories_next_to_sha1_ones() {
+    let s = Server::start_configured(|c| {
+        c.auth = Some(pando::auth::Auth::parse("root ta admin\n").unwrap().into());
+    });
+    let api = |path: &str| format!("{}/api/repos{path}", s.base);
+    assert_eq!(
+        http("POST", &api("/new?object-format=sha256"), Some("ta")).0,
+        201
+    );
+    assert_eq!(
+        http("POST", &api("/new?object-format=sha256"), Some("ta")).0,
+        409
+    );
+    assert_eq!(
+        http("POST", &api("/bad?object-format=md5"), Some("ta")).0,
+        400
+    );
+    assert_eq!(http("POST", &api("/old"), Some("ta")).0, 201);
+    let authed =
+        |repo: &str| format!("{}/{repo}.git", s.base).replace("http://", "http://root:ta@");
+
+    // An empty SHA-256 repository clones as one, over v2 (ls-refs unborn) and v0.
+    for v in ["2", "0"] {
+        let e = s.path(&format!("empty{v}"));
+        let p = format!("protocol.version={v}");
+        git(
+            s.dir.path(),
+            &["-c", &p, "clone", "-q", &authed("new"), e.to_str().unwrap()],
+        );
+        assert_eq!(git(&e, &["rev-parse", "--show-object-format"]), "sha256");
+    }
+    let e = s.path("empty2");
+    commit(&e, "f", "first");
+    git(&e, &["push", "-q", "origin", "main"]);
+
+    let one = s.path("one");
+    init(&one);
+    commit(&one, "f", "sha1");
+    git(&one, &["push", "-q", &authed("old"), "main"]);
+    git(&one, &["push", "-q", &authed("pushed"), "main"]);
+
+    let (_, list) = http("GET", &api(""), Some("ta"));
+    assert!(
+        list.contains(r#""name":"new","head":"refs/heads/main","refs":1,"object_format":"sha256""#),
+        "{list}"
+    );
+    assert!(
+        list.contains(r#""name":"old","head":"refs/heads/main","refs":1,"object_format":"sha1""#),
+        "{list}"
+    );
+    assert!(
+        list.contains(
+            r#""name":"pushed","head":"refs/heads/main","refs":1,"object_format":"sha1""#
+        ),
+        "{list}"
+    );
+    for (repo, format) in [("new", "sha256"), ("old", "sha1"), ("pushed", "sha1")] {
+        let c = s.path(&format!("c-{repo}"));
+        git(
+            s.dir.path(),
+            &["clone", "-q", &authed(repo), c.to_str().unwrap()],
+        );
+        assert_eq!(git(&c, &["rev-parse", "--show-object-format"]), format);
+        git(&c, &["fsck", "--strict", "--no-progress"]);
+    }
+}
+
+#[test]
+fn object_format_mismatches_are_refused_both_ways() {
+    let s = Server::start();
+    let one = s.path("one");
+    init(&one);
+    commit(&one, "f", "sha1");
+    let two = s.path("two");
+    init_sha256(&two, None);
+    commit(&two, "f", "sha256");
+
+    // A SHA-256 push to a SHA-1 server's new name is refused by git, and creates
+    // nothing; to an existing SHA-1 repository likewise.
+    let err = git_fails(
+        &two,
+        &["push", "-q", &format!("{}/fresh.git", s.base), "main"],
+    );
+    assert!(
+        err.contains("does not support this repository's hash algorithm"),
+        "{err}"
+    );
+    assert!(s.server.repo("fresh").unwrap().is_none());
+    git(&one, &["push", "-q", &s.url, "main"]);
+    let err = git_fails(&two, &["push", "-q", &s.url, "main"]);
+    assert!(err.contains("hash algorithm"), "{err}");
+    // A SHA-1 clone cannot fetch into a SHA-256 repository.
+    let err = git_fails(&two, &["fetch", "-q", &s.url, "main"]);
+    assert!(err.contains("mismatched algorithms"), "{err}");
+
+    // The other way round, on a SHA-256 repository.
+    assert!(s.server.create_repo("two", Format::Sha256).unwrap());
+    let url = format!("{}/two.git", s.base);
+    let err = git_fails(&one, &["push", "-q", &url, "main"]);
+    assert!(err.contains("hash algorithm"), "{err}");
+    git(&two, &["push", "-q", &url, "main"]);
+    let err = git_fails(&one, &["fetch", "-q", &url, "main"]);
+    assert!(err.contains("mismatched algorithms"), "{err}");
+
+    // Clients that ignore the advertisement are refused the way git refuses them.
+    let v2 = |body: String| {
+        let (_, out) = post(
+            &format!("{url}/git-upload-pack"),
+            "application/x-git-upload-pack-request",
+            Some("version=2"),
+            body.into_bytes(),
+        );
+        out
+    };
+    let out = v2(format!(
+        "{}{}0001{}0000",
+        pkt("command=ls-refs\n"),
+        pkt("object-format=sha1\n"),
+        pkt("peel\n")
+    ));
+    assert!(
+        out.contains("ERR mismatched object format: server sha256; client sha1"),
+        "{out}"
+    );
+    let out = v2(format!(
+        "{}0001{}0000",
+        pkt("command=ls-refs\n"),
+        pkt("peel\n")
+    ));
+    assert!(out.contains("ERR mismatched object format"), "{out}");
+    let sha1_id = git(&one, &["rev-parse", "HEAD"]);
+    let out = v2(format!(
+        "{}{}0001{}{}0000",
+        pkt("command=fetch\n"),
+        pkt("object-format=sha256\n"),
+        pkt(&format!("want {sha1_id}\n")),
+        pkt("done\n")
+    ));
+    assert!(
+        out.contains("ERR protocol error: expected a sha256 object id"),
+        "{out}"
+    );
+    let (code, out) = post(
+        &format!("{url}/git-receive-pack"),
+        "application/x-git-receive-pack-request",
+        None,
+        format!(
+            "{}0000",
+            pkt(&format!(
+                "{} {sha1_id} refs/heads/x\0report-status object-format=sha1\n",
+                "0".repeat(40)
+            ))
+        )
+        .into_bytes(),
+    );
+    assert!(
+        code >= 400 && out.contains("unsupported object format 'sha1'"),
+        "{code} {out}"
+    );
+    // The SHA-256 repository is untouched by all of it.
+    let c = s.path("c");
+    git(s.dir.path(), &["clone", "-q", &url, c.to_str().unwrap()]);
+    check_sha256(&c);
+    assert_eq!(
+        git(&c, &["rev-parse", "HEAD"]),
+        git(&two, &["rev-parse", "HEAD"])
     );
 }

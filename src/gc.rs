@@ -360,7 +360,8 @@ impl Trim {
     /// Reads the cover's pack only; takes no lock.
     pub fn build(&self, store: &BlobStore) -> anyhow::Result<Built> {
         let pack = self.cover.pack.expect("planned with a pack");
-        let odb = Odb::open(store, &[pack])?;
+        let format = pack.format();
+        let odb = Odb::open(store, format, &[pack])?;
         let mut kept: HashMap<Oid, u64> = HashMap::new();
         for &(seq, tip) in &self.tips {
             let mut stack = vec![tip];
@@ -378,7 +379,7 @@ impl Trim {
                         stack.extend(commit_tree(&data));
                     }
                     Kind::Tree => {
-                        let entries = tree_entries(&data)
+                        let entries = tree_entries(format, &data)
                             .ok_or_else(|| anyhow::anyhow!("malformed tree {oid}"))?;
                         for (mode, child) in entries {
                             if mode & 0o170000 == 0o040000 {

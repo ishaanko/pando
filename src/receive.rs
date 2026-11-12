@@ -19,9 +19,15 @@
 //!
 //! So metadata only ever commits naming a pack that is durably stored and that gc
 //! cannot delete until the lock is released, by which time the pack is live.
+//!
+//! Object format. The advertisement names the repository's `object-format` (for one
+//! that does not exist yet, the server default it would be created in), and every id
+//! in it is that wide. Git refuses to push across formats itself; a client that
+//! sends another format's `object-format`, or ids of the wrong width, is refused here
+//! as git's receive-pack refuses it.
 
 use crate::meta::{CommitRow, Deps, Meta, NewVersion, PackRows, RefUpdate, Version, View};
-use crate::object::Oid;
+use crate::object::{Format, Oid};
 use crate::pack::{self, ParsedPack};
 use crate::pktline::{self, Packet};
 use crate::server::{AGENT, Advertise, Repo, Server, blocking, body_reader, git_response};
@@ -37,20 +43,24 @@ const ANCESTRY_WALK_LIMIT: usize = 100_000;
 
 /// The ref advertisement for pushers, plus `.have` lines for older trunk tips at
 /// exponentially spaced distances, so even a stale client finds a base it has.
-pub fn advertisement(server: &Server, meta: &View) -> anyhow::Result<Vec<u8>> {
+/// Without `meta`, that of a repository the push will create.
+pub fn advertisement(server: &Server, meta: Option<&View>) -> anyhow::Result<Vec<u8>> {
+    let format = meta.map_or(server.cfg.object_format, |m| m.format);
     let caps = format!(
         "report-status delete-refs side-band-64k quiet atomic ofs-delta push-options no-thin \
-         object-format=sha1 agent={AGENT}"
+         object-format={} agent={AGENT}",
+        format.name()
     );
     let mut out = Vec::new();
-    let mut refs: Vec<Version> = match server.cfg.advertise {
-        Advertise::All => meta.refs(&[])?,
-        Advertise::Trunk => meta.trunk_head()?.into_iter().collect(),
+    let mut refs: Vec<Version> = match (meta, server.cfg.advertise) {
+        (None, _) => Vec::new(),
+        (Some(meta), Advertise::All) => meta.refs(&[])?,
+        (Some(meta), Advertise::Trunk) => meta.trunk_head()?.into_iter().collect(),
     };
     if refs.is_empty() {
         pktline::line(
             &mut out,
-            format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO),
+            format!("{} capabilities^{{}}\0{caps}\n", format.zero()),
         );
     }
     for (i, v) in refs.drain(..).enumerate() {
@@ -61,7 +71,9 @@ pub fn advertisement(server: &Server, meta: &View) -> anyhow::Result<Vec<u8>> {
         };
         pktline::line(&mut out, format!("{} {}{caps}\n", v.tip, v.refname));
     }
-    if let Some(head) = meta.trunk_head()? {
+    if let Some(meta) = meta
+        && let Some(head) = meta.trunk_head()?
+    {
         let mut back = 1;
         while back < head.seq {
             if let Some(v) = meta.trunk_version(head.seq - back)? {
@@ -74,13 +86,14 @@ pub fn advertisement(server: &Server, meta: &View) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `GET info/refs?service=git-receive-pack`.
-pub async fn advertise(server: Arc<Server>, repo: Arc<Repo>) -> anyhow::Result<Response> {
+/// `GET info/refs?service=git-receive-pack`, for `repo` or one the push will create.
+pub async fn advertise(server: Arc<Server>, repo: Option<Arc<Repo>>) -> anyhow::Result<Response> {
     let out = blocking(move || {
         let mut out = Vec::new();
         pktline::line(&mut out, "# service=git-receive-pack\n");
         pktline::flush(&mut out);
-        out.extend(advertisement(&server, &*repo.read()?)?);
+        let meta = repo.as_ref().map(|r| r.read()).transpose()?;
+        out.extend(advertisement(&server, meta.as_deref())?);
         Ok(out)
     })
     .await?;
@@ -113,17 +126,35 @@ pub async fn handle(
     ))
 }
 
-/// A whole receive-pack conversation over a byte stream (SSH).
+/// A whole receive-pack conversation over a byte stream (SSH). A repository that
+/// does not exist yet is created once the client sends commands, not when it only
+/// reads the advertisement and hangs up (or flushes: nothing to push).
 pub fn serve_stream(
     server: &Server,
-    repo: &Repo,
+    name: &str,
+    repo: Option<Arc<Repo>>,
     user: Option<&str>,
     r: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let refs = advertisement(server, &*repo.read()?)?;
+    let meta = repo.as_ref().map(|r| r.read()).transpose()?;
+    let refs = advertisement(server, meta.as_deref())?;
+    drop(meta);
     out.write_all(&refs)?;
     out.flush()?;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => {
+            let next = r.fill_buf()?;
+            if next.is_empty() || next.starts_with(b"0000") {
+                return Ok(());
+            }
+            server
+                .open_repo(name, true)?
+                .ok_or_else(|| anyhow::anyhow!("invalid repository name {name:?}"))?
+        }
+    };
+    let repo = &*repo;
     let (report, trunk_moved) = push(server, repo, user, r, true)?;
     out.write_all(&report)?;
     out.flush()?;
@@ -151,6 +182,7 @@ fn push(
     delimited: bool,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
     let started = std::time::Instant::now();
+    let format = repo.format;
     let mut commands = Vec::new();
     let mut caps = HashSet::new();
     while let Some(Packet::Data(line)) = pktline::read(r)? {
@@ -168,11 +200,24 @@ fn push(
                 .filter(|c| !c.is_empty())
                 .map(String::from),
         );
+        if commands.is_empty() {
+            // Capabilities come with the first command. Like git, a client that names
+            // no format speaks SHA-1; one that speaks the other is refused before its
+            // ids are read.
+            let client = caps
+                .iter()
+                .find_map(|c| c.strip_prefix("object-format="))
+                .unwrap_or("sha1");
+            anyhow::ensure!(
+                client == format.name(),
+                "error: unsupported object format '{client}'"
+            );
+        }
         let mut parts = cmd.splitn(3, ' ');
         let (Some(old), Some(new), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
             anyhow::bail!("malformed push command {cmd:?}");
         };
-        let (Some(old), Some(new)) = (Oid::from_hex(old), Oid::from_hex(new)) else {
+        let (Some(old), Some(new)) = (format.parse_oid(old), format.parse_oid(new)) else {
             anyhow::bail!("malformed push command {cmd:?}");
         };
         commands.push(Command {
@@ -192,7 +237,7 @@ fn push(
     let mut parsed: Option<ParsedPack> = None;
     let mut staged: Option<Staged> = None;
     if commands.iter().any(|c| !c.new.is_zero()) {
-        match receive_pack_data(&repo.store, r, delimited, server.cfg.max_push_bytes) {
+        match receive_pack_data(&repo.store, format, r, delimited, server.cfg.max_push_bytes) {
             Ok((p, s)) => {
                 parsed = Some(p);
                 staged = Some(s);
@@ -429,6 +474,7 @@ impl Drop for Staged {
 /// push has passed its hooks.
 fn receive_pack_data(
     store: &BlobStore,
+    format: Format,
     r: &mut dyn BufRead,
     delimited: bool,
     limit: u64,
@@ -442,7 +488,7 @@ fn receive_pack_data(
         )
     };
     if delimited {
-        match pack::copy_stream(r, &mut file, limit) {
+        match pack::copy_stream(format, r, &mut file, limit) {
             Err(pack::PackError::TooLarge) => return Err(too_large()),
             res => res?,
         };
@@ -453,7 +499,7 @@ fn receive_pack_data(
     drop(file);
     let map = map_file(&staged.0)?;
     metrics::PUSH_BYTES.add(map.len() as u64);
-    let parsed = pack::parse(&map)?;
+    let parsed = pack::parse(format, &map)?;
     Ok((parsed, staged))
 }
 
@@ -530,7 +576,8 @@ fn plan_updates(
                 meta.current(&c.refname).map_err(db)?
             };
             let expect = current.as_ref().map(|v| v.id);
-            let stale = |cur: &Option<Version>| c.old != cur.as_ref().map_or(Oid::ZERO, |v| v.tip);
+            let stale =
+                |cur: &Option<Version>| c.old != cur.as_ref().map_or(meta.format.zero(), |v| v.tip);
             if c.new.is_zero() {
                 if is_trunk {
                     return Err("deleting trunk is not allowed".into());
@@ -624,12 +671,10 @@ fn apply(
             .collect());
     }
     let stored = pack.filter(|p| !p.entries.is_empty());
-    let objects: Vec<Oid> =
-        stored.map_or(Vec::new(), |p| p.entries.iter().map(|e| e.oid).collect());
     let rows = stored.map(|p| PackRows {
         hash: p.hash,
         deps: pack_deps,
-        objects: &objects,
+        objects: &p.entries,
         commits: &p.commits,
         tags: &p.tags,
     });

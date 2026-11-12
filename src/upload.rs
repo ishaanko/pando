@@ -8,10 +8,14 @@
 //! reads back the one it wrote for an identical earlier request (the fetch cache),
 //! on both protocol paths. Wants are always planned against current metadata first,
 //! so a cached answer is never served for a commit gc has dropped.
+//!
+//! Both advertisements name the repository's `object-format`. A v2 command from a
+//! client of the other format fails as it does against git (`mismatched object
+//! format`), and an id of the wrong width anywhere in a request is a protocol error.
 
 use crate::generate::{self, Answer};
 use crate::meta::View;
-use crate::object::Oid;
+use crate::object::{Format, Oid};
 use crate::pack::{self, IdxEntry};
 use crate::pktline::{self, Packet, SidebandWriter};
 use crate::planner::{self, Plan, PlanError};
@@ -72,15 +76,15 @@ impl Version {
     }
 }
 
-/// The v2 capability advertisement.
-pub fn v2_capabilities() -> Vec<u8> {
+/// The v2 capability advertisement of a repository in `format`.
+pub fn v2_capabilities(format: Format) -> Vec<u8> {
     let mut out = Vec::new();
     for line in [
         "version 2".to_string(),
         format!("agent={AGENT}"),
         "ls-refs=unborn".into(),
         "fetch=packfile-uris shallow filter".into(),
-        "object-format=sha1".into(),
+        format!("object-format={}", format.name()),
     ] {
         pktline::line(&mut out, format!("{line}\n"));
     }
@@ -98,7 +102,8 @@ fn v0_capabilities(meta: &View) -> String {
     format!(
         "multi_ack multi_ack_detailed side-band side-band-64k ofs-delta shallow \
          deepen-since deepen-not deepen-relative no-progress allow-tip-sha1-in-want \
-         allow-reachable-sha1-in-want filter object-format=sha1{symref} agent={AGENT}"
+         allow-reachable-sha1-in-want filter object-format={}{symref} agent={AGENT}",
+        meta.format.name()
     )
 }
 
@@ -122,7 +127,7 @@ pub fn v0_advertisement(meta: &View, version: Version) -> anyhow::Result<Vec<u8>
     if refs.is_empty() {
         pktline::line(
             &mut out,
-            format!("{} capabilities^{{}}\0{caps}\n", Oid::ZERO),
+            format!("{} capabilities^{{}}\0{caps}\n", meta.format.zero()),
         );
     }
     for (i, (oid, name)) in refs.iter().enumerate() {
@@ -144,7 +149,7 @@ pub async fn advertise(repo: Arc<Repo>, headers: &HeaderMap) -> anyhow::Result<R
         pktline::line(&mut out, "# service=git-upload-pack\n");
         pktline::flush(&mut out);
         if version == Version::V2 {
-            out.extend(v2_capabilities());
+            out.extend(v2_capabilities(repo.format));
         } else {
             out.extend(v0_advertisement(&*repo.read()?, version)?);
         }
@@ -219,7 +224,7 @@ fn converse(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     if version == Version::V2 {
-        out.write_all(&v2_capabilities())?;
+        out.write_all(&v2_capabilities(repo.format))?;
         out.flush()?;
         while command(server, repo, r, out)? {
             out.flush()?;
@@ -263,12 +268,24 @@ fn command(
         .unwrap_or("")
         .to_string();
     let args = read_section(r)?;
+    if !command.is_empty() {
+        // Like git: a client that names no format speaks SHA-1.
+        let client = head
+            .iter()
+            .find_map(|l| l.strip_prefix("object-format="))
+            .unwrap_or("sha1");
+        anyhow::ensure!(
+            client == repo.format.name(),
+            "mismatched object format: server {}; client {client}",
+            repo.format.name()
+        );
+    }
     match command.as_str() {
         "ls-refs" => {
             let refs = ls_refs(&*repo.read()?, &args)?;
             out.write_all(&refs)?
         }
-        "fetch" => fetch(server, repo, &FetchArgs::parse(&args), out)?,
+        "fetch" => fetch(server, repo, &FetchArgs::parse(repo.format, &args)?, out)?,
         "" => return Ok(false), // a bare flush or hang-up: the client is done
         other => anyhow::bail!("unknown command {other}"),
     }
@@ -324,16 +341,18 @@ pub struct FetchArgs {
 }
 
 impl FetchArgs {
-    pub fn parse(args: &[String]) -> FetchArgs {
-        let oids = |prefix: &str| -> Vec<Oid> {
+    /// The arguments of a fetch from a repository in `format`. An id of another
+    /// width is a protocol error.
+    pub fn parse(format: Format, args: &[String]) -> anyhow::Result<FetchArgs> {
+        let oids = |prefix: &str| -> anyhow::Result<Vec<Oid>> {
             args.iter()
                 .filter_map(|a| a.strip_prefix(prefix))
-                .filter_map(Oid::from_hex)
+                .map(|hex| parse_oid(format, hex))
                 .collect()
         };
-        FetchArgs {
-            wants: oids("want "),
-            haves: oids("have "),
+        Ok(FetchArgs {
+            wants: oids("want ")?,
+            haves: oids("have ")?,
             done: args.iter().any(|a| a == "done"),
             progress: !args.iter().any(|a| a == "no-progress"),
             uri_protocols: args
@@ -341,14 +360,24 @@ impl FetchArgs {
                 .find_map(|a| a.strip_prefix("packfile-uris "))
                 .map(|p| p.split(',').map(String::from).collect())
                 .unwrap_or_default(),
-            shallow: oids("shallow "),
+            shallow: oids("shallow ")?,
             deepen: generate::Deepen::parse(args),
             filter: args
                 .iter()
                 .find_map(|a| a.strip_prefix("filter "))
                 .map(String::from),
-        }
+        })
     }
+}
+
+/// An id a client sent, which must be in the repository's `format`.
+fn parse_oid(format: Format, hex: &str) -> anyhow::Result<Oid> {
+    format.parse_oid(hex).ok_or_else(|| {
+        anyhow::anyhow!(
+            "protocol error: expected a {} object id, not '{hex}'",
+            format.name()
+        )
+    })
 }
 
 /// Plan which stored packs answer `wants` given `haves`.
@@ -525,7 +554,7 @@ fn session_v0(
             args.push(arg.into());
         }
     }
-    let base = FetchArgs::parse(&args);
+    let base = FetchArgs::parse(repo.format, &args)?;
     if base.wants.is_empty() {
         return Ok(()); // nothing wanted (e.g. ls-remote)
     }
@@ -587,8 +616,8 @@ fn session_v0(
                         done = true;
                         break;
                     }
-                    if let Some(oid) = line.strip_prefix("have ").and_then(Oid::from_hex) {
-                        batch.push(oid);
+                    if let Some(hex) = line.strip_prefix("have ") {
+                        batch.push(parse_oid(repo.format, hex)?);
                     }
                 }
                 Some(_) => break,
@@ -652,7 +681,7 @@ fn session_v0(
         // `done`: the final answer, then the pack.
         let mut fetch_args = args.clone();
         fetch_args.extend(haves.iter().map(|h| format!("have {h}")));
-        let fetch_args = FetchArgs::parse(&fetch_args);
+        let fetch_args = FetchArgs::parse(repo.format, &fetch_args)?;
         let mut full = Vec::new();
         let generated = if stateless || !deepening {
             shallow_info(&fetch_args, &mut full)?
@@ -717,7 +746,7 @@ pub fn send_packfile(
 /// One stored pack copied as-is, several spliced into one, or an empty pack.
 fn write_stored_packs(repo: &Repo, packs: &[Oid], out: &mut dyn Write) -> anyhow::Result<()> {
     match packs {
-        [] => out.write_all(&pack::empty_pack())?,
+        [] => out.write_all(&pack::empty_pack(repo.format))?,
         [single] => out.write_all(&repo.store.map_pack(single)?)?,
         _ => {
             let loaded: Vec<(memmap2::Mmap, Vec<IdxEntry>)> = packs
@@ -726,7 +755,7 @@ fn write_stored_packs(repo: &Repo, packs: &[Oid], out: &mut dyn Write) -> anyhow
                 .collect::<io::Result<_>>()?;
             let parts: Vec<(&[u8], &[IdxEntry])> =
                 loaded.iter().map(|(b, i)| (&b[..], i.as_slice())).collect();
-            pack::concat(&parts, out)?;
+            pack::concat(repo.format, &parts, out)?;
         }
     }
     Ok(())

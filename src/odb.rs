@@ -3,7 +3,7 @@
 //! Pando's normal paths never open objects: they move whole packs around. Shallow
 //! fetches are the exception, since cutting history means choosing objects one by one.
 
-use crate::object::{Kind, Oid};
+use crate::object::{Format, Kind, Oid};
 use crate::pack::{self, Base, PackError};
 use crate::store::BlobStore;
 use memmap2::Mmap;
@@ -20,6 +20,8 @@ const CACHE_BYTES: usize = 256 << 20;
 
 struct Pack {
     map: Mmap,
+    /// Everything before the trailer.
+    body_len: usize,
     /// Object start offsets in pack order; an entry ends where the next begins.
     offsets: Vec<u64>,
     /// The object at each offset.
@@ -27,6 +29,8 @@ struct Pack {
 }
 
 pub struct Odb {
+    /// The repository's object format.
+    pub format: Format,
     packs: Vec<Pack>,
     index: HashMap<Oid, (usize, u64)>,
     cache: RefCell<HashMap<(usize, u64), Object>>,
@@ -34,8 +38,9 @@ pub struct Odb {
 }
 
 impl Odb {
-    /// Open a set of stored packs. Earlier packs win when an object appears twice.
-    pub fn open(store: &BlobStore, hashes: &[Oid]) -> std::io::Result<Odb> {
+    /// Open a set of stored packs of a repository in `format`. Earlier packs win when
+    /// an object appears twice.
+    pub fn open(store: &BlobStore, format: Format, hashes: &[Oid]) -> std::io::Result<Odb> {
         let mut packs = Vec::new();
         let mut index = HashMap::new();
         for (i, hash) in hashes.iter().enumerate() {
@@ -45,13 +50,16 @@ impl Odb {
             }
             let mut by_offset: Vec<(u64, Oid)> = idx.iter().map(|e| (e.offset, e.oid)).collect();
             by_offset.sort();
+            let map = store.map_pack(hash)?;
             packs.push(Pack {
-                map: store.map_pack(hash)?,
+                body_len: map.len().saturating_sub(format.raw_len()),
+                map,
                 offsets: by_offset.iter().map(|e| e.0).collect(),
                 oids: by_offset.iter().map(|e| e.1).collect(),
             });
         }
         Ok(Odb {
+            format,
             packs,
             index,
             cache: RefCell::new(HashMap::new()),
@@ -78,8 +86,8 @@ impl Odb {
             return Ok(None);
         };
         let pack = &self.packs[p];
-        let body = &pack.map[..pack.map.len() - 20];
-        let h = pack::read_header(body, off as usize)?;
+        let body = &pack.map[..pack.body_len];
+        let h = pack::read_header(self.format, body, off as usize)?;
         if matches!(h.base, Base::None) {
             return Ok(Some(h.size));
         }
@@ -114,8 +122,8 @@ impl Odb {
     pub fn raw_whole(&self, oid: &Oid) -> Option<&[u8]> {
         let &(p, off) = self.index.get(oid)?;
         let pack = &self.packs[p];
-        let body = &pack.map[..pack.map.len() - 20];
-        let h = pack::read_header(body, off as usize).ok()?;
+        let body = &pack.map[..pack.body_len];
+        let h = pack::read_header(self.format, body, off as usize).ok()?;
         if !matches!(h.base, Base::None) {
             return None;
         }
@@ -129,8 +137,8 @@ impl Odb {
     pub fn raw_delta(&self, oid: &Oid) -> Option<(Oid, usize, &[u8])> {
         let &(p, off) = self.index.get(oid)?;
         let pack = &self.packs[p];
-        let body = &pack.map[..pack.map.len() - 20];
-        let h = pack::read_header(body, off as usize).ok()?;
+        let body = &pack.map[..pack.body_len];
+        let h = pack::read_header(self.format, body, off as usize).ok()?;
         let base = match h.base {
             Base::None => return None,
             Base::Oid(b) => b,
@@ -146,8 +154,8 @@ impl Odb {
             return Ok(hit.clone());
         }
         let pack = &self.packs[p];
-        let body = &pack.map[..pack.map.len() - 20];
-        let h = pack::read_header(body, off as usize)?;
+        let body = &pack.map[..pack.body_len];
+        let h = pack::read_header(self.format, body, off as usize)?;
         let (data, _) = pack::inflate(&body[off as usize + h.len..], h.size)?;
         let result = match h.base {
             Base::None => {

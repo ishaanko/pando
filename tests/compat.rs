@@ -9,7 +9,12 @@
 //!
 //! Helpers implement `clone <url> <dir>`, `fetch <dir>` and `push <dir> <refspec>`,
 //! exiting 3 for operations the client does not support.
+//!
+//! Clients that support SHA-256 repositories ([`SHA256_CLIENTS`]) also run the scenario
+//! against one. go-git v5, libgit2 (as pygit2 ships it) and JGit do not: they refuse
+//! the advertised format or speak SHA-1 to it.
 
+use pando::object::Format;
 use pando::server::{Config, Server};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -17,6 +22,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 const TOKEN: &str = "compat-token";
+
+/// Clients that clone, fetch and push SHA-256 repositories (git from 2.29).
+const SHA256_CLIENTS: &[&str] = &["git-v0", "git-v1", "git-v2", "gitoxide"];
 
 /// How a client is driven.
 enum Driver {
@@ -41,6 +49,7 @@ enum Outcome {
 
 struct Env {
     _dir: TempDir,
+    server: Arc<Server>,
     root: PathBuf,
     http: String,
     ssh: String,
@@ -79,6 +88,7 @@ impl Env {
         let server = Server::new(cfg).unwrap();
         let router = server.router();
         let ssh_server: Arc<Server> = server.clone();
+        let kept = server.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
@@ -96,6 +106,7 @@ impl Env {
         Env {
             http: http.replace("http://", &format!("http://u:{TOKEN}@")),
             _dir: dir,
+            server: kept,
             root,
             ssh,
             key,
@@ -164,8 +175,15 @@ impl Env {
     }
 }
 
-/// The scenario every client runs. Returns the pushes it could not run.
-fn scenario(env: &Env, client: &Client, base: &str, repo: &str) -> Result<Vec<String>, String> {
+/// The scenario every client runs, in a repository of `format`. Returns the pushes it
+/// could not run.
+fn scenario(
+    env: &Env,
+    client: &Client,
+    base: &str,
+    repo: &str,
+    format: Format,
+) -> Result<Vec<String>, String> {
     let work = env.root.join(format!("{}-{repo}", client.name));
     std::fs::create_dir_all(&work).unwrap();
     let url = format!("{base}/{repo}.git");
@@ -175,7 +193,12 @@ fn scenario(env: &Env, client: &Client, base: &str, repo: &str) -> Result<Vec<St
     // binary file larger than one SSH packet.
     let seed = work.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    env.git(&seed, &["init", "-q", "-b", "main"]);
+    let object_format = format!("--object-format={}", format.name());
+    env.git(&seed, &["init", "-q", "-b", "main", &object_format]);
+    if format != Format::Sha1 {
+        // The server's default is SHA-1: anything else is created up front.
+        env.server.create_repo(repo, format).unwrap();
+    }
     let noise: Vec<u8> = (0..300_000u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
         .collect();
@@ -312,11 +335,22 @@ fn clients_interoperate() {
     }
 
     let mut failures = Vec::new();
-    println!("\n{:<10} {:<6} result", "client", "via");
+    println!("\n{:<10} {:<9} result", "client", "via");
     for client in &clients {
-        for (via, base) in [("http", env.http.as_str()), ("ssh", env.ssh.as_str())] {
+        let mut formats = vec![Format::Sha1];
+        if SHA256_CLIENTS.contains(&client.name.as_str()) {
+            formats.push(Format::Sha256);
+        }
+        for (format, (via, base)) in formats
+            .into_iter()
+            .flat_map(|f| [("http", env.http.as_str()), ("ssh", env.ssh.as_str())].map(|v| (f, v)))
+        {
+            let via = match format {
+                Format::Sha1 => via.to_string(),
+                Format::Sha256 => format!("{via}-256"),
+            };
             let repo = format!("{}-{via}", client.name);
-            let result = match scenario(&env, client, base, &repo) {
+            let result = match scenario(&env, client, base, &repo, format) {
                 Ok(u) if u.is_empty() => "ok".to_string(),
                 Ok(u) => format!("ok (unsupported by client: {})", u.join(", ")),
                 Err(e) => {
@@ -324,11 +358,11 @@ fn clients_interoperate() {
                     "FAILED".to_string()
                 }
             };
-            println!("{:<10} {:<6} {result}", client.name, via);
+            println!("{:<10} {:<9} {result}", client.name, via);
         }
     }
     for m in &missing {
-        println!("{m:<10} -      not installed");
+        println!("{m:<10} -         not installed");
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     assert!(

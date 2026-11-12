@@ -2,6 +2,8 @@
 //! concerned; listing shows the repositories an admin can see):
 //!
 //! - `GET    /api/repos`                          list repositories (JSON)
+//! - `POST   /api/repos/<repo>?object-format=<f>` create an empty repository, `sha1` or
+//!   `sha256` (default: the server's `--object-format`)
 //! - `DELETE /api/repos/<repo>`                   delete a repository
 //! - `POST   /api/repos/<repo>/rename?to=<name>`  rename a repository
 //! - `PUT    /api/repos/<repo>/head?branch=<b>`   change the default branch
@@ -11,6 +13,7 @@
 
 use crate::auth::Access;
 use crate::hooks::json_string;
+use crate::object::Format;
 use crate::server::{Server, blocking};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
@@ -73,6 +76,23 @@ pub async fn handle(server: Arc<Server>, req: Request) -> Response {
     }
     let s = server.clone();
     let result = match (method, action) {
+        (Method::POST, "") => {
+            let format = match param("object-format") {
+                None => s.cfg.object_format,
+                Some(name) => match Format::from_name(&name) {
+                    Some(f) => f,
+                    None => {
+                        let msg = format!("unknown object format {name:?} (sha1 or sha256)\n");
+                        return (StatusCode::BAD_REQUEST, msg).into_response();
+                    }
+                },
+            };
+            return match blocking(move || s.create_repo(&name, format)).await {
+                Ok(true) => StatusCode::CREATED.into_response(),
+                Ok(false) => (StatusCode::CONFLICT, "repository exists\n").into_response(),
+                Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}\n")).into_response(),
+            };
+        }
         (Method::DELETE, "") => blocking(move || Ok(s.delete_repo(&name)?.then(String::new))).await,
         (Method::POST, "rename") => {
             let Some(to) = param("to") else {
@@ -137,9 +157,10 @@ fn list_json(server: &Server, names: &[String]) -> anyhow::Result<String> {
         let meta = repo.read()?;
         let refs = meta.refs(&[])?.len();
         items.push(format!(
-            r#"{{"name":{},"head":{},"refs":{refs}}}"#,
+            r#"{{"name":{},"head":{},"refs":{refs},"object_format":"{}"}}"#,
             json_string(name),
-            json_string(&meta.trunk)
+            json_string(&meta.trunk),
+            meta.format.name()
         ));
     }
     Ok(format!("[{}]", items.join(",")))

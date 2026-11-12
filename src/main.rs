@@ -2,6 +2,7 @@ use axum::serve::ListenerExt;
 use clap::{Parser, Subcommand};
 use pando::auth::{LiveAuth, UrlSigner};
 use pando::express::{self, Express, Origin};
+use pando::object::Format;
 use pando::server::{Advertise, Config, Server};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,6 +77,10 @@ enum Cmd {
         /// repositories (e.g. 10G; 0 turns the cache off).
         #[arg(long, value_parser = parse_size, default_value = "1G")]
         fetch_cache_max_size: u64,
+        /// Object format of repositories created by their first push. Existing
+        /// repositories keep theirs; the admin API creates either kind.
+        #[arg(long, value_enum, default_value = "sha1")]
+        object_format: Format,
     },
     /// Copy a data directory (consistent while the server runs).
     Backup {
@@ -145,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
             webhook_secret,
             max_push_size,
             fetch_cache_max_size,
+            object_format,
         } => {
             let auth = auth_file.as_deref().map(LiveAuth::open).transpose()?;
             if auth.is_none() {
@@ -167,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.webhook_secret = webhook_secret;
             cfg.max_push_bytes = max_push_size;
             cfg.fetch_cache_max_size = fetch_cache_max_size;
+            cfg.object_format = object_format;
             let server = Server::new(cfg)?;
             if server.cfg.auth.is_some() {
                 tokio::spawn(reload_on_hangup(server.clone()));
