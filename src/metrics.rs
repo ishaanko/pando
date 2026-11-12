@@ -77,6 +77,12 @@ pub static WEBHOOK_FAILURES: Counter = Counter::new(
     "pando_webhook_failures_total",
     "Webhook deliveries that failed.",
 );
+pub static LFS_BYTES_UPLOADED: Counter =
+    Counter::new("pando_lfs_uploaded_bytes_total", "LFS object bytes stored.");
+pub static LFS_BYTES_DOWNLOADED: Counter = Counter::new(
+    "pando_lfs_downloaded_bytes_total",
+    "LFS object bytes served.",
+);
 pub static PUSH_TIME: Timer = Timer::new(
     "pando_push_seconds_sum",
     "pando_push_seconds_count",
@@ -109,6 +115,8 @@ pub fn render() -> String {
         &GC_PACKS_DELETED,
         &GC_BYTES_DELETED,
         &WEBHOOK_FAILURES,
+        &LFS_BYTES_UPLOADED,
+        &LFS_BYTES_DOWNLOADED,
     ] {
         let _ = writeln!(
             out,

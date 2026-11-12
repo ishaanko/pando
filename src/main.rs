@@ -186,9 +186,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Backup { data, out } => {
             let s = pando::backup::backup(&data, &out)?;
             println!(
-                "backed up {} repositories ({} packs) to {}",
+                "backed up {} repositories ({} packs, {} LFS objects) to {}",
                 s.repos,
                 s.packs,
+                s.lfs_objects,
                 out.display()
             );
         }

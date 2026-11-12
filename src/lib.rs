@@ -8,6 +8,7 @@ pub mod express;
 pub mod gc;
 pub mod generate;
 pub mod hooks;
+pub mod lfs;
 pub mod meta;
 pub mod metrics;
 pub mod object;

@@ -315,6 +315,13 @@ impl UrlSigner {
         exp >= now() && constant_time_eq(&self.mac(repo, hash, exp), &sig)
     }
 
+    /// HMAC-SHA256 of `msg` under the signing secret, for other signed capabilities
+    /// (LFS hrefs and credentials). Callers start `msg` with a tag of their own, so one
+    /// kind of signature never verifies as another.
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 32] {
+        hmac_sha256(&self.secret, msg)
+    }
+
     fn mac(&self, repo: &str, hash: &crate::object::Oid, exp: u64) -> [u8; 20] {
         hmac_sha1(&self.secret, format!("{repo}\n{hash}\n{exp}").as_bytes())
     }

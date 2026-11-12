@@ -1,9 +1,11 @@
 //! Git over SSH: `git clone ssh://git@host:2222/<repo>.git`.
 //!
 //! Clients authenticate with a public key from the auth file (any key when auth is
-//! off). The only commands are `git-upload-pack` and `git-receive-pack`, which speak
+//! off). The commands are `git-upload-pack` and `git-receive-pack`, which speak
 //! the same protocols as smart HTTP over the channel; `GIT_PROTOCOL` (which git sends
-//! with `SendEnv`) selects protocol v2. The host key is created on first start in
+//! with `SendEnv`) selects protocol v2. `git-lfs-authenticate <repo> <operation>`
+//! points git-lfs at the HTTP LFS endpoint with a short-lived credential for the key's
+//! identity (see `lfs.rs`). The host key is created on first start in
 //! `<data>/ssh_host_ed25519_key`.
 
 use crate::auth::Access;
@@ -194,7 +196,13 @@ impl russh::server::Handler for Conn {
                 let code = match result {
                     Ok(()) => 0,
                     Err(e) => {
-                        tracing::warn!(command, "ssh: {e:#}");
+                        // git-lfs tries its SSH transfer protocol on every operation
+                        // before falling back to git-lfs-authenticate.
+                        if command.starts_with("git-lfs-transfer ") {
+                            tracing::debug!(command, "ssh: {e:#}");
+                        } else {
+                            tracing::warn!(command, "ssh: {e:#}");
+                        }
                         let _ = writeln!(err, "fatal: {e:#}");
                         let _ = err.flush();
                         128
@@ -225,8 +233,12 @@ fn run(
     w: &mut dyn Write,
 ) -> anyhow::Result<()> {
     crate::metrics::SSH_SESSIONS.inc();
-    let (push, name) = parse_command(command)?;
-    let need = if push { Access::Write } else { Access::Read };
+    let (cmd, name) = parse_command(command)?;
+    let need = match cmd {
+        Command::UploadPack => Access::Read,
+        Command::ReceivePack => Access::Write,
+        Command::LfsAuthenticate(op) => op.need(),
+    };
     let user = match (&server.cfg.auth, key) {
         (None, _) => None,
         (Some(auth), Some(key)) => {
@@ -235,12 +247,24 @@ fn run(
                 .check_key(key)
                 .ok_or_else(|| anyhow::anyhow!("unknown key"))?;
             if !id.allows(&name, need) {
-                let what = if push { "push to" } else { "read" };
+                let what = if need == Access::Write {
+                    "push to"
+                } else {
+                    "read"
+                };
                 anyhow::bail!("{} cannot {what} {name}", id.name);
             }
             Some(id.name.clone())
         }
         (Some(_), None) => anyhow::bail!("authentication required"),
+    };
+    let push = match cmd {
+        Command::UploadPack => false,
+        Command::ReceivePack => true,
+        Command::LfsAuthenticate(_) => {
+            let auth = crate::lfs::ssh_authenticate(server, &name, need, user.as_deref());
+            return Ok(w.write_all(auth.as_bytes())?);
+        }
     };
     let repo = server
         .open_repo(&name, push)?
@@ -254,9 +278,17 @@ fn run(
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Command {
+    UploadPack,
+    ReceivePack,
+    LfsAuthenticate(crate::lfs::Operation),
+}
+
 /// `git-upload-pack '/team/app.git'` (also `git upload-pack`, with or without the
-/// leading slash, `~/`, quotes, or `.git`) into (is a push, repository name).
-fn parse_command(command: &str) -> anyhow::Result<(bool, String)> {
+/// leading slash, `~/`, quotes, or `.git`, and `git-lfs-authenticate <repo>
+/// <operation>`) into the command and repository name.
+fn parse_command(command: &str) -> anyhow::Result<(Command, String)> {
     let command = command.trim();
     let (prog, arg) = command
         .split_once(' ')
@@ -268,9 +300,15 @@ fn parse_command(command: &str) -> anyhow::Result<(bool, String)> {
         }
         _ => (prog.to_string(), arg),
     };
-    let push = match prog.as_str() {
-        "git-upload-pack" => false,
-        "git-receive-pack" => true,
+    let (cmd, arg) = match prog.as_str() {
+        "git-upload-pack" => (Command::UploadPack, arg),
+        "git-receive-pack" => (Command::ReceivePack, arg),
+        "git-lfs-authenticate" => {
+            let (path, op) = arg.trim().rsplit_once(' ').unwrap_or((arg, ""));
+            let op = crate::lfs::Operation::parse(op)
+                .ok_or_else(|| anyhow::anyhow!("unknown LFS operation {op:?}"))?;
+            (Command::LfsAuthenticate(op), path)
+        }
         _ => anyhow::bail!("only git-upload-pack and git-receive-pack are supported"),
     };
     let path = arg.trim().trim_matches(|c| c == '\'' || c == '"');
@@ -280,25 +318,44 @@ fn parse_command(command: &str) -> anyhow::Result<(bool, String)> {
     if !valid_repo_name(name) {
         anyhow::bail!("invalid repository name {path:?}");
     }
-    Ok((push, name.to_string()))
+    Ok((cmd, name.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_command;
+    use super::{Command, parse_command};
+    use crate::lfs::Operation;
 
     #[test]
     fn commands_parse_like_git_sends_them() {
         for (cmd, want) in [
-            ("git-upload-pack '/team/app.git'", (false, "team/app")),
-            ("git-upload-pack 'app.git'", (false, "app")),
-            ("git receive-pack '~/app.git'", (true, "app")),
-            ("git-receive-pack '/app.git/'", (true, "app")),
-            ("git-upload-pack app", (false, "app")),
+            (
+                "git-upload-pack '/team/app.git'",
+                (Command::UploadPack, "team/app"),
+            ),
+            ("git-upload-pack 'app.git'", (Command::UploadPack, "app")),
+            (
+                "git receive-pack '~/app.git'",
+                (Command::ReceivePack, "app"),
+            ),
+            (
+                "git-receive-pack '/app.git/'",
+                (Command::ReceivePack, "app"),
+            ),
+            ("git-upload-pack app", (Command::UploadPack, "app")),
+            (
+                "git-lfs-authenticate 'team/app.git' upload",
+                (Command::LfsAuthenticate(Operation::Upload), "team/app"),
+            ),
+            (
+                "git-lfs-authenticate /app.git download",
+                (Command::LfsAuthenticate(Operation::Download), "app"),
+            ),
         ] {
-            let (push, name) = parse_command(cmd).unwrap();
-            assert_eq!((push, name.as_str()), want, "{cmd}");
+            let (cmd_, name) = parse_command(cmd).unwrap();
+            assert_eq!((cmd_, name.as_str()), want, "{cmd}");
         }
+        assert!(parse_command("git-lfs-authenticate app.git delete").is_err());
         assert!(parse_command("rm -rf /").is_err());
         assert!(parse_command("git-upload-pack '../etc.git'").is_err());
         assert!(parse_command("git-upload-archive 'app.git'").is_err());
