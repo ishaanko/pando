@@ -1,5 +1,6 @@
 //! Garbage collection: delete packs that nothing can reach anymore (deleted branches,
-//! history dropped by a force push, rejected pushes, and pieces compaction replaced).
+//! history dropped by a force push, rejected pushes, and pieces compaction replaced),
+//! and trim history a rewrite dropped out of the compaction cover that still holds it.
 //!
 //! Live data starts at the refs: each current version's pack and dependencies, the
 //! current trunk epoch, and earlier-epoch trunk positions up to the highest one
@@ -17,14 +18,54 @@
 //! or are dropped along with versions that can no longer be served. Compaction moves
 //! trunk rows off the packs it replaces before they can die, so that search is only
 //! needed for history that really became unreachable.
+//!
+//! Trimming. A cover of an earlier epoch can straddle `old_max` (start <= old_max <
+//! end): it is live, but the positions above `old_max` were dropped by a rewrite (or
+//! by a branch going away), and their objects would stay on disk and fetchable for as
+//! long as the cover does. After collecting, gc replaces such a cover's pack with a
+//! trimmed one, once all of these hold:
+//!
+//! - No pack, live or dead, depends on an earlier-epoch position above `old_max`.
+//!   Every stored pack can come back (a dead one through a push that references it),
+//!   and dead packs go after `grace`, so this holds from the run that deletes the last
+//!   one: what is dropped can no longer be needed. Versions are never revived.
+//! - Nothing names the cover's pack as a dependency: no live ref version or piece,
+//!   and no pack, live or dead. A push that builds on an object homed in the cover
+//!   records the whole pack (a branch based on dropped history keeps it reachable),
+//!   which then stays whole while that lives; trimming would store it twice.
+//! - No pending cover overlaps it (compaction may be splicing it into a larger one).
+//! - Some index row homed in it is marked with a dropped position.
+//!
+//! The trimmed pack holds the cover's objects that its live positions reach, walking
+//! from their tips through commits and trees and never leaving the cover: anything
+//! they reach only through an object stored elsewhere is complete there, and
+//! everything else (dropped history, and objects of other refs that rode along in a
+//! trunk push and are no longer referenced) is left out. It is written by the
+//! generated-fetch writer, so an object stored as a delta against one left out is
+//! written whole, and the pack is self-contained like every stored pack.
+//!
+//! The pack is built outside the metadata lock. The swap then re-checks everything
+//! under the lock (the cover still has the same pack, `old_max` and the epoch are
+//! unchanged, nothing names it) and in one transaction points the cover at the new
+//! pack, moves the kept objects' index rows to it, deletes the dropped versions, and
+//! marks the old pack dead: nothing references it now. Rows of left-out objects stay
+//! with it (a row must never point at a pack that lacks its object), so until it goes
+//! after `grace` they are still served from it, and a push that references one revives
+//! it whole. Then they go with it. Dropped history is therefore gone two grace periods
+//! after the first run that sees the rewrite (each rounded up to the next run). A crash
+//! before the swap leaves the repository as it was (and a staging file, removed
+//! later), and the next run trims again; the swap itself is one transaction.
 
-use crate::meta::{CHAIN, Meta};
-use crate::object::Oid;
+use crate::meta::{CHAIN, Meta, Piece};
+use crate::object::{GITLINK_MODE, Kind, Oid, commit_parents, commit_tree, tree_entries};
+use crate::odb::Odb;
+use crate::pack::IdxEntry;
 use crate::planner;
 use crate::server::Repo;
 use crate::store::BlobStore;
 use rusqlite::{OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -34,9 +75,20 @@ pub struct Report {
     pub marked: usize,
     pub deleted: usize,
     pub bytes: u64,
+    /// Covers trimmed of history a rewrite dropped.
+    pub trimmed: usize,
 }
 
+/// Collect garbage, then trim the cover that straddles `old_max` if one is due.
 pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
+    let mut report = collect(repo, grace)?;
+    report.trimmed = usize::from(trim(repo)?);
+    Ok(report)
+}
+
+/// Mark dead packs, and delete those dead for `grace` (everything [`run`] does but
+/// trimming).
+pub fn collect(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let mut report = Report::default();
     let mut doomed: Vec<Oid> = Vec::new();
@@ -141,6 +193,9 @@ struct Live {
     /// Live cover rows (pieces of live trunk ranges, and pending covers), by (level,
     /// start).
     covers: HashSet<(u32, u64)>,
+    /// Packs live things name directly (as a ref version's pack, or a dependency), as
+    /// opposed to serving them as a trunk piece.
+    named: HashSet<Oid>,
 }
 
 impl Live {
@@ -152,6 +207,7 @@ impl Live {
             old_max: 0,
             epoch,
             covers: HashSet::new(),
+            named: HashSet::new(),
         };
         let mut work: Vec<Oid> = Vec::new();
         let need = |live: &mut Live, trunk: u64| {
@@ -161,6 +217,8 @@ impl Live {
         };
         for v in meta.refs(&[])? {
             if !v.on_trunk {
+                live.named.extend(v.pack);
+                live.named.extend(v.deps.packs.iter().copied());
                 work.extend(v.pack);
                 work.extend(v.deps.packs);
                 need(&mut live, v.deps.trunk);
@@ -171,6 +229,7 @@ impl Live {
         need(&mut live, meta.trunk_dep_below(epoch, head, epoch)?);
         for cover in meta.pending_covers()? {
             live.covers.insert((cover.level, cover.start));
+            live.named.extend(cover.side.iter().copied());
             work.extend(cover.pack);
             work.extend(cover.side);
         }
@@ -180,6 +239,7 @@ impl Live {
                 if live.packs.insert(p)
                     && let Some(deps) = meta.pack_deps(&p)?
                 {
+                    live.named.extend(deps.packs.iter().copied());
                     work.extend(deps.packs);
                     need(&mut live, deps.trunk);
                 }
@@ -206,6 +266,7 @@ impl Live {
             if piece.level > 0 {
                 self.covers.insert((piece.level, piece.start));
             }
+            self.named.extend(piece.side.iter().copied());
             work.extend(piece.pack);
             work.extend(piece.side);
         }
@@ -214,6 +275,187 @@ impl Live {
 
     fn trunk_position_live(&self, seq: u64) -> bool {
         seq == 0 || seq <= self.old_max || seq >= self.epoch
+    }
+}
+
+/// Trim the cover that straddles `old_max`, if one is due (see the module docs).
+/// Returns whether one was trimmed.
+pub fn trim(repo: &Repo) -> anyhow::Result<bool> {
+    let Some(trim) = Trim::plan(&repo.meta.lock().unwrap())? else {
+        return Ok(false);
+    };
+    let built = trim.build(&repo.store)?;
+    trim.swap(repo, built)
+}
+
+/// A cover to trim: the piece holding `old_max`, and the live positions in it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Trim {
+    cover: Piece,
+    /// `old_max`: positions above it are dropped.
+    cut: u64,
+    epoch: u64,
+    /// Tips of the cover's chain versions up to `cut`, by position.
+    tips: Vec<(u64, Oid)>,
+}
+
+/// A trimmed pack waiting in staging, and what it keeps.
+pub struct Built {
+    /// `None` when every object is kept (only index rows need fixing).
+    staged: Option<(PathBuf, Oid, Vec<IdxEntry>)>,
+    /// Kept objects, each with the first live position that reaches it.
+    kept: HashMap<Oid, u64>,
+}
+
+impl Trim {
+    /// The cover to trim now, if any. Reads metadata only.
+    pub fn plan(meta: &Meta) -> anyhow::Result<Option<Trim>> {
+        let epoch = meta.epoch_start;
+        if epoch == 1 {
+            return Ok(None);
+        }
+        let live = Live::compute(meta)?;
+        let cut = live.old_max;
+        if cut == 0 {
+            return Ok(None);
+        }
+        let Some(cover) = planner::piece_at(meta, cut)? else {
+            return Ok(None);
+        };
+        let Some(pack) = cover.pack else {
+            return Ok(None);
+        };
+        // Positions `epoch..` are live too, so the cover must end before them.
+        if cover.level == 0 || cover.end <= cut || cover.end >= epoch {
+            return Ok(None);
+        }
+        let hex = pack.hex();
+        let conn = &meta.conn;
+        // Anything that can still be revived needs nothing above `cut`.
+        let revivable: u64 = conn.query_row(
+            "SELECT COALESCE(MAX(trunk_dep), 0) FROM packs WHERE trunk_dep < ?1",
+            [epoch],
+            |r| r.get(0),
+        )?;
+        let named = live.named.contains(&pack)
+            || conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM packs WHERE instr(side_deps, ?1) > 0)",
+                [&hex],
+                |r| r.get(0),
+            )?;
+        let pending = meta
+            .pending_covers()?
+            .iter()
+            .any(|p| p.start <= cover.end && cover.start <= p.end);
+        if revivable > cut || named || pending {
+            return Ok(None);
+        }
+        let dropped: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM objects WHERE pack = ?1 AND trunk_seq > ?2 AND trunk_seq < ?3)",
+            params![hex, cut, epoch],
+            |r| r.get(0),
+        )?;
+        if !dropped {
+            return Ok(None);
+        }
+        let mut tips = Vec::new();
+        for seq in cover.start..=cut {
+            if let Some(v) = meta.trunk_version(seq)? {
+                tips.push((seq, v.tip));
+            }
+        }
+        Ok(Some(Trim {
+            cover,
+            cut,
+            epoch,
+            tips,
+        }))
+    }
+
+    /// Find what the live positions reach inside the cover and write it to staging.
+    /// Reads the cover's pack only; takes no lock.
+    pub fn build(&self, store: &BlobStore) -> anyhow::Result<Built> {
+        let pack = self.cover.pack.expect("planned with a pack");
+        let odb = Odb::open(store, &[pack])?;
+        let mut kept: HashMap<Oid, u64> = HashMap::new();
+        for &(seq, tip) in &self.tips {
+            let mut stack = vec![tip];
+            while let Some(oid) = stack.pop() {
+                if !odb.contains(&oid) || kept.contains_key(&oid) {
+                    continue;
+                }
+                kept.insert(oid, seq);
+                let (kind, data) = odb
+                    .read(&oid)?
+                    .ok_or_else(|| anyhow::anyhow!("missing object {oid}"))?;
+                match kind {
+                    Kind::Commit => {
+                        stack.extend(commit_parents(&data));
+                        stack.extend(commit_tree(&data));
+                    }
+                    Kind::Tree => {
+                        let entries = tree_entries(&data)
+                            .ok_or_else(|| anyhow::anyhow!("malformed tree {oid}"))?;
+                        for (mode, child) in entries {
+                            if mode & 0o170000 == 0o040000 {
+                                stack.push(child);
+                            } else if mode != GITLINK_MODE && odb.contains(&child) {
+                                kept.entry(child).or_insert(seq);
+                            }
+                        }
+                    }
+                    Kind::Blob | Kind::Tag => {}
+                }
+            }
+        }
+        let idx = store.read_idx(&pack)?;
+        let objects: Vec<Oid> = idx
+            .iter()
+            .map(|e| e.oid)
+            .filter(|o| kept.contains_key(o))
+            .collect();
+        let staged = if objects.len() == idx.len() {
+            None
+        } else {
+            let (path, (hash, idx)) = store.stage(|out| {
+                crate::generate::write_pack(&odb, &objects, out).map_err(std::io::Error::other)
+            })?;
+            Some((path, hash, idx))
+        };
+        Ok(Built { staged, kept })
+    }
+
+    /// Publish the trimmed pack and make it the cover's, if the plan still holds.
+    /// Returns false (discarding the build) if it does not.
+    pub fn swap(&self, repo: &Repo, built: Built) -> anyhow::Result<bool> {
+        // Under the lock, like a push, so gc cannot delete a pack with the same hash
+        // between its publication and its row.
+        let mut meta = repo.meta.lock().unwrap();
+        if Trim::plan(&meta)?.as_ref() != Some(self) {
+            if let Some((path, ..)) = &built.staged {
+                let _ = std::fs::remove_file(path);
+            }
+            return Ok(false);
+        }
+        let new = match &built.staged {
+            Some((path, hash, idx)) => {
+                repo.store.publish(path, hash, idx)?;
+                *hash
+            }
+            None => self.cover.pack.expect("planned with a pack"),
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        meta.trim_cover(&self.cover, &new, self.cut, &built.kept, now)?;
+        tracing::info!(
+            repo = %repo.name,
+            level = self.cover.level,
+            start = self.cover.start,
+            cut = self.cut,
+            kept = built.kept.len(),
+            pack = %new,
+            "trimmed cover"
+        );
+        Ok(true)
     }
 }
 

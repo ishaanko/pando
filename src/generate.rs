@@ -24,7 +24,7 @@ use crate::object::{
     GITLINK_MODE, Kind, Oid, commit_parents, commit_time, commit_tree, tree_entries,
 };
 use crate::odb::Odb;
-use crate::pack::{HashingWriter, encode_type_size};
+use crate::pack::{HashingWriter, IdxEntry, encode_type_size};
 use crate::planner;
 use crate::server::Repo;
 use crate::upload::FetchArgs;
@@ -363,7 +363,8 @@ impl Generated {
     /// Write the pack.
     pub fn write(&self, out: &mut dyn Write) -> anyhow::Result<()> {
         let objects = self.walk.objects(&self.odb, self.filter.as_ref())?;
-        write_pack(&self.odb, &objects, out)
+        write_pack(&self.odb, &objects, out)?;
+        Ok(())
     }
 }
 
@@ -657,14 +658,24 @@ fn reachable_commits(odb: &Odb, tips: &[Oid]) -> anyhow::Result<HashSet<Oid>> {
 
 /// Write a self-contained pack of `objects`, copying stored bytes where possible:
 /// whole objects as they are, and deltas whose base is also being sent as ref-deltas.
-/// Only deltas against objects left out are expanded and recompressed.
-fn write_pack(odb: &Odb, objects: &[Oid], out: &mut dyn Write) -> anyhow::Result<()> {
+/// Only deltas against objects left out are expanded and recompressed. Returns the
+/// pack's hash and index. Also used by gc to trim covers (see `gc.rs`).
+pub fn write_pack(
+    odb: &Odb,
+    objects: &[Oid],
+    out: &mut dyn Write,
+) -> anyhow::Result<(Oid, Vec<IdxEntry>)> {
     let sending: HashSet<&Oid> = objects.iter().collect();
     let mut w = HashingWriter::new(out);
     w.write_all(b"PACK\0\0\0\x02")?;
     w.write_all(&(objects.len() as u32).to_be_bytes())?;
     let mut head = Vec::new();
+    let mut idx = Vec::with_capacity(objects.len());
     for oid in objects {
+        idx.push(IdxEntry {
+            offset: w.written,
+            oid: *oid,
+        });
         if let Some(raw) = odb.raw_whole(oid) {
             w.write_all(raw)?;
             continue;
@@ -688,8 +699,8 @@ fn write_pack(odb: &Odb, objects: &[Oid], out: &mut dyn Write) -> anyhow::Result
         z.write_all(&data)?;
         z.finish()?;
     }
-    w.finish()?;
-    Ok(())
+    let (hash, _) = w.finish()?;
+    Ok((hash, idx))
 }
 
 /// Pack type code of a delta against an object named by id.

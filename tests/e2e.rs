@@ -3719,3 +3719,305 @@ fn a_cover_left_pending_by_a_crash_is_finished_later() {
     git(&c, &["fsck", "--strict", "--no-progress"]);
     assert_eq!(count(&c, "HEAD"), 8);
 }
+
+/// What a secret committed to trunk is made of: its blob, root tree and commit.
+struct Secret {
+    blob: String,
+    tree: String,
+    commit: String,
+}
+
+impl Secret {
+    fn ids(&self) -> [&str; 3] {
+        [&self.blob, &self.tree, &self.commit]
+    }
+}
+
+/// Push trunk versions 1..=100 from `a` with a secret blob committed at position 80
+/// (inside the level-2 cover [65..80]), cloning at `clone_at`, and compact.
+fn deep_trunk_with_secret(s: &Server, a: &Path, clone_at: &[u64]) -> (Secret, Vec<PathBuf>) {
+    init(a);
+    git(a, &["remote", "add", "origin", &s.url]);
+    let mut clones: Vec<PathBuf> = push_trunk(s, a, 79, clone_at)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect();
+    let commit = self::commit(a, "secret", "hunter2 9f1c2e7a");
+    git(a, &["push", "-q", "origin", "main"]);
+    let secret = Secret {
+        blob: git(a, &["rev-parse", "HEAD:secret"]),
+        tree: git(a, &["rev-parse", "HEAD^{tree}"]),
+        commit,
+    };
+    clones.extend(push_trunk(s, a, 20, clone_at).into_iter().map(|(_, c)| c));
+    s.compact();
+    let p = trunk_pieces(s, 74, 75)[0].clone();
+    assert_eq!((p.level, p.start, p.end), (2, 65, 80));
+    (secret, clones)
+}
+
+/// Force-push trunk to a new commit on top of position `at`.
+fn rewrite_trunk(s: &Server, a: &Path, at: u64) {
+    git(
+        a,
+        &["checkout", "-q", "-B", "main", &trunk_tip(s, at).hex()],
+    );
+    commit(a, "f", "rewritten");
+    git(a, &["push", "-qf", "origin", "main"]);
+}
+
+fn gc(s: &Server, grace: u64) -> pando::gc::Report {
+    pando::gc::run(&s.repo(), std::time::Duration::from_secs(grace)).unwrap()
+}
+
+/// The secret is in no pack on disk and cannot be fetched by id.
+#[track_caller]
+fn assert_gone(s: &Server, secret: &Secret, name: &str) {
+    let stored = stored_objects(s);
+    let b = s.path(name);
+    init(&b);
+    for id in secret.ids() {
+        assert!(!stored.contains(id), "{id} is still stored");
+        git_fails(&b, &["fetch", "-q", &s.url, id]);
+    }
+}
+
+#[track_caller]
+fn assert_clean(s: &Server) {
+    let data = s.dir.path().join("data");
+    assert_eq!(
+        pando::backup::verify(&data, true).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn history_dropped_from_inside_a_cover_is_trimmed_out_of_it() {
+    let s = Server::start();
+    let a = s.path("a");
+    let (secret, stale) = deep_trunk_with_secret(&s, &a, &[10, 64, 65, 70, 75]);
+    // Drop positions 76..100 (25 pushes, the secret among them).
+    rewrite_trunk(&s, &a, 75);
+    // Earlier-epoch positions 1..75 merge without the lag: [1..64] becomes one cover.
+    assert_eq!(s.compact(), 1);
+
+    // First pass: the dropped pieces go, then the cover holding 65..80 is rewritten
+    // without 76..80. The old copy is unreferenced (and dead) but still on disk.
+    let r = gc(&s, 0);
+    assert!(r.deleted > 0 && r.trimmed == 1, "{r:?}");
+    assert!(stored_objects(&s).contains(&secret.blob));
+    let p = trunk_pieces(&s, 74, 75)[0].clone();
+    assert_eq!((p.level, p.start, p.end), (2, 65, 80));
+    assert_eq!(s.compact(), 0, "nothing merges the dropped positions back");
+    // Second pass: the old copy goes.
+    let r = gc(&s, 0);
+    assert!(r.deleted == 1 && r.trimmed == 0, "{r:?}");
+    assert_eq!(
+        gc(&s, 0),
+        pando::gc::Report {
+            live: r.live,
+            ..Default::default()
+        }
+    );
+    assert_gone(&s, &secret, "by-id");
+
+    let fresh = clone(&s, "fresh", true);
+    git(&fresh, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&fresh, "HEAD"), 76);
+    for (i, c) in stale.iter().enumerate() {
+        catch_up(c, &a, i % 2 == 0);
+    }
+    assert_clean(&s);
+}
+
+#[test]
+fn a_branch_on_dropped_history_keeps_its_cover_whole_until_it_goes() {
+    let s = Server::start();
+    let a = s.path("a");
+    let (secret, _) = deep_trunk_with_secret(&s, &a, &[]);
+    rewrite_trunk(&s, &a, 75);
+    // A branch on the secret commit, pushed after the rewrite: it depends on the
+    // cover [65..80] by name.
+    git(&a, &["checkout", "-qb", "leak", &secret.commit]);
+    commit(&a, "side", "on the secret");
+    git(&a, &["push", "-q", "origin", "leak"]);
+
+    for _ in 0..2 {
+        assert_eq!(gc(&s, 0).trimmed, 0);
+    }
+    let m = s.path("mirror");
+    git(
+        s.dir.path(),
+        &["clone", "-q", "--mirror", &s.url, m.to_str().unwrap()],
+    );
+    git(&m, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&m, "leak"), 81);
+    let b = s.path("by-id");
+    init(&b);
+    git(&b, &["fetch", "-q", &s.url, &secret.commit]);
+    git(&b, &["fsck", "--strict", "--no-progress"]);
+    assert_clean(&s);
+
+    // Once the branch goes, the cover is trimmed and the copy collected.
+    git(&a, &["push", "-q", "origin", "--delete", "leak"]);
+    assert_eq!(gc(&s, 0).trimmed, 1);
+    assert_eq!(gc(&s, 0).deleted, 1);
+    assert_gone(&s, &secret, "by-id-after");
+    let fresh = clone(&s, "fresh", false);
+    git(&fresh, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&fresh, "HEAD"), 76);
+    assert_clean(&s);
+}
+
+#[test]
+fn a_dead_pack_needing_dropped_positions_can_still_be_revived() {
+    let s = Server::start();
+    let a = s.path("a");
+    let (secret, _) = deep_trunk_with_secret(&s, &a, &[]);
+    // A branch on position 78, pushed while 78 is on trunk: it needs positions 1..78.
+    let c78 = trunk_tip(&s, 78).hex();
+    git(&a, &["checkout", "-qb", "s1", &c78]);
+    let s1 = commit(&a, "s", "side");
+    git(&a, &["push", "-q", "origin", "s1"]);
+    let s1_pack = s
+        .repo()
+        .meta
+        .lock()
+        .unwrap()
+        .current("refs/heads/s1")
+        .unwrap()
+        .unwrap()
+        .pack;
+    git(&a, &["checkout", "-q", "main"]);
+    rewrite_trunk(&s, &a, 75);
+    // The branch holds old_max at 78: only 79 and 80 (the secret) are trimmed out.
+    assert_eq!(gc(&s, 0).trimmed, 1);
+
+    // Deleted, the branch's pack is dead but revivable for the grace period: nothing
+    // it needs may be trimmed meanwhile.
+    git(&a, &["push", "-q", "origin", "--delete", "s1"]);
+    let r = gc(&s, 3600);
+    assert!(r.marked > 0 && r.trimmed == 0, "{r:?}");
+    // Revive it: with 78 advertised again, pushing s1 again sends the identical pack.
+    git(
+        &a,
+        &["push", "-q", "origin", &format!("{c78}:refs/heads/t")],
+    );
+    git(
+        &a,
+        &["push", "-q", "origin", &format!("{s1}:refs/heads/s2")],
+    );
+    let s2_pack = s
+        .repo()
+        .meta
+        .lock()
+        .unwrap()
+        .current("refs/heads/s2")
+        .unwrap()
+        .unwrap()
+        .pack;
+    assert_eq!(s2_pack, s1_pack, "not a revival");
+    // A branch on top of it, changing every file, depends on that pack alone, and so
+    // on positions 1..78.
+    git(&a, &["checkout", "-qb", "s3", &s1]);
+    std::fs::write(a.join("f"), "on top").unwrap();
+    git(&a, &["add", "f"]);
+    let s3 = commit(&a, "s", "on top");
+    git(&a, &["push", "-q", "origin", "s3"]);
+    git(&a, &["push", "-q", "origin", "--delete", "t", "s2"]);
+    let r = gc(&s, 0);
+    assert!(r.deleted > 0 && r.trimmed == 0, "{r:?}");
+
+    let b = s.path("b");
+    init(&b);
+    git(&b, &["fetch", "-q", &s.url, "s3"]);
+    git(&b, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(git(&b, &["rev-parse", "FETCH_HEAD"]), s3);
+    assert_eq!(count(&b, "FETCH_HEAD"), 80);
+    assert_clean(&s);
+    // The secret (position 80) went with the first trim.
+    assert_gone(&s, &secret, "by-id");
+}
+
+#[test]
+fn objects_stored_as_deltas_against_trimmed_ones_are_written_whole() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    push_trunk(&s, &a, 69, &[]);
+    // One push: trunk position 70 with a file, and a branch with a larger version of
+    // it, so git stores trunk's as a delta against the branch's.
+    let lines: Vec<String> = (0..2000u32)
+        .map(|i| format!("line {i} {:08x}", i.wrapping_mul(2654435761)))
+        .collect();
+    std::fs::write(a.join("data"), lines[..1500].join("\n")).unwrap();
+    git(&a, &["add", "data"]);
+    git(&a, &["commit", "-qm", "data"]);
+    let kept = git(&a, &["rev-parse", "HEAD:data"]);
+    git(&a, &["checkout", "-qb", "tmp"]);
+    std::fs::write(a.join("data"), lines.join("\n")).unwrap();
+    git(&a, &["commit", "-qam", "more data"]);
+    let base = git(&a, &["rev-parse", "HEAD:data"]);
+    git(&a, &["checkout", "-q", "main"]);
+    git(&a, &["push", "-q", "origin", "main", "tmp"]);
+    git(&a, &["push", "-q", "origin", "--delete", "tmp"]);
+    push_trunk(&s, &a, 30, &[]);
+    s.compact();
+    let repo = s.repo();
+    let (kept, base) = (Oid::from_hex(&kept).unwrap(), Oid::from_hex(&base).unwrap());
+    let cover = trunk_pieces(&s, 69, 70)[0].clone();
+    assert_eq!((cover.level, cover.start), (2, 65));
+    {
+        let odb = pando::odb::Odb::open(&repo.store, &[cover.pack.unwrap()]).unwrap();
+        assert_eq!(odb.raw_delta(&kept).map(|d| d.0), Some(base), "not a delta");
+    }
+
+    rewrite_trunk(&s, &a, 75);
+    assert_eq!(gc(&s, 0).trimmed, 1);
+    let trimmed = trunk_pieces(&s, 69, 70)[0].pack.unwrap();
+    {
+        let odb = pando::odb::Odb::open(&repo.store, &[trimmed]).unwrap();
+        assert!(odb.raw_whole(&kept).is_some() && !odb.contains(&base));
+    }
+    gc(&s, 0);
+    // The branch's version of the file was unreachable, and is gone with the rest.
+    assert!(!stored_objects(&s).contains(&base.hex()));
+    let fresh = clone(&s, "fresh", true);
+    git(&fresh, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(
+        git(&fresh, &["cat-file", "-p", &kept.hex()]),
+        lines[..1500].join("\n")
+    );
+    assert_clean(&s);
+}
+
+#[test]
+fn a_trim_interrupted_before_its_swap_is_redone() {
+    let s = Server::start();
+    let a = s.path("a");
+    let (secret, _) = deep_trunk_with_secret(&s, &a, &[]);
+    rewrite_trunk(&s, &a, 75);
+    let repo = s.repo();
+    pando::gc::collect(&repo, std::time::Duration::ZERO).unwrap();
+    // Build the trimmed pack, then "crash" before swapping it in.
+    let trim = pando::gc::Trim::plan(&repo.meta.lock().unwrap())
+        .unwrap()
+        .expect("a trim is due");
+    let built = trim.build(&repo.store).unwrap();
+    drop(built);
+    let tmp = s.dir.path().join("data/repos/repo.git/blobs/tmp");
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1);
+
+    // Nothing changed: the repository is served as before.
+    let fresh = clone(&s, "fresh", true);
+    git(&fresh, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&fresh, "HEAD"), 76);
+    assert_clean(&s);
+    // The next runs trim and collect.
+    assert_eq!(gc(&s, 0).trimmed, 1);
+    assert_eq!(gc(&s, 0).deleted, 1);
+    assert_gone(&s, &secret, "by-id");
+    catch_up(&fresh, &a, false);
+    assert_clean(&s);
+}

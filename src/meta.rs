@@ -776,7 +776,8 @@ impl Meta {
         }))
     }
 
-    /// Store what gc found: earlier-epoch positions `1..=old` are needed.
+    /// Store what gc (or compaction) found: earlier-epoch positions `1..=old` are
+    /// needed. A hint: it goes stale when a ref that needed more goes away.
     pub fn set_old_needed(&mut self, old: u64) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('old_needed', ?1)",
@@ -937,6 +938,64 @@ impl Meta {
         tx.execute(
             "UPDATE covers SET pending = 0 WHERE level = ?1 AND start = ?2",
             params![piece.level, piece.start],
+        )?;
+        tx.commit()
+    }
+
+    /// Replace the pack of the cover `piece` (an earlier epoch's, holding live chain
+    /// positions only up to `cut`) with `new`, a stored copy of its objects in `kept`
+    /// (see `gc.rs`). In one transaction: `new` gets the old pack's dependencies, index
+    /// rows of kept objects homed in the old pack move to it, and the cover's chain
+    /// versions above `cut` are deleted. Rows of objects left out stay with the old
+    /// pack, which nothing references any more: it is marked dead as of `now`, and gc
+    /// collects it and them.
+    ///
+    /// `kept` maps each object to the first position that reaches it; a kept row
+    /// still marked with a dropped position (`cut < trunk_seq < epoch_start`) gets
+    /// that one instead.
+    pub fn trim_cover(
+        &mut self,
+        piece: &Piece,
+        new: &Oid,
+        cut: u64,
+        kept: &std::collections::HashMap<Oid, u64>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let old_pack = piece.pack.expect("a trimmed cover has a pack");
+        let old = old_pack.hex();
+        let epoch = self.epoch_start;
+        let tx = self.conn.transaction()?;
+        let added = tx.execute(
+            "INSERT INTO packs (hash, trunk_dep, side_deps)
+             SELECT ?1, trunk_dep, side_deps FROM packs WHERE hash = ?2 AND ?1 != ?2
+             ON CONFLICT (hash) DO UPDATE SET dead_since = NULL",
+            params![new.hex(), old],
+        )?;
+        // Unknown to the metadata, the new pack would be swept as an orphan.
+        if added == 0 && *new != old_pack {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        tx.execute(
+            "UPDATE covers SET pack = ?3 WHERE level = ?1 AND start = ?2",
+            params![piece.level, piece.start, new.hex()],
+        )?;
+        tx.execute(
+            "UPDATE packs SET dead_since = ?2 WHERE hash = ?1 AND ?1 != ?3",
+            params![old, now, new.hex()],
+        )?;
+        for table in ["objects", "commits"] {
+            let mut stmt = tx.prepare(&format!(
+                "UPDATE {table} SET pack = ?1,
+                 trunk_seq = CASE WHEN trunk_seq > ?2 AND trunk_seq < ?3 THEN ?4 ELSE trunk_seq END
+                 WHERE oid = ?5 AND pack = ?6"
+            ))?;
+            for (oid, seq) in kept {
+                stmt.execute(params![new.hex(), cut, epoch, seq, oid.hex(), old])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM versions WHERE ref = ?1 AND seq > ?2 AND seq BETWEEN ?3 AND ?4",
+            params![CHAIN, cut, piece.start, piece.end],
         )?;
         tx.commit()
     }
