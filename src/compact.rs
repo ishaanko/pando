@@ -24,8 +24,11 @@
 //! Epochs: covers of the current epoch start inside it. Earlier epochs are only ever
 //! served whole, from position 1 up to the highest position something still needs
 //! (gc's `old_max`), so that range is merged as far as it goes, without the lag. Covers
-//! there may span several old epochs, and never go past `old_max`, so history a
-//! rewrite dropped is not merged into anything new.
+//! there may span several old epochs, and never go past `old_max` as found when the
+//! merge starts (gc stores it; compaction finds it afresh before merging there), so
+//! history a rewrite dropped is not merged into anything new. A cover built before a
+//! rewrite (or before a ref holding `old_max` up went away) can still straddle it; gc
+//! trims those (see `gc.rs`).
 //!
 //! Compaction never deletes packs: the replaced ones become unreachable, and gc
 //! deletes them after its grace period (fetches in flight and signed pack URLs may
@@ -36,8 +39,10 @@
 //!
 //! Steps, with metadata locked only for short reads and writes:
 //! 1. Build: map the parts and splice them into a staging file (no lock).
-//! 2. Record (lock): publish the pack and store the cover as pending. gc keeps
-//!    pending covers, and the planner does not see them.
+//! 2. Record (lock): check the parts are still the pieces of their ranges (gc may
+//!    have trimmed one meanwhile; if so, discard and retry next run), publish the
+//!    pack and store the cover as pending. gc keeps pending covers, does not trim
+//!    under them, and the planner does not see them.
 //! 3. Re-point (lock per chunk): move trunk index rows from the parts to the cover.
 //! 4. Finish (lock): one transaction makes the cover the piece for its range. A
 //!    crash before this leaves it pending, and the next run finishes it.
@@ -94,20 +99,27 @@ pub fn run_with_limit(
         end.saturating_add(s) <= head
     })?;
     // Earlier epochs are only ever served whole, from position 1 up to the highest
-    // one something still needs: merge as far as that allows.
+    // one something still needs: merge as far as that allows. What gc last stored
+    // says whether anything is due; a ref deleted since may have lowered it, so the
+    // merge goes only as far as what is needed now.
     if epoch > 1 {
-        let old = old_needed(meta)?;
-        let pieces = walk(meta, 0, old)?;
-        written += merge_due(meta, store, max_bytes, pieces, 1, |end, _| end <= old)?;
+        let hint = old_needed(meta, false)?;
+        let pieces = walk(meta, 0, hint)?;
+        let fits = |end: u64, _| end <= hint;
+        if (0..pieces.len()).any(|i| due(&pieces, i, 1, fits, &HashSet::new()).is_some()) {
+            let old = old_needed(meta, true)?;
+            let pieces = walk(meta, 0, old)?;
+            written += merge_due(meta, store, max_bytes, pieces, 1, |end, _| end <= old)?;
+        }
     }
     Ok(written)
 }
 
-/// The highest earlier-epoch position anything still depends on, as gc last found it
-/// (or found now, after a rewrite).
-fn old_needed(meta: &Mutex<Meta>) -> anyhow::Result<u64> {
+/// The highest earlier-epoch position anything still depends on: as gc last found it
+/// unless `fresh` (or none is stored for this epoch), otherwise found and stored now.
+fn old_needed(meta: &Mutex<Meta>, fresh: bool) -> anyhow::Result<u64> {
     let mut m = meta.lock().unwrap();
-    if let Some(old) = m.old_needed()? {
+    if !fresh && let Some(old) = m.old_needed()? {
         return Ok(old);
     }
     let old = crate::gc::old_needed(&m)?;
@@ -149,7 +161,15 @@ fn merge_due(
             refused.insert((level, start));
             continue; // lower levels for the same piece
         }
-        let cover = merge(meta, store, level, start, parts, &packs, lo)?;
+        let Some(cover) = merge(meta, store, level, start, parts, &packs, lo)? else {
+            // The pieces changed while it was built (gc trimmed one): next run.
+            tracing::info!(
+                level,
+                start,
+                "pieces changed while building, cover not recorded"
+            );
+            break;
+        };
         tracing::info!(level, start, end = cover.end, pack = ?cover.pack, "compacted");
         pieces.splice(range.clone(), [cover]);
         written += 1;
@@ -198,7 +218,8 @@ fn due(
     None
 }
 
-/// Build (or adopt) the cover over `parts`, and record it.
+/// Build (or adopt) the cover over `parts`, and record it. `None` if the parts stopped
+/// being the pieces of their ranges meanwhile.
 fn merge(
     meta: &Mutex<Meta>,
     store: &BlobStore,
@@ -207,7 +228,7 @@ fn merge(
     parts: &[Piece],
     packs: &[Oid],
     lo: u64,
-) -> anyhow::Result<Piece> {
+) -> anyhow::Result<Option<Piece>> {
     let end = start + span(level) - 1;
     // Parts are inside the cover; anything else stays a dependency.
     let mut side: Vec<Oid> = parts
@@ -240,18 +261,17 @@ fn merge(
     let mut recorded = false;
     if let Some((pack, false)) = existing {
         cover.pack = pack;
-        recorded = record(meta, store, &cover, trunk_dep, None)?;
+        recorded = record(meta, store, &cover, parts, trunk_dep, None)?;
     }
     if !recorded {
         let (pack, staged) = build(store, packs)?;
         cover.pack = pack;
-        anyhow::ensure!(
-            record(meta, store, &cover, trunk_dep, staged)?,
-            "cover part {pack:?} is gone"
-        );
+        if !record(meta, store, &cover, parts, trunk_dep, staged)? {
+            return Ok(None);
+        }
     }
     finish(meta, &cover, packs)?;
-    Ok(cover)
+    Ok(Some(cover))
 }
 
 /// A spliced pack waiting in staging, with its index.
@@ -284,19 +304,32 @@ fn build(store: &BlobStore, packs: &[Oid]) -> anyhow::Result<(Option<Oid>, Optio
     }
 }
 
-/// Publish a staged pack and store the cover as pending. Without `staged`, the
-/// cover's pack must already be stored: returns false (recording nothing) if it is
-/// gone.
+/// Publish a staged pack and store the cover as pending. Returns false, recording
+/// nothing and discarding `staged`, if `parts` are no longer the pieces of their
+/// ranges (gc trims covers concurrently, see `gc.rs`), or if without `staged` the
+/// cover's pack is no longer stored.
 fn record(
     meta: &Mutex<Meta>,
     store: &BlobStore,
     cover: &Piece,
+    parts: &[Piece],
     trunk_dep: u64,
     staged: Option<Staged>,
 ) -> anyhow::Result<bool> {
     // Under the lock, like a push, so gc cannot delete a pack with the same hash
     // between its publication and its row.
     let mut m = meta.lock().unwrap();
+    let mut current = true;
+    for part in parts {
+        let now = planner::piece_at(&m, part.start)?;
+        current &= now.is_some_and(|p| (p.level, p.pack) == (part.level, part.pack));
+    }
+    if !current {
+        if let Some((path, _)) = staged {
+            let _ = std::fs::remove_file(path);
+        }
+        return Ok(false);
+    }
     match (staged, cover.pack) {
         (Some((path, idx)), Some(hash)) => store.publish(&path, &hash, &idx)?,
         (_, Some(hash)) if !store.has(&hash) => return Ok(false),
