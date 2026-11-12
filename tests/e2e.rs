@@ -124,14 +124,16 @@ impl Server {
             .map_or(0, |p| self.repo().store.read_idx(&p).unwrap().len())
     }
 
+    /// Trunk head position (0 before the first push).
     fn trunk_seq(&self) -> u64 {
-        self.repo()
-            .meta
-            .lock()
-            .unwrap()
-            .trunk_head()
-            .unwrap()
-            .map_or(0, |v| v.seq)
+        self.server.repo("repo").unwrap().map_or(0, |r| {
+            r.meta
+                .lock()
+                .unwrap()
+                .trunk_head()
+                .unwrap()
+                .map_or(0, |v| v.seq)
+        })
     }
 }
 
@@ -439,16 +441,19 @@ fn compaction_keeps_catch_up_fetches_small() {
         &["update-ref", "refs/remotes/origin/main", &v3.hex()],
     );
 
-    // 20 versions: five L1 covers and one L2 cover.
-    assert_eq!(s.compact(), 6);
+    // 20 versions: an L1 cover is due once head is a span past its end, so [1..4]
+    // through [13..16] are merged and the last four versions stay on their own.
+    assert_eq!(s.compact(), 4);
     assert_eq!(s.compact(), 0, "compaction is idempotent");
     {
         let r = s.repo();
         let m = r.meta.lock().unwrap();
-        // (0, 20] = L2 [1..16] + L1 [17..20].
-        assert_eq!(planner::cover_trunk(&m, 0, 20).unwrap().0.len(), 2);
-        // (3, 20] = v4 + L1 [5..8], [9..12], [13..16], [17..20].
-        assert_eq!(planner::cover_trunk(&m, 3, 20).unwrap().0.len(), 5);
+        // (0, 20] = L1 [1..4], [5..8], [9..12], [13..16] + v17..v20.
+        assert_eq!(planner::cover_trunk(&m, 0, 20).unwrap().0.len(), 8);
+        // (3, 20]: v4 is inside L1 [1..4], which is sent whole.
+        assert_eq!(planner::cover_trunk(&m, 3, 20).unwrap().0.len(), 8);
+        // (16, 20] = v17..v20.
+        assert_eq!(planner::cover_trunk(&m, 16, 20).unwrap().0.len(), 4);
     }
 
     for uris in [false, true] {
@@ -1810,10 +1815,10 @@ fn gc_deletes_unreachable_packs_and_keeps_everything_else_servable() {
     let old = clone(&s, "old", false);
     git(&a, &["checkout", "-q", "main"]);
 
-    // Nothing is garbage yet.
+    // Nothing is garbage yet but the packs of versions 1..4, merged into a cover.
     let repo = s.repo();
     let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
-    assert_eq!((r.marked, r.deleted), (0, 0));
+    assert_eq!((r.marked, r.deleted), (4, 4));
 
     // Drop the secret from trunk and delete the branch that contains it.
     git(&a, &["reset", "-q", "--hard", "HEAD~2"]);
@@ -3273,4 +3278,444 @@ fn cached_answers_do_not_outlive_deleted_branches() {
         assert!(err.contains("not our ref"), "ssh v{proto}: {err}");
     }
     assert_eq!(cache_counts(&s).0, 0);
+}
+
+/// Push `n` trunk versions from `a`, one commit each, cloning the server into
+/// `at<seq>` whenever trunk reaches a position listed in `clone_at`. Returns those
+/// clones with their positions.
+fn push_trunk(s: &Server, a: &Path, n: u64, clone_at: &[u64]) -> Vec<(u64, PathBuf)> {
+    let mut clones = Vec::new();
+    for _ in 0..n {
+        let seq = s.trunk_seq() + 1;
+        commit(a, "f", &format!("version {seq}"));
+        git(a, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        if clone_at.contains(&seq) {
+            clones.push((seq, clone(s, &format!("at{seq}"), false)));
+        }
+    }
+    clones
+}
+
+fn trunk_tip(s: &Server, seq: u64) -> Oid {
+    let r = s.repo();
+    let m = r.meta.lock().unwrap();
+    m.trunk_version(seq).unwrap().unwrap().tip
+}
+
+fn trunk_pieces(s: &Server, have: u64, want: u64) -> Vec<pando::meta::Piece> {
+    let r = s.repo();
+    let m = r.meta.lock().unwrap();
+    planner::pieces(&m, have, want).unwrap()
+}
+
+/// Pack files on disk and their total size.
+fn packs_on_disk(s: &Server) -> (usize, u64) {
+    let r = s.repo();
+    let files = r.store.list().unwrap();
+    let bytes = files
+        .iter()
+        .map(|(h, _)| r.store.pack_size(h).unwrap())
+        .sum();
+    (files.len(), bytes)
+}
+
+/// Most pieces a client `d` versions behind trunk head may be sent: at most
+/// `2 * FANOUT - 1` per level, for levels up to log_FANOUT(d).
+fn catch_up_bound(d: u64) -> usize {
+    (2 * planner::FANOUT as usize - 1) * (d.ilog(planner::FANOUT) as usize + 1)
+}
+
+/// Bring a stale clone up to date and check it against `a`.
+#[track_caller]
+fn catch_up(clone: &Path, a: &Path, uris: bool) {
+    let mut args = vec!["-c", "fetch.uriprotocols=http"];
+    if !uris {
+        args.clear();
+    }
+    args.extend(["pull", "-q", "--ff-only"]);
+    git(clone, &args);
+    git(clone, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(
+        git(clone, &["rev-parse", "HEAD"]),
+        git(a, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn deep_trunk_clones_and_catch_ups_stay_small() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    let stale = push_trunk(
+        &s,
+        &a,
+        200,
+        &[1, 4, 5, 17, 63, 64, 65, 100, 128, 129, 177, 193, 197, 199],
+    );
+
+    // Due covers at head 200 (each needs head a full span past its end): L3 [1..64],
+    // [65..128]; L2 [129..144] to [161..176]; L1 [177..180] to [193..196].
+    assert_eq!(s.compact(), 10);
+    assert_eq!(s.compact(), 0, "compaction is idempotent");
+    let levels: Vec<u32> = trunk_pieces(&s, 0, 200).iter().map(|p| p.level).collect();
+    assert_eq!(levels, [3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+
+    // From every position: a bounded number of packs, and fewer than twice the
+    // versions the client lacks.
+    {
+        let r = s.repo();
+        let m = r.meta.lock().unwrap();
+        let head = m.trunk_head().unwrap().unwrap().tip;
+        for have in 0..200u64 {
+            let haves: Vec<Oid> = m
+                .trunk_version(have)
+                .unwrap()
+                .map(|v| v.tip)
+                .into_iter()
+                .collect();
+            let plan = planner::plan(&m, &[head], &haves).unwrap();
+            assert_eq!((plan.trunk_have, plan.trunk_want), (have, 200));
+            let pieces = planner::pieces(&m, have, 200).unwrap();
+            let packs: Vec<Oid> = pieces.iter().filter_map(|p| p.pack).collect();
+            assert_eq!(plan.packs, packs);
+            let d = 200 - have;
+            let sent = pieces.last().unwrap().end - pieces[0].start + 1;
+            assert!(
+                sent < 2 * d || d == 200,
+                "{have}: sent {sent} versions for {d}"
+            );
+            assert!(
+                pieces.len() <= catch_up_bound(d),
+                "{have}: {} packs for {d} versions",
+                pieces.len()
+            );
+        }
+    }
+
+    for uris in [false, true] {
+        let fresh = clone(&s, if uris { "fresh-uri" } else { "fresh" }, uris);
+        git(&fresh, &["fsck", "--strict", "--no-progress"]);
+        assert_eq!(count(&fresh, "HEAD"), 200);
+        if uris {
+            let names = downloaded_pack_names(&fresh);
+            for p in trunk_pieces(&s, 0, 200).iter().filter_map(|p| p.pack) {
+                assert!(names.contains(&p.hex()), "piece {p} not downloaded");
+            }
+        }
+    }
+    for (i, (_, c)) in stale.iter().enumerate() {
+        catch_up(c, &a, i % 2 == 1);
+    }
+}
+
+#[test]
+fn compacted_and_collected_trunk_is_stored_once() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    let stale = push_trunk(&s, &a, 100, &[2, 30, 64, 70, 90, 99]);
+    let objects = stored_objects(&s);
+    let (_, before) = packs_on_disk(&s);
+
+    s.compact();
+    let repo = s.repo();
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert!(r.deleted > 0, "{r:?}");
+    // One file per piece, every object once, and no more bytes than the pushes took.
+    let pieces = trunk_pieces(&s, 0, 100);
+    let (files, bytes) = packs_on_disk(&s);
+    assert_eq!(files, pieces.len());
+    let entries: usize = repo
+        .store
+        .list()
+        .unwrap()
+        .iter()
+        .map(|(h, _)| repo.store.read_idx(h).unwrap().len())
+        .sum();
+    assert_eq!(entries, objects.len(), "objects stored more than once");
+    assert_eq!(stored_objects(&s), objects);
+    assert!(
+        bytes <= before,
+        "{bytes} bytes on disk, pushes took {before}"
+    );
+    let data = s.dir.path().join("data");
+    assert_eq!(
+        pando::backup::verify(&data, true).unwrap(),
+        Vec::<String>::new()
+    );
+
+    for (i, (_, c)) in stale.iter().enumerate() {
+        catch_up(c, &a, i % 2 == 0);
+    }
+    let fresh = clone(&s, "fresh", true);
+    git(&fresh, &["fsck", "--strict", "--no-progress"]);
+
+    // Steady state: more pushes, compaction and gc keep it that way.
+    push_trunk(&s, &a, 40, &[]);
+    s.compact();
+    pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert_eq!(packs_on_disk(&s).0, trunk_pieces(&s, 0, 140).len());
+    assert_eq!(
+        pando::backup::verify(&data, true).unwrap(),
+        Vec::<String>::new()
+    );
+    catch_up(&fresh, &a, true);
+}
+
+#[test]
+fn rewrites_after_compaction_keep_old_positions_servable() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    let stale = push_trunk(&s, &a, 60, &[40]);
+    s.compact();
+    let tip = |seq| trunk_tip(&s, seq).hex();
+    let (c10, c45, c55) = (tip(10), tip(45), tip(55));
+    // A branch on position 20 and a tag on position 30, both inside covers.
+    assert!(trunk_pieces(&s, 19, 20)[0].level > 0);
+    git(&a, &["checkout", "-qb", "old-side", &tip(20)]);
+    commit(&a, "side", "on 20");
+    git(&a, &["push", "-q", "origin", "old-side"]);
+    git(&a, &["tag", "-am", "old", "v-old", &tip(30)]);
+    git(&a, &["push", "-q", "origin", "v-old"]);
+
+    // Rewrite trunk from position 50 (position 49..52 share a cover), push and
+    // compact the new epoch, and collect.
+    git(&a, &["checkout", "-q", "-B", "main", &tip(50)]);
+    commit(&a, "f", "rewritten");
+    git(&a, &["push", "-qf", "origin", "main"]);
+    assert_eq!(s.repo().meta.lock().unwrap().epoch_start, 61);
+    push_trunk(&s, &a, 69, &[]);
+    assert!(s.compact() > 0);
+    let repo = s.repo();
+    pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    {
+        // The cover [49..52] holds the only copy of positions 49 and 50, which the
+        // new epoch depends on; versions 51.. were dropped around it.
+        let m = repo.meta.lock().unwrap();
+        let piece = planner::piece_at(&m, 50).unwrap().unwrap();
+        assert_eq!((piece.level, piece.start), (1, 49));
+        assert!(repo.store.has(&piece.pack.unwrap()));
+        assert!(m.trunk_version(51).unwrap().is_none());
+        // The needed part of the old epoch is served whole, so it merges without lag.
+        let levels: Vec<u32> = planner::pieces(&m, 0, 50)
+            .unwrap()
+            .iter()
+            .map(|p| p.level)
+            .collect();
+        assert_eq!(levels, [2, 2, 2, 1]);
+    }
+
+    let check = |name: &str, head: usize| {
+        let c = s.path(name);
+        git(
+            s.dir.path(),
+            &["clone", "-q", "--mirror", &s.url, c.to_str().unwrap()],
+        );
+        git(&c, &["fsck", "--strict", "--no-progress"]);
+        assert_eq!(count(&c, "main"), head);
+        assert_eq!(count(&c, "old-side"), 21);
+        assert_eq!(git(&c, &["rev-parse", "v-old^{commit}"]), tip(30));
+        // Old trunk commits that something still depends on, fetched by id.
+        let b = s.path(&format!("{name}-by-id"));
+        init(&b);
+        git(&b, &["fetch", "-q", &s.url, &c10, &c45]);
+        git(&b, &["fsck", "--strict", "--no-progress"]);
+        assert_eq!(count(&b, &c45), 45);
+    };
+    check("mirror1", 120);
+    // Dropped history (above position 50, nothing depends on it) is gone.
+    let b = s.path("dropped");
+    init(&b);
+    git_fails(&b, &["fetch", "-q", &s.url, &c55]);
+    for (_, c) in &stale {
+        git(c, &["fetch", "-q"]);
+        git(c, &["fsck", "--strict", "--no-progress"]);
+        git(c, &["reset", "-q", "--hard", "origin/main"]);
+    }
+    catch_up(&stale[0].1, &a, true);
+
+    // Rewrite again, from inside a cover of the second epoch, then collect.
+    git(&a, &["checkout", "-q", "-B", "main", &tip(100)]);
+    commit(&a, "f", "rewritten again");
+    git(&a, &["push", "-qf", "origin", "main"]);
+    push_trunk(&s, &a, 20, &[]);
+    s.compact();
+    pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    check("mirror2", 50 + 40 + 1 + 20);
+    let data = s.dir.path().join("data");
+    assert_eq!(
+        pando::backup::verify(&data, true).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn trunk_pack_a_branch_depends_on_survives_merging() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "origin", "main"]);
+    // One push, one pack: trunk version 2 plus a feature commit trunk does not reach.
+    git(&a, &["checkout", "-qb", "feature"]);
+    let f1 = commit(&a, "feat", "1");
+    git(&a, &["checkout", "-q", "main"]);
+    commit(&a, "f", "trunk");
+    git(&a, &["push", "-q", "origin", "main", "feature"]);
+    // A branch on the feature commit depends on that trunk pack directly.
+    git(&a, &["checkout", "-qb", "other", &f1]);
+    commit(&a, "other", "1");
+    git(&a, &["push", "-q", "origin", "other"]);
+    git(&a, &["push", "-q", "origin", "--delete", "feature"]);
+    git(&a, &["checkout", "-q", "main"]);
+    let repo = s.repo();
+    let p2 = repo
+        .meta
+        .lock()
+        .unwrap()
+        .trunk_version(2)
+        .unwrap()
+        .unwrap()
+        .pack
+        .unwrap();
+
+    push_trunk(&s, &a, 10, &[]);
+    s.compact();
+    pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    {
+        let m = repo.meta.lock().unwrap();
+        assert!(m.trunk_version(2).unwrap().unwrap().merged);
+        let cover = planner::piece_at(&m, 2).unwrap().unwrap();
+        assert!(cover.level > 0 && cover.pack != Some(p2));
+        // Trunk objects moved to the cover; the feature commit stays with its pack.
+        let f1 = m.object(&Oid::from_hex(&f1).unwrap()).unwrap().unwrap();
+        assert_eq!(f1.pack, p2);
+    }
+    assert!(
+        repo.store.has(&p2),
+        "the pack `other` depends on was deleted"
+    );
+
+    // A client with trunk fetches the branch alone.
+    let b = clone(&s, "b", true);
+    git(&b, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&b, "origin/other"), 3);
+    let c = s.path("c");
+    init(&c);
+    git(
+        &c,
+        &["fetch", "-q", a.to_str().unwrap(), "main:refs/heads/trunk"],
+    );
+    git(&c, &["fetch", "-q", &s.url, "other"]);
+    git(&c, &["fsck", "--strict", "--no-progress"]);
+    let data = s.dir.path().join("data");
+    assert_eq!(
+        pando::backup::verify(&data, true).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn covers_over_the_size_cap_are_left_in_smaller_pieces() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    push_trunk(&s, &a, 40, &[]);
+    let repo = s.repo();
+    let largest = (1..=40)
+        .map(|seq| {
+            let pack = repo
+                .meta
+                .lock()
+                .unwrap()
+                .trunk_version(seq)
+                .unwrap()
+                .unwrap()
+                .pack
+                .unwrap();
+            repo.store.pack_size(&pack).unwrap()
+        })
+        .max()
+        .unwrap();
+    // Room for four versions, not sixteen: L2 [1..16] is refused, and L1 [1..4]
+    // through [33..36] are built anyway.
+    let cap = 6 * largest;
+    assert_eq!(
+        pando::compact::run_with_limit(&repo.meta, &repo.store, cap).unwrap(),
+        9
+    );
+    let levels: Vec<u32> = trunk_pieces(&s, 0, 40).iter().map(|p| p.level).collect();
+    assert_eq!(levels, [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+    let c = clone(&s, "c", true);
+    git(&c, &["fsck", "--strict", "--no-progress"]);
+    // Under the default cap, L2 [1..16] is built from the L1 covers.
+    assert_eq!(s.compact(), 1);
+    assert_eq!(trunk_pieces(&s, 0, 40)[0].level, 2);
+    catch_up(&c, &a, false);
+}
+
+#[test]
+fn a_cover_left_pending_by_a_crash_is_finished_later() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    push_trunk(&s, &a, 8, &[]);
+    let repo = s.repo();
+    // Compaction's first steps for L1 [1..4], then a "crash": built and recorded as
+    // pending, never finished.
+    let parts: Vec<Oid> = trunk_pieces(&s, 0, 4)
+        .iter()
+        .filter_map(|p| p.pack)
+        .collect();
+    let maps: Vec<_> = parts
+        .iter()
+        .map(|p| repo.store.map_pack(p).unwrap())
+        .collect();
+    let idxs: Vec<_> = parts
+        .iter()
+        .map(|p| repo.store.read_idx(p).unwrap())
+        .collect();
+    let inputs: Vec<(&[u8], &[pando::pack::IdxEntry])> = maps
+        .iter()
+        .zip(&idxs)
+        .map(|(m, i)| (&m[..], i.as_slice()))
+        .collect();
+    let (path, (hash, idx)) = repo
+        .store
+        .stage(|out| pando::pack::concat(&inputs, out).map(|(h, i, _)| (h, i)))
+        .unwrap();
+    {
+        let mut m = repo.meta.lock().unwrap();
+        repo.store.publish(&path, &hash, &idx).unwrap();
+        let cover = pando::meta::Piece {
+            level: 1,
+            start: 1,
+            end: 4,
+            pack: Some(hash),
+            side: vec![],
+        };
+        m.record_cover(&cover, 0).unwrap();
+    }
+    // Nothing changed for readers, and gc keeps both the parts and the pending cover.
+    assert_eq!(trunk_pieces(&s, 0, 8).len(), 8);
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert_eq!(r.deleted, 0, "{r:?}");
+    assert!(repo.store.has(&hash));
+
+    // The next run finishes it, then builds what else is due.
+    assert_eq!(s.compact(), 1);
+    let first = trunk_pieces(&s, 0, 8)[0].clone();
+    assert_eq!((first.level, first.pack), (1, Some(hash)));
+    let r = pando::gc::run(&repo, std::time::Duration::ZERO).unwrap();
+    assert_eq!(r.deleted, 4, "{r:?}");
+    let c = clone(&s, "c", true);
+    git(&c, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&c, "HEAD"), 8);
 }

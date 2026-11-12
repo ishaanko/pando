@@ -752,28 +752,34 @@ pub fn empty_pack() -> Vec<u8> {
 /// against the base's new position (which is always earlier, since input order is
 /// preserved); ref deltas and whole objects are copied byte for byte. Used for
 /// compaction covers and for inline fetch responses to clients without packfile-uris.
+///
+/// Output streams to `out`. Memory grows with the number of objects (the input and
+/// returned indexes, plus about 40 bytes each), never with their size.
 pub fn concat<W: Write>(
     packs: &[(&[u8], &[IdxEntry])],
     out: W,
 ) -> io::Result<(Oid, Vec<IdxEntry>, W)> {
-    let mut seen = HashSet::new();
-    let keep: Vec<Vec<bool>> = packs
-        .iter()
-        .map(|(_, idx)| idx.iter().map(|e| seen.insert(e.oid)).collect())
-        .collect();
-    let total: usize = keep.iter().flatten().filter(|k| **k).count();
+    // Where each object first appears, as (pack, entry). Later copies are dropped.
+    let mut first: HashMap<Oid, (u32, u32)> = HashMap::new();
+    for (p, (_, idx)) in packs.iter().enumerate() {
+        for (i, e) in idx.iter().enumerate() {
+            first.entry(e.oid).or_insert((p as u32, i as u32));
+        }
+    }
+    let total = u32::try_from(first.len()).map_err(|_| io::Error::other("too many objects"))?;
 
     let mut w = HashingWriter::new(out);
     w.write_all(b"PACK\0\0\0\x02")?;
-    w.write_all(&(total as u32).to_be_bytes())?;
-    let mut new_offset: HashMap<Oid, u64> = HashMap::new();
-    let mut entries = Vec::with_capacity(total);
+    w.write_all(&total.to_be_bytes())?;
+    // Each entry's offset in the new pack, by input pack (u64::MAX where dropped).
+    let mut new_offsets: Vec<Vec<u64>> = Vec::with_capacity(packs.len());
+    let mut entries = Vec::with_capacity(first.len());
     let mut head = Vec::with_capacity(32);
-    for ((buf, idx), keep) in packs.iter().zip(&keep) {
-        let oid_at: HashMap<u64, Oid> = idx.iter().map(|e| (e.offset, e.oid)).collect();
+    for (p, (buf, idx)) in packs.iter().enumerate() {
+        let mut offsets = vec![u64::MAX; idx.len()];
         let body_end = buf.len() as u64 - 20;
         for (i, e) in idx.iter().enumerate() {
-            if !keep[i] {
+            if first[&e.oid] != (p as u32, i as u32) {
                 continue;
             }
             let end = idx.get(i + 1).map_or(body_end, |n| n.offset);
@@ -783,10 +789,23 @@ pub fn concat<W: Write>(
             head.clear();
             match h.base {
                 Base::Offset(base_off) => {
-                    let base_oid = oid_at
-                        .get(&base_off)
-                        .ok_or_else(|| io::Error::other("dangling ofs-delta"))?;
-                    let base_new = new_offset[base_oid];
+                    // Entries are in pack order, so the base is found by offset.
+                    let j = idx
+                        .binary_search_by_key(&base_off, |e| e.offset)
+                        .map_err(|_| io::Error::other("dangling ofs-delta"))?;
+                    // Written from this pack, or else from an earlier one.
+                    let base_new = match offsets[j] {
+                        u64::MAX => {
+                            let (bp, bi) = first[&idx[j].oid];
+                            new_offsets
+                                .get(bp as usize)
+                                .map_or(u64::MAX, |o| o[bi as usize])
+                        }
+                        o => o,
+                    };
+                    if base_new >= here {
+                        return Err(io::Error::other("ofs-delta base after the delta"));
+                    }
                     encode_type_size(OFS_DELTA, h.size as u64, &mut head);
                     encode_ofs(here - base_new, &mut head);
                 }
@@ -794,12 +813,13 @@ pub fn concat<W: Write>(
             }
             w.write_all(&head)?;
             w.write_all(data)?;
-            new_offset.insert(e.oid, here);
+            offsets[i] = here;
             entries.push(IdxEntry {
                 offset: here,
                 oid: e.oid,
             });
         }
+        new_offsets.push(offsets);
     }
     let (hash, inner) = w.finish()?;
     Ok((hash, entries, inner))

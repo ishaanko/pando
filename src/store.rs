@@ -62,28 +62,9 @@ impl BlobStore {
         self.write_idx(hash, idx)
     }
 
-    /// Store a pack built in memory (compaction output), durably.
-    pub fn put(&self, hash: &Oid, bytes: &[u8], idx: &[IdxEntry]) -> io::Result<()> {
-        if self.has(hash) {
-            return Ok(());
-        }
-        let tmp = self.stage(bytes)?;
-        self.install(&tmp, &self.pack_path(hash))?;
-        self.write_idx(hash, idx)
-    }
-
     fn write_idx(&self, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
-        let tmp = self.stage(&pack::encode_idx(idx))?;
+        let (tmp, ()) = self.stage(|out| out.write_all(&pack::encode_idx(idx)))?;
         self.install(&tmp, &self.idx_path(hash))
-    }
-
-    /// Write `bytes` to a fresh staging file and sync it.
-    fn stage(&self, bytes: &[u8]) -> io::Result<PathBuf> {
-        let tmp = self.staging_path();
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(tmp)
     }
 
     /// Rename a synced staging file into `packs/` and make the rename durable.
@@ -92,8 +73,32 @@ impl BlobStore {
         sync_dir(&self.root.join("packs"))
     }
 
-    pub fn read_pack(&self, hash: &Oid) -> io::Result<Vec<u8>> {
-        fs::read(self.pack_path(hash))
+    /// Stream a file built here (a compaction cover, an index) into a fresh staging
+    /// file through `write`, and sync it. A pack is then published with
+    /// [`BlobStore::publish`]. The file is removed if writing fails.
+    pub fn stage<T>(
+        &self,
+        write: impl FnOnce(&mut io::BufWriter<fs::File>) -> io::Result<T>,
+    ) -> io::Result<(PathBuf, T)> {
+        let path = self.staging_path();
+        let result = (|| {
+            let mut out = io::BufWriter::with_capacity(1 << 20, fs::File::create(&path)?);
+            let value = write(&mut out)?;
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok(value)
+        })();
+        match result {
+            Ok(value) => Ok((path, value)),
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Size in bytes of a stored pack.
+    pub fn pack_size(&self, hash: &Oid) -> io::Result<u64> {
+        Ok(fs::metadata(self.pack_path(hash))?.len())
     }
 
     /// Map a stored pack into memory. Packs are immutable, so the mapping is stable.
@@ -140,19 +145,30 @@ impl BlobStore {
 
     /// Remove staging files older than `age` (left by interrupted pushes).
     pub fn clean_staging(&self, age: std::time::Duration) -> io::Result<()> {
-        for entry in fs::read_dir(self.root.join("tmp"))? {
-            let entry = entry?;
-            let old = entry
-                .metadata()?
-                .modified()?
-                .elapsed()
-                .is_ok_and(|e| e >= age);
-            if old {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        Ok(())
+        remove_stale(&self.root.join("tmp"), age)
     }
+}
+
+/// Remove files in `dir` that were last written more than `age` ago: staging files
+/// left by interrupted writes. A missing directory is fine.
+pub fn remove_stale(dir: &Path, age: std::time::Duration) -> io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let old = entry
+            .metadata()?
+            .modified()?
+            .elapsed()
+            .is_ok_and(|e| e >= age);
+        if old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// Flush a directory's entries (new names, renames) to disk.

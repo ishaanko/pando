@@ -4,24 +4,30 @@
 //! the metadata store, and the answer is a set of existing packs:
 //!
 //! - Trunk is a linear chain, so "what the client has" collapses to one number
-//!   (`trunk_have`) and "what it wants" to another (`trunk_want`). The range between
-//!   them is covered greedily with compaction covers (L4 down to L0), which is the
-//!   skip-list walk that keeps a catch-up fetch to O(log Δ) packs.
+//!   (`trunk_have`) and "what it wants" to another (`trunk_want`). Compaction keeps
+//!   every trunk position in exactly one *piece* (a version's own pack, or one cover;
+//!   see `compact.rs`), so the range between them is served by walking pieces: the
+//!   piece holding `trunk_have + 1`, then the one after it, up to `trunk_want`. If the
+//!   client's position falls inside a cover, the whole cover is sent. Compaction's
+//!   merge rule keeps that overshoot below the distance the client is behind, and
+//!   the walk to O(log Δ) packs.
 //! - Any other ref version is one pack plus its trunk dependency.
 //! - After trunk is rewritten, positions from earlier epochs are served as every chain
-//!   version up to that position (see `meta.rs`).
+//!   version up to that position (see `meta.rs`), also by walking pieces. An earlier
+//!   epoch's chain version that compaction merged is served that way too.
 //!
 //! Packs may contain objects the client already has. That is the trade: the same
 //! bytes are served to every reader, so they can be cached like a CDN.
 
-use crate::meta::{Meta, Version};
+use crate::meta::{Meta, Piece, Version};
 use crate::object::Oid;
 use std::collections::{HashSet, VecDeque};
 
 /// Compaction fan-out: a level-L cover spans `FANOUT^L` trunk versions.
 pub const FANOUT: u64 = 4;
-/// Highest compaction level.
-pub const MAX_LEVEL: u32 = 4;
+/// Highest compaction level. Its span (4^16, about 4 billion versions) is never
+/// reached in practice, so covers have no fixed ceiling.
+pub const MAX_LEVEL: u32 = 16;
 /// How many commits to walk back from the haves, in total, looking for known ref
 /// version tips.
 const HAVE_WALK_LIMIT: usize = 4096;
@@ -49,6 +55,8 @@ pub struct Plan {
 pub enum PlanError {
     #[error("not our ref {0}")]
     NotOurRef(Oid),
+    #[error("trunk version {0} is merged but no cover holds it")]
+    Uncovered(u64),
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
 }
@@ -116,6 +124,10 @@ pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError
         };
         if version.on_trunk {
             p.trunk_want = p.trunk_want.max(version.seq);
+        } else if version.merged {
+            // An earlier epoch's chain version whose pack a cover replaced: serve its
+            // position (every chain version up to it, a superset).
+            need(&mut p, &mut old_want, version.seq);
         } else if !had_versions.contains(&version.id) {
             need(&mut p, &mut old_want, version.deps.trunk);
             work.extend(version.pack);
@@ -210,37 +222,58 @@ fn tips_reachable_from(
     Ok((known, tips))
 }
 
-/// Packs covering trunk versions `(have, want]`, using the largest aligned cover that
-/// fits at each step, plus the non-trunk packs those versions depend on.
+/// Packs holding trunk positions `(have, want]` (see [`pieces`]), plus the non-trunk
+/// packs those positions depend on.
 pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<Oid>), PlanError> {
     let mut packs = Vec::new();
     let mut deps = Vec::new();
-    let mut at = have; // versions 1..=at are covered
-    'outer: while at < want {
-        for level in (1..=MAX_LEVEL).rev() {
-            let s = span(level);
-            if at.is_multiple_of(s)
-                && at + s <= want
-                && let Some(cover) = meta.cover(level, at + 1)?
-            {
-                packs.extend(cover.pack);
-                deps.extend(cover.packs);
-                at += s;
-                continue 'outer;
-            }
-        }
-        match meta.trunk_version(at + 1)? {
-            Some(v) => {
-                packs.extend(v.pack);
-                deps.extend(v.deps.packs);
+    for piece in pieces(meta, have, want)? {
+        packs.extend(piece.pack);
+        deps.extend(piece.side);
+    }
+    Ok((packs, deps))
+}
+
+/// The pieces holding trunk positions `(have, want]`, in order. The first may start
+/// at or before `have`, and the last may end after `want`.
+pub fn pieces(meta: &Meta, have: u64, want: u64) -> Result<Vec<Piece>, PlanError> {
+    let mut out = Vec::new();
+    let mut at = have; // positions 1..=at are covered
+    while at < want {
+        match piece_at(meta, at + 1)? {
+            Some(piece) => {
+                at = piece.end;
+                out.push(piece);
             }
             // gc removes earlier-epoch versions that nothing needed. Such a gap lies
             // above every position anything still depends on, so it holds nothing
             // this range needs.
-            None if at + 1 < meta.epoch_start => {}
+            None if at + 1 < meta.epoch_start => {
+                at = meta.next_trunk_seq(at + 1)?.map_or(want, |next| next - 1);
+            }
             None => return Err(PlanError::NotOurRef(Oid::ZERO)),
         }
-        at += 1;
     }
-    Ok((packs, deps))
+    Ok(out)
+}
+
+/// The piece holding chain position `seq`: its version if not merged, otherwise the
+/// cover that merged it. `None` if gc removed the version.
+pub fn piece_at(meta: &Meta, seq: u64) -> Result<Option<Piece>, PlanError> {
+    let Some(v) = meta.trunk_version(seq)? else {
+        return Ok(None);
+    };
+    if !v.merged {
+        return Ok(Some(Piece {
+            level: 0,
+            start: seq,
+            end: seq,
+            pack: v.pack,
+            side: v.deps.packs,
+        }));
+    }
+    match meta.cover_containing(seq)? {
+        Some(cover) => Ok(Some(cover)),
+        None => Err(PlanError::Uncovered(seq)),
+    }
 }

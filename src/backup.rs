@@ -1,6 +1,9 @@
 //! Backups. `pando backup` takes a consistent copy of a data directory while the
 //! server keeps running, `pando restore` puts one in place, and `pando verify` checks
-//! that every pack the metadata needs is present (and with `--full`, intact).
+//! that every pack the metadata knows is present (and with `--full`, intact), and that
+//! everything the refs need is: every trunk position is held by a stored piece (its
+//! version's pack, or the compaction cover that merged it), as gc and the planner
+//! see it.
 //!
 //! Each repository's metadata is snapshotted with SQLite's `VACUUM INTO`. Packs never
 //! change once written, so they are hard-linked (or copied across filesystems) after
@@ -122,8 +125,8 @@ pub fn restore(from: &Path, data: &Path) -> anyhow::Result<Summary> {
 }
 
 /// Problems found in a data directory: packs the metadata knows that are missing or
-/// (with `full`) corrupt, refs whose tips are not stored, and stray or (with `full`)
-/// corrupt LFS objects.
+/// (with `full`) corrupt, packs the refs need that are not stored, refs whose tips
+/// are not stored, and stray or (with `full`) corrupt LFS objects.
 pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
     let mut problems = Vec::new();
     for name in repo_names(data)? {
@@ -145,6 +148,18 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
             if full && let Err(e) = check_pack(&store, &hash) {
                 problems.push(format!("{name}: pack {hash}: {e}"));
             }
+        }
+        match crate::gc::needed_packs(&meta) {
+            Ok(needed) => {
+                let mut needed: Vec<Oid> = needed.into_iter().collect();
+                needed.sort();
+                for hash in needed {
+                    if !store.has(&hash) || !store.pack_path(&hash).exists() {
+                        problems.push(format!("{name}: needed pack {hash} is missing"));
+                    }
+                }
+            }
+            Err(e) => problems.push(format!("{name}: {e:#}")),
         }
         for v in meta.refs(&[])? {
             if meta.object(&v.tip)?.is_none() {
