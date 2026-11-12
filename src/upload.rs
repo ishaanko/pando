@@ -10,7 +10,7 @@
 //! so a cached answer is never served for a commit gc has dropped.
 
 use crate::generate::{self, Answer};
-use crate::meta::Meta;
+use crate::meta::View;
 use crate::object::Oid;
 use crate::pack::{self, IdxEntry};
 use crate::pktline::{self, Packet, SidebandWriter};
@@ -89,7 +89,7 @@ pub fn v2_capabilities() -> Vec<u8> {
 }
 
 /// Capabilities offered to v0/v1 clients.
-fn v0_capabilities(meta: &Meta) -> String {
+fn v0_capabilities(meta: &View) -> String {
     let symref = if meta.trunk_fixed().unwrap_or(false) {
         format!(" symref=HEAD:{}", meta.trunk)
     } else {
@@ -103,7 +103,7 @@ fn v0_capabilities(meta: &Meta) -> String {
 }
 
 /// The v0/v1 ref advertisement: HEAD, every ref, and peeled tags.
-pub fn v0_advertisement(meta: &Meta, version: Version) -> anyhow::Result<Vec<u8>> {
+pub fn v0_advertisement(meta: &View, version: Version) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     if version == Version::V1 {
         pktline::line(&mut out, "version 1\n");
@@ -146,7 +146,7 @@ pub async fn advertise(repo: Arc<Repo>, headers: &HeaderMap) -> anyhow::Result<R
         if version == Version::V2 {
             out.extend(v2_capabilities());
         } else {
-            out.extend(v0_advertisement(&repo.meta.lock().unwrap(), version)?);
+            out.extend(v0_advertisement(&*repo.read()?, version)?);
         }
         Ok(out)
     })
@@ -226,7 +226,8 @@ fn converse(
         }
         return Ok(());
     }
-    out.write_all(&v0_advertisement(&repo.meta.lock().unwrap(), version)?)?;
+    let refs = v0_advertisement(&*repo.read()?, version)?;
+    out.write_all(&refs)?;
     out.flush()?;
     session_v0(server, repo, r, out, false)
 }
@@ -263,7 +264,10 @@ fn command(
         .to_string();
     let args = read_section(r)?;
     match command.as_str() {
-        "ls-refs" => out.write_all(&ls_refs(&repo.meta.lock().unwrap(), &args)?)?,
+        "ls-refs" => {
+            let refs = ls_refs(&*repo.read()?, &args)?;
+            out.write_all(&refs)?
+        }
         "fetch" => fetch(server, repo, &FetchArgs::parse(&args), out)?,
         "" => return Ok(false), // a bare flush or hang-up: the client is done
         other => anyhow::bail!("unknown command {other}"),
@@ -271,7 +275,7 @@ fn command(
     Ok(true)
 }
 
-fn ls_refs(meta: &Meta, args: &[String]) -> anyhow::Result<Vec<u8>> {
+fn ls_refs(meta: &View, args: &[String]) -> anyhow::Result<Vec<u8>> {
     let symrefs = args.iter().any(|a| a == "symrefs");
     let peel = args.iter().any(|a| a == "peel");
     let unborn = args.iter().any(|a| a == "unborn");
@@ -349,7 +353,8 @@ impl FetchArgs {
 
 /// Plan which stored packs answer `wants` given `haves`.
 fn plan_for(repo: &Repo, wants: &[Oid], haves: &[Oid]) -> anyhow::Result<Plan> {
-    match planner::plan(&repo.meta.lock().unwrap(), wants, haves) {
+    let planned = planner::plan(&*repo.read()?, wants, haves);
+    match planned {
         Ok(p) => Ok(p),
         Err(PlanError::NotOurRef(oid)) => anyhow::bail!("upload-pack: not our ref {oid}"),
         Err(e) => Err(e.into()),
@@ -426,9 +431,15 @@ fn fetch(
                 .iter()
                 .any(|p| base.starts_with(&format!("{p}://")))
         });
-    if use_uris {
+    // The largest packs go out as URIs, the rest inline in the same response.
+    let (by_uri, inline) = if use_uris {
+        split_uris(repo, &plan.packs)?
+    } else {
+        (Vec::new(), plan.packs.clone())
+    };
+    if !by_uri.is_empty() {
         pktline::line(&mut head, "packfile-uris\n");
-        for hash in &plan.packs {
+        for hash in &by_uri {
             let node = express::pick_node(&nodes, hash);
             // With auth on, a signed, expiring URL stands in for the client's token.
             let query = if server.packs_need_auth() {
@@ -445,28 +456,44 @@ fn fetch(
     }
     pktline::line(&mut head, "packfile\n");
     if args.progress {
-        let how = if use_uris {
-            "as packfile URIs"
-        } else {
-            "inline"
-        };
         let msg = format!(
-            "pando: trunk {}..{}, {} pack(s) {how}\n",
+            "pando: trunk {}..{}, {} pack(s) as packfile URIs, {} inline\n",
             plan.trunk_have,
             plan.trunk_want,
-            plan.packs.len()
+            by_uri.len(),
+            inline.len()
         );
         pktline::sideband(&mut head, 2, msg.as_bytes());
     }
     out.write_all(&head)?;
 
-    let packs = if use_uris { &[][..] } else { &plan.packs[..] };
     let sent = send_packfile(out, Some(pktline::MAX_PAYLOAD - 1), |data| {
-        write_stored_packs(repo, packs, data)
+        write_stored_packs(repo, &inline, data)
     });
     metrics::FETCHES.inc();
     metrics::FETCH_TIME.observe(started.elapsed());
     sent
+}
+
+/// Most packfile URIs in one response. Each costs the client a request and an
+/// `index-pack` run (about 17 ms on a local clone), so past this many the smaller packs
+/// travel inline instead. Eight holds a whole top compaction level (at most
+/// `2 * FANOUT - 1` covers, most of trunk's bytes) plus one.
+const MAX_URIS: usize = 8;
+
+/// Split planned packs into those sent as URIs (the [`MAX_URIS`] largest, which are
+/// the ones worth caching) and those spliced into the inline pack, keeping plan order.
+fn split_uris(repo: &Repo, packs: &[Oid]) -> io::Result<(Vec<Oid>, Vec<Oid>)> {
+    if packs.len() <= MAX_URIS {
+        return Ok((packs.to_vec(), Vec::new()));
+    }
+    let mut sizes = packs
+        .iter()
+        .map(|p| Ok((repo.store.pack_size(p)?, *p)))
+        .collect::<io::Result<Vec<_>>>()?;
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let largest: HashSet<Oid> = sizes.iter().take(MAX_URIS).map(|(_, p)| *p).collect();
+    Ok(packs.iter().partition(|p| largest.contains(p)))
 }
 
 /// One v0/v1 upload-pack negotiation. Over HTTP (`stateless`) each request carries

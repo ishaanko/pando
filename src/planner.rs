@@ -19,7 +19,7 @@
 //! Packs may contain objects the client already has. That is the trade: the same
 //! bytes are served to every reader, so they can be cached like a CDN.
 
-use crate::meta::{Meta, Piece, Version};
+use crate::meta::{Piece, Version, View};
 use crate::object::Oid;
 use std::collections::{HashSet, VecDeque};
 
@@ -61,7 +61,7 @@ pub enum PlanError {
     Db(#[from] rusqlite::Error),
 }
 
-pub fn plan(meta: &Meta, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError> {
+pub fn plan(meta: &View, wants: &[Oid], haves: &[Oid]) -> Result<Plan, PlanError> {
     let mut p = Plan::default();
     let mut had_versions = HashSet::new();
     let mut had_packs = HashSet::new();
@@ -192,7 +192,7 @@ fn best_version(mut vs: Vec<Version>) -> Option<Version> {
 /// trunk tip stops that path, since trunk tips imply every earlier trunk version of
 /// their epoch.
 fn tips_reachable_from(
-    meta: &Meta,
+    meta: &View,
     have: &Oid,
     walked: &mut HashSet<Oid>,
 ) -> Result<(bool, Vec<Version>), PlanError> {
@@ -224,7 +224,7 @@ fn tips_reachable_from(
 
 /// Packs holding trunk positions `(have, want]` (see [`pieces`]), plus the non-trunk
 /// packs those positions depend on.
-pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<Oid>), PlanError> {
+pub fn cover_trunk(meta: &View, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<Oid>), PlanError> {
     let mut packs = Vec::new();
     let mut deps = Vec::new();
     for piece in pieces(meta, have, want)? {
@@ -236,7 +236,7 @@ pub fn cover_trunk(meta: &Meta, have: u64, want: u64) -> Result<(Vec<Oid>, Vec<O
 
 /// The pieces holding trunk positions `(have, want]`, in order. The first may start
 /// at or before `have`, and the last may end after `want`.
-pub fn pieces(meta: &Meta, have: u64, want: u64) -> Result<Vec<Piece>, PlanError> {
+pub fn pieces(meta: &View, have: u64, want: u64) -> Result<Vec<Piece>, PlanError> {
     let mut out = Vec::new();
     let mut at = have; // positions 1..=at are covered
     while at < want {
@@ -259,7 +259,7 @@ pub fn pieces(meta: &Meta, have: u64, want: u64) -> Result<Vec<Piece>, PlanError
 
 /// The piece holding chain position `seq`: its version if not merged, otherwise the
 /// cover that merged it. `None` if gc removed the version.
-pub fn piece_at(meta: &Meta, seq: u64) -> Result<Option<Piece>, PlanError> {
+pub fn piece_at(meta: &View, seq: u64) -> Result<Option<Piece>, PlanError> {
     let Some(v) = meta.trunk_version(seq)? else {
         return Ok(None);
     };

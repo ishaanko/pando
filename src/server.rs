@@ -8,11 +8,18 @@
 //! - `POST /<repo>.git/git-receive-pack`       push (see `receive.rs`)
 //! - `GET  /<repo>.git/pack/<hash>.pack`       stored packs (the local Express origin)
 //! - `/<repo>.git/info/lfs/...`                 Git LFS (see `lfs.rs`)
+//!
+//! Locking. Each repository has one writer, `Repo::meta`: the only read-write SQLite
+//! connection, behind a mutex. Pushes (through [`Repo::write`], which commits the
+//! pushes queued for the lock in one transaction), gc, compaction and admin changes
+//! take it. Fetches and ref advertisements never do: they read a snapshot through
+//! their own read-only connections (WAL), so a fetch never waits for a push. Pack
+//! files are written and fsynced outside the lock; only gc deletes them, under it.
 
 use crate::auth::{Access, LiveAuth, UrlSigner};
 use crate::express::{self, Express};
 use crate::fetch_cache::FetchCache;
-use crate::meta::Meta;
+use crate::meta::{Meta, Readers, Snapshot};
 use crate::store::BlobStore;
 use crate::{receive, upload};
 use axum::Router;
@@ -24,7 +31,7 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -108,7 +115,12 @@ pub struct Repo {
     pub dir: PathBuf,
     /// Set once the repository is deleted or renamed; holders of this handle stop.
     pub closed: std::sync::atomic::AtomicBool,
+    /// The writer: pushes, gc, compaction and admin changes take this lock.
     pub meta: Mutex<Meta>,
+    /// Read-only connections for fetches and advertisements (see [`Repo::read`]).
+    pub readers: Readers,
+    /// Writes waiting for `meta`, committed together (see [`Repo::write`]).
+    queue: Mutex<Vec<Queued>>,
     pub store: BlobStore,
     /// Signalled after trunk moves, to wake the compactor.
     pub compact: Notify,
@@ -309,6 +321,8 @@ impl Server {
             dir: dir.clone(),
             closed: Default::default(),
             meta: Mutex::new(Meta::open(dir.join("meta.db"), &self.cfg.trunk)?),
+            readers: Readers::new(dir.join("meta.db"), &self.cfg.trunk),
+            queue: Mutex::new(Vec::new()),
             store: BlobStore::open(dir.join("blobs"))?,
             compact: Notify::new(),
         });
@@ -349,6 +363,77 @@ impl Repo {
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// A consistent, read-only snapshot of the metadata that does not wait for the
+    /// writer's lock. Drop it before streaming anything.
+    pub fn read(&self) -> rusqlite::Result<Snapshot<'_>> {
+        self.readers.snapshot()
+    }
+
+    /// Run `job` under the metadata lock and commit it durably, sharing the commit
+    /// with other writes queued meanwhile (group commit). Whoever takes the lock runs
+    /// every queued job in one transaction, each in a savepoint (an `Err` rolls back
+    /// only that job), and commits once; nobody returns before the commit holding
+    /// their job is durable. Gc, compaction and admin changes take `meta` directly and
+    /// never see a batch half done: a batch begins and commits within one lock hold.
+    pub fn write<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Meta, &BlobStore) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let result = Arc::new(Mutex::new(None));
+        let committed = Arc::new(OnceLock::new());
+        let slot = result.clone();
+        self.queue.lock().unwrap().push(Queued {
+            job: Box::new(move |meta, store| {
+                let r = job(meta, store);
+                let ok = r.is_ok();
+                *slot.lock().unwrap() = Some(r);
+                ok
+            }),
+            committed: committed.clone(),
+        });
+        {
+            let mut meta = self.meta.lock().unwrap();
+            // Unless a previous holder already ran (and committed) this job, run the
+            // whole queue, this job included.
+            if committed.get().is_none() {
+                let batch = std::mem::take(&mut *self.queue.lock().unwrap());
+                let (jobs, waiting): (Vec<_>, Vec<_>) =
+                    batch.into_iter().map(|q| (q.job, q.committed)).unzip();
+                let store = &self.store;
+                // `retire` marks a repository closed under this lock.
+                let outcome = if self.is_closed() {
+                    Err("repository was moved or deleted".to_string())
+                } else {
+                    meta.batch(
+                        jobs.into_iter()
+                            .map(|job| move |m: &mut Meta| job(m, store)),
+                    )
+                    .map_err(|e| format!("metadata commit failed: {e}"))
+                };
+                crate::metrics::PUSH_COMMITS.inc();
+                for w in waiting {
+                    let _ = w.set(outcome.clone());
+                }
+            }
+        }
+        committed
+            .get()
+            .unwrap()
+            .clone()
+            .map_err(anyhow::Error::msg)?;
+        result.lock().unwrap().take().unwrap()
+    }
+}
+
+/// Runs a queued write; returns false if it failed (and must be rolled back).
+type WriteJob = Box<dyn FnOnce(&mut Meta, &BlobStore) -> bool + Send>;
+
+/// A write queued for [`Repo::write`].
+struct Queued {
+    job: WriteJob,
+    /// Set once the transaction holding the job has committed (or failed to).
+    committed: Arc<OnceLock<Result<(), String>>>,
 }
 
 /// Compact a repository after trunk moves, and at least every `every`.

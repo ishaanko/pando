@@ -1,11 +1,21 @@
 //! Blob storage for packs. Packs are immutable and keyed by their trailer hash, so a
-//! write is "stage, then rename into place", and readers never see partial packs.
-//! This stands in for an object store; nothing else in Pando touches pack bytes.
+//! write is "stage, then rename (or link) into place", and readers never see partial
+//! packs. This stands in for an object store; nothing else in Pando touches pack bytes.
 //!
-//! Durability: every file is fsynced before its rename, and `packs/` after it. A pack's
-//! rename is durable before its index is written, and the index's before a write
-//! returns, so once a write returns its pack survives power loss and metadata may name
-//! it. Deletes are not synced: a pack that reappears after a crash is just garbage.
+//! A stored pack is two files in `packs/`: `<hash>.pack` and its index sidecar
+//! `<hash>.pidx`. It counts as stored ([`BlobStore::has`]) only when both exist.
+//!
+//! Durability: every file is fsynced while still in staging, so any name in `packs/`
+//! that survives a power loss names complete contents. Publishing puts both names in
+//! place and then fsyncs `packs/` once, so when it returns the pack survives power loss
+//! and metadata may name it. A crash before that sync can leave either name without
+//! the other; [`BlobStore::has`] then says the pack is not stored, and publishing it
+//! again completes it. Deletes are not synced: a pack that reappears after a crash is
+//! just garbage, and half of one is not stored.
+//!
+//! Pushes publish before taking the metadata lock (see `receive.rs`); deletes happen
+//! only under it (gc). [`BlobStore::deletions`] lets a pusher tell, under the lock,
+//! whether a delete could have removed what it published meanwhile.
 
 use crate::object::Oid;
 use crate::pack::{self, IdxEntry};
@@ -17,6 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct BlobStore {
     root: PathBuf,
     staged: AtomicU64,
+    /// Calls to [`BlobStore::delete`] so far.
+    deleted: AtomicU64,
 }
 
 impl BlobStore {
@@ -27,6 +39,7 @@ impl BlobStore {
         Ok(BlobStore {
             root,
             staged: AtomicU64::new(0),
+            deleted: AtomicU64::new(0),
         })
     }
 
@@ -47,30 +60,56 @@ impl BlobStore {
         self.root.join("packs").join(format!("{hash}.pidx"))
     }
 
+    /// Whether a pack is stored: its file and its index both exist.
     pub fn has(&self, hash: &Oid) -> bool {
-        self.idx_path(hash).exists()
+        self.idx_path(hash).exists() && self.pack_path(hash).exists()
     }
 
     /// Move a validated, already synced staged pack into place along with its sidecar
-    /// index. The index is renamed last, so its presence means the pack is complete.
-    /// Both are durable when this returns.
+    /// index. Both are durable when this returns.
     pub fn publish(&self, staged: &Path, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
+        self.put(staged, hash, idx, false)
+    }
+
+    /// Like [`BlobStore::publish`], but hard-link the staged file into place and leave
+    /// it in staging, so the caller can publish it again if the pack is deleted before
+    /// its metadata is committed.
+    pub fn publish_linked(&self, staged: &Path, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
+        self.put(staged, hash, idx, true)
+    }
+
+    fn put(&self, staged: &Path, hash: &Oid, idx: &[IdxEntry], link: bool) -> io::Result<()> {
+        let packs = self.root.join("packs");
         if self.has(hash) {
-            return fs::remove_file(staged);
+            if !link {
+                fs::remove_file(staged)?;
+            }
+            // Whoever put these names here may not have synced them yet.
+            return sync_dir(&packs);
         }
-        self.install(staged, &self.pack_path(hash))?;
-        self.write_idx(hash, idx)
-    }
-
-    fn write_idx(&self, hash: &Oid, idx: &[IdxEntry]) -> io::Result<()> {
         let (tmp, ()) = self.stage(|out| out.write_all(&pack::encode_idx(idx)))?;
-        self.install(&tmp, &self.idx_path(hash))
+        let dest = self.pack_path(hash);
+        let placed = if link {
+            match fs::hard_link(staged, &dest) {
+                // The same bytes, stored by a concurrent push or left by a crash.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                r => r,
+            }
+        } else {
+            fs::rename(staged, &dest)
+        };
+        if let Err(e) = placed.and_then(|()| fs::rename(&tmp, self.idx_path(hash))) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        sync_dir(&packs)
     }
 
-    /// Rename a synced staging file into `packs/` and make the rename durable.
-    fn install(&self, tmp: &Path, dest: &Path) -> io::Result<()> {
-        fs::rename(tmp, dest)?;
-        sync_dir(&self.root.join("packs"))
+    /// How many times [`BlobStore::delete`] has been called. Deletes run under the
+    /// metadata lock, so if this is unchanged between before a publish and a point
+    /// under the lock, nothing the publish wrote has been deleted.
+    pub fn deletions(&self) -> u64 {
+        self.deleted.load(Ordering::SeqCst)
     }
 
     /// Stream a file built here (a compaction cover, an index) into a fresh staging
@@ -130,10 +169,11 @@ impl BlobStore {
         Ok(out)
     }
 
-    /// Delete a pack and its index. Readers that already opened it keep working.
+    /// Delete a pack and its index. Readers that already opened it keep working. Call
+    /// it only under the metadata lock (see [`BlobStore::deletions`]).
     pub fn delete(&self, hash: &Oid) -> io::Result<u64> {
+        self.deleted.fetch_add(1, Ordering::SeqCst);
         let size = fs::metadata(self.pack_path(hash)).map_or(0, |m| m.len());
-        // Index first: its presence is what marks a pack as complete.
         for path in [self.idx_path(hash), self.pack_path(hash)] {
             match fs::remove_file(path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),

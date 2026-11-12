@@ -27,13 +27,24 @@
 //! position `k` is served as all chain versions `1..=k`, a superset that stays correct
 //! across any number of rewrites.
 //!
+//! Access. [`Meta`] is the writer: one read-write connection that callers serialize
+//! with a lock (see `server.rs`). Pushes commit through [`Meta::batch`] and
+//! [`Meta::push`]: one transaction, one savepoint per push and per ref group, so one
+//! fsync (`synchronous = FULL`, WAL) covers several pushes. Readers use
+//! [`Readers::snapshot`]: a read-only connection inside a read transaction, so a whole
+//! read (planning a fetch, an advertisement) sees one committed state, including the
+//! trunk settings it loads first, while the writer keeps writing. Both share the
+//! queries in [`View`]; only the writer can reach its connection to write.
+//!
 //! SQLite is the reference backend. Nothing here needs more than single-row CAS and
 //! small transactions, so it maps onto any horizontally scalable KV store.
 
 use crate::object::Oid;
 use crate::planner::{MAX_LEVEL, span};
-use rusqlite::{Connection, OptionalExtension, Row, params};
-use std::path::Path;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// What a pack (or a version without a pack) needs besides itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -117,7 +128,7 @@ pub struct Piece {
     pub side: Vec<Oid>,
 }
 
-/// A ref change to apply atomically.
+/// A ref change, applied by compare-and-swap (see [`Meta::push`]).
 pub struct RefUpdate<'a> {
     pub refname: &'a str,
     /// The version id the caller observed. The update fails if the pointer has moved.
@@ -134,7 +145,7 @@ pub struct NewVersion<'a> {
     pub pack_complete: bool,
     pub peeled: Option<Oid>,
     /// On trunk: the objects in `pack` that the new tip reaches. They get this
-    /// version's trunk position (see [`Meta::index_pack`] for the rest).
+    /// version's trunk position.
     pub reached: &'a [Oid],
     /// On trunk: other packs whose every object the new tip now reaches (a branch
     /// that trunk fast-forwarded to or merged). They join trunk at this position too.
@@ -143,12 +154,108 @@ pub struct NewVersion<'a> {
     pub rewrite: bool,
 }
 
-pub struct Meta {
-    pub(crate) conn: Connection,
+/// Read access to a repository's metadata: every query, over one connection, plus the
+/// trunk settings loaded from it. Writers reach it through [`Meta`], readers through a
+/// [`Snapshot`]; the connection is private, so nothing holding only a `View` can write.
+pub struct View {
+    conn: Connection,
     /// The branch that is trunk (and HEAD).
     pub trunk: String,
     /// First chain sequence number of the current epoch.
     pub epoch_start: u64,
+}
+
+/// The writer: the one read-write connection of a repository, behind the repository's
+/// metadata lock (`Repo::meta`). Reads go through [`View`], which it derefs to.
+pub struct Meta(View);
+
+impl Deref for Meta {
+    type Target = View;
+    fn deref(&self) -> &View {
+        &self.0
+    }
+}
+
+impl DerefMut for Meta {
+    fn deref_mut(&mut self) -> &mut View {
+        &mut self.0
+    }
+}
+
+/// Read-only connections to one repository's metadata, kept for reuse.
+pub struct Readers {
+    path: PathBuf,
+    default_trunk: String,
+    idle: Mutex<Vec<Connection>>,
+}
+
+/// Idle reader connections kept per repository.
+const MAX_IDLE_READERS: usize = 16;
+
+impl Readers {
+    /// Readers of the database at `path`, which [`Meta::open`] has created.
+    pub fn new(path: impl Into<PathBuf>, default_trunk: &str) -> Readers {
+        Readers {
+            path: path.into(),
+            default_trunk: default_trunk.to_string(),
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// One consistent view of the metadata: a read transaction that lasts until the
+    /// snapshot is dropped. It never waits for the writer, nor the writer for it, but
+    /// WAL checkpoints cannot pass it, so keep it short (never across streaming a pack).
+    pub fn snapshot(&self) -> rusqlite::Result<Snapshot<'_>> {
+        let idle = self.idle.lock().unwrap().pop();
+        let conn = match idle {
+            Some(conn) => conn,
+            None => {
+                let conn = Connection::open_with_flags(
+                    &self.path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn
+            }
+        };
+        conn.execute_batch("BEGIN")?;
+        let mut view = View {
+            conn,
+            trunk: self.default_trunk.clone(),
+            epoch_start: 1,
+        };
+        // The first read fixes the snapshot, so the trunk settings come from it too.
+        view.load_settings()?;
+        Ok(Snapshot {
+            view: Some(view),
+            readers: self,
+        })
+    }
+}
+
+/// A read transaction on a reader connection (see [`Readers::snapshot`]).
+pub struct Snapshot<'a> {
+    view: Option<View>,
+    readers: &'a Readers,
+}
+
+impl Deref for Snapshot<'_> {
+    type Target = View;
+    fn deref(&self) -> &View {
+        self.view.as_ref().unwrap()
+    }
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        let view = self.view.take().unwrap();
+        if view.conn.execute_batch("COMMIT").is_ok() {
+            let mut idle = self.readers.idle.lock().unwrap();
+            if idle.len() < MAX_IDLE_READERS {
+                idle.push(view.conn);
+            }
+        }
+    }
 }
 
 const VERSION_COLS: &str = "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.side_deps, v.pack_complete, \
@@ -300,15 +407,173 @@ impl Meta {
              );",
         )?;
         migrate(&conn)?;
-        let mut meta = Meta {
+        let mut view = View {
             conn,
             trunk: default_trunk.to_string(),
             epoch_start: 1,
         };
-        meta.load_settings()?;
-        Ok(meta)
+        view.load_settings()?;
+        Ok(Meta(view))
     }
 
+    /// Choose the trunk ref, once. Later calls keep the first choice.
+    pub fn fix_trunk(&mut self, refname: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('trunk', ?1)",
+            [refname],
+        )?;
+        self.load_settings()
+    }
+
+    /// Record a push in one transaction (or savepoint, inside [`Meta::batch`]): index
+    /// its pack (if it stored one), then apply its ref updates in `groups`. Each group lands all-or-nothing, in a savepoint:
+    /// one group per ref for a plain push, a single group for an atomic one. Returns,
+    /// per group, the new versions or why its compare-and-swap failed.
+    pub fn push(
+        &mut self,
+        pack: Option<&PackRows>,
+        groups: &[Vec<&RefUpdate>],
+    ) -> rusqlite::Result<Vec<Result<Vec<Option<Version>>, String>>> {
+        let trunk = self.trunk.clone();
+        let mut epoch = self.epoch_start;
+        // A savepoint, so that it nests in a batch (see [`Meta::batch`]).
+        let mut tx = self.conn.savepoint()?;
+        if let Some(p) = pack {
+            index_pack(&tx, p)?;
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for group in groups {
+            let sp = tx.savepoint()?;
+            let mut e = epoch;
+            match update_refs(&sp, &trunk, &mut e, group)? {
+                Ok(versions) => {
+                    sp.commit()?;
+                    epoch = e;
+                    out.push(Ok(versions));
+                }
+                // Dropping the savepoint rolls the group back.
+                Err(why) => out.push(Err(why)),
+            }
+        }
+        tx.commit()?;
+        self.epoch_start = epoch;
+        Ok(out)
+    }
+
+    /// Run `jobs` in one transaction and commit it once: one fsync for all of them.
+    /// Each job runs in its own savepoint, rolled back alone if it returns false. If
+    /// the commit fails, nothing is written and the error is returned.
+    pub fn batch<J: FnOnce(&mut Meta) -> bool>(
+        &mut self,
+        jobs: impl IntoIterator<Item = J>,
+    ) -> rusqlite::Result<()> {
+        let result = (|| {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            for job in jobs {
+                self.conn.execute_batch("SAVEPOINT job")?;
+                if job(self) {
+                    self.conn.execute_batch("RELEASE job")?;
+                } else {
+                    self.conn.execute_batch("ROLLBACK TO job; RELEASE job")?;
+                    // The job may have cached settings it wrote.
+                    self.load_settings()?;
+                }
+            }
+            self.conn.execute_batch("COMMIT")
+        })();
+        if result.is_err() {
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+            let _ = self.load_settings();
+        }
+        result
+    }
+
+    /// Make another branch trunk (and HEAD). This starts a new epoch whose first
+    /// version is the branch's tip; the old trunk branch continues as a normal branch.
+    pub fn set_trunk(&mut self, branch: &str) -> rusqlite::Result<Result<(), String>> {
+        if branch == self.trunk {
+            return Ok(Ok(()));
+        }
+        let old = self.trunk_head()?;
+        if !branch.starts_with("refs/heads/") {
+            return Ok(Err(format!("{branch} is not a branch")));
+        }
+        let Some(new) = self.current(branch)? else {
+            if old.is_none() {
+                // Nothing pushed yet: just choose the name.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('trunk', ?1)",
+                    [branch],
+                )?;
+                self.load_settings()?;
+                return Ok(Ok(()));
+            }
+            return Ok(Err(format!("no such branch {branch}")));
+        };
+        if new.peeled.is_some() {
+            return Ok(Err(format!("{branch} does not point at a commit")));
+        }
+        let old_trunk = self.trunk.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let insert = |vref: &str, v: &Version, deps: &Deps| -> rusqlite::Result<(u64, i64)> {
+            let seq: u64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM versions WHERE ref = ?1",
+                [vref],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, side_deps, pack_complete, peeled)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, ?6)",
+                params![
+                    vref,
+                    seq,
+                    v.tip.hex(),
+                    deps.trunk,
+                    join_oids(&deps.packs),
+                    v.peeled.map(|p| p.hex())
+                ],
+            )?;
+            Ok((seq, tx.last_insert_rowid()))
+        };
+        let point = |name: &str, id: i64| {
+            tx.execute(
+                "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
+                params![name, id],
+            )
+        };
+        // The new chain version holds whatever the branch's version held.
+        let mut deps = new.deps.clone();
+        deps.packs.extend(new.pack);
+        let (seq, id) = insert(CHAIN, &new, &deps)?;
+        point(branch, id)?;
+        if let Some(old) = &old {
+            let deps = Deps {
+                trunk: old.seq,
+                packs: vec![],
+            };
+            let (_, id) = insert(&old_trunk, old, &deps)?;
+            point(&old_trunk, id)?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('trunk', ?1), ('epoch_start', ?2)",
+            params![branch, seq.to_string()],
+        )?;
+        tx.commit()?;
+        self.load_settings()?;
+        Ok(Ok(()))
+    }
+
+    /// The connection, for maintenance code (gc) that writes its own SQL.
+    pub(crate) fn conn(&mut self) -> &mut Connection {
+        &mut self.0.conn
+    }
+}
+
+impl View {
     fn setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
@@ -349,15 +614,6 @@ impl Meta {
             .query_row("SELECT 1 FROM settings WHERE key = 'trunk'", [], |_| Ok(()))
             .optional()?
             .is_some())
-    }
-
-    /// Choose the trunk ref, once. Later calls keep the first choice.
-    pub fn fix_trunk(&mut self, refname: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('trunk', ?1)",
-            [refname],
-        )?;
-        self.load_settings()
     }
 
     pub fn is_trunk(&self, refname: &str) -> bool {
@@ -523,6 +779,40 @@ impl Meta {
         Ok(peeled)
     }
 
+    /// The highest trunk dependency below position `below` among all stored packs,
+    /// live or dead (gc uses it to tell whether anything revivable needs a position).
+    pub fn max_trunk_dep_below(&self, below: u64) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT COALESCE(MAX(trunk_dep), 0) FROM packs WHERE trunk_dep < ?1",
+            [below],
+            |r| r.get(0),
+        )
+    }
+
+    /// Whether any stored pack, live or dead, names `pack` as a dependency.
+    pub fn pack_is_named(&self, pack: &Oid) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM packs WHERE instr(side_deps, ?1) > 0)",
+            [pack.hex()],
+            |r| r.get(0),
+        )
+    }
+
+    /// Whether an object homed in `pack` is marked with a trunk position strictly
+    /// between `after` and `before`.
+    pub fn homes_positions_between(
+        &self,
+        pack: &Oid,
+        after: u64,
+        before: u64,
+    ) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM objects WHERE pack = ?1 AND trunk_seq > ?2 AND trunk_seq < ?3)",
+            params![pack.hex(), after, before],
+            |r| r.get(0),
+        )
+    }
+
     /// Dependencies recorded for a stored pack.
     pub fn pack_deps(&self, pack: &Oid) -> rusqlite::Result<Option<Deps>> {
         self.conn
@@ -536,235 +826,6 @@ impl Meta {
             .optional()
     }
 
-    /// Record a newly stored pack: its dependencies, and where each of its objects and
-    /// commits lives. Objects already stored elsewhere keep their first location.
-    pub fn index_pack(
-        &mut self,
-        pack: &Oid,
-        deps: &Deps,
-        objects: impl Iterator<Item = Oid>,
-        commits: &std::collections::HashMap<Oid, Vec<Oid>>,
-        tags: &std::collections::HashMap<Oid, Oid>,
-    ) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-        let hex = pack.hex();
-        // Pushed again after gc marked it: it is wanted after all.
-        tx.execute(
-            "INSERT INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)
-             ON CONFLICT (hash) DO UPDATE SET dead_since = NULL",
-            params![hex, deps.trunk, join_oids(&deps.packs)],
-        )?;
-        {
-            let mut obj =
-                tx.prepare_cached("INSERT OR IGNORE INTO objects (oid, pack) VALUES (?1, ?2)")?;
-            for oid in objects {
-                obj.execute(params![oid.hex(), hex])?;
-            }
-            let mut com = tx.prepare_cached(
-                "INSERT OR IGNORE INTO commits (oid, pack, parents) VALUES (?1, ?2, ?3)",
-            )?;
-            for (oid, parents) in commits {
-                com.execute(params![oid.hex(), hex, join_oids(parents)])?;
-            }
-            let mut tag =
-                tx.prepare_cached("INSERT OR IGNORE INTO tags (oid, target) VALUES (?1, ?2)")?;
-            for (oid, target) in tags {
-                tag.execute(params![oid.hex(), target.hex()])?;
-            }
-        }
-        tx.commit()
-    }
-
-    /// Apply ref updates as one transaction: for each, compare-and-swap the ref
-    /// pointer and append the new version; on trunk, mark what the new tip reaches.
-    /// All-or-nothing: if any pointer moved since the caller looked, nothing is
-    /// written and the reason is returned.
-    pub fn update_all(
-        &mut self,
-        updates: &[&RefUpdate],
-    ) -> rusqlite::Result<Result<Vec<Option<Version>>, String>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut out = Vec::with_capacity(updates.len());
-        let mut epoch = self.epoch_start;
-        for u in updates {
-            let current: Option<i64> = tx
-                .query_row(
-                    "SELECT version FROM refs WHERE name = ?1",
-                    [u.refname],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if current != u.expect {
-                return Ok(Err("ref moved during push (retry)".into()));
-            }
-            let Some(new) = &u.new else {
-                tx.execute("DELETE FROM refs WHERE name = ?1", [u.refname])?;
-                out.push(None);
-                continue;
-            };
-            let on_trunk = u.refname == self.trunk;
-            let vref = if on_trunk { CHAIN } else { u.refname };
-            let seq: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM versions WHERE ref = ?1",
-                [vref],
-                |r| r.get(0),
-            )?;
-            if on_trunk && new.rewrite {
-                epoch = seq;
-                tx.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('epoch_start', ?1)",
-                    [seq.to_string()],
-                )?;
-            }
-            tx.execute(
-                "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, side_deps, pack_complete, peeled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    vref,
-                    seq,
-                    new.tip.hex(),
-                    new.pack.map(|p| p.hex()),
-                    new.deps.trunk,
-                    join_oids(&new.deps.packs),
-                    new.pack_complete,
-                    new.peeled.map(|p| p.hex())
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
-                params![u.refname, id],
-            )?;
-            if on_trunk && let Some(pack) = new.pack {
-                // Trunk now reaches these: they get a trunk position (and move to this
-                // pack, which holds them) unless an earlier version of this epoch had
-                // them.
-                let pack = pack.hex();
-                let mut obj = tx.prepare_cached(
-                    "UPDATE objects SET trunk_seq = ?1, pack = ?2
-                     WHERE oid = ?3 AND (trunk_seq IS NULL OR trunk_seq < ?4)",
-                )?;
-                let mut com = tx.prepare_cached(
-                    "UPDATE commits SET trunk_seq = ?1
-                     WHERE oid = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
-                )?;
-                for oid in new.reached {
-                    let hex = oid.hex();
-                    obj.execute(params![seq, pack, hex, epoch])?;
-                    com.execute(params![seq, hex, epoch])?;
-                }
-            }
-            if on_trunk {
-                for pack in new.reached_packs {
-                    let hex = pack.hex();
-                    tx.execute(
-                        "UPDATE objects SET trunk_seq = ?1
-                         WHERE pack = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
-                        params![seq, hex, epoch],
-                    )?;
-                    tx.execute(
-                        "UPDATE commits SET trunk_seq = ?1
-                         WHERE pack = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
-                        params![seq, hex, epoch],
-                    )?;
-                }
-            }
-            out.push(Some(Version {
-                id,
-                refname: u.refname.to_string(),
-                on_trunk,
-                seq,
-                tip: new.tip,
-                pack: new.pack,
-                deps: new.deps.clone(),
-                pack_complete: new.pack_complete,
-                peeled: new.peeled,
-                merged: false,
-            }));
-        }
-        tx.commit()?;
-        self.epoch_start = epoch;
-        Ok(Ok(out))
-    }
-
-    /// Make another branch trunk (and HEAD). This starts a new epoch whose first
-    /// version is the branch's tip; the old trunk branch continues as a normal branch.
-    pub fn set_trunk(&mut self, branch: &str) -> rusqlite::Result<Result<(), String>> {
-        if branch == self.trunk {
-            return Ok(Ok(()));
-        }
-        let old = self.trunk_head()?;
-        if !branch.starts_with("refs/heads/") {
-            return Ok(Err(format!("{branch} is not a branch")));
-        }
-        let Some(new) = self.current(branch)? else {
-            if old.is_none() {
-                // Nothing pushed yet: just choose the name.
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('trunk', ?1)",
-                    [branch],
-                )?;
-                self.load_settings()?;
-                return Ok(Ok(()));
-            }
-            return Ok(Err(format!("no such branch {branch}")));
-        };
-        if new.peeled.is_some() {
-            return Ok(Err(format!("{branch} does not point at a commit")));
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let insert = |vref: &str, v: &Version, deps: &Deps| -> rusqlite::Result<(u64, i64)> {
-            let seq: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM versions WHERE ref = ?1",
-                [vref],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, side_deps, pack_complete, peeled)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, ?6)",
-                params![
-                    vref,
-                    seq,
-                    v.tip.hex(),
-                    deps.trunk,
-                    join_oids(&deps.packs),
-                    v.peeled.map(|p| p.hex())
-                ],
-            )?;
-            Ok((seq, tx.last_insert_rowid()))
-        };
-        let point = |name: &str, id: i64| {
-            tx.execute(
-                "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
-                params![name, id],
-            )
-        };
-        // The new chain version holds whatever the branch's version held.
-        let mut deps = new.deps.clone();
-        deps.packs.extend(new.pack);
-        let (seq, id) = insert(CHAIN, &new, &deps)?;
-        point(branch, id)?;
-        if let Some(old) = &old {
-            let deps = Deps {
-                trunk: old.seq,
-                packs: vec![],
-            };
-            let (_, id) = insert(&self.trunk, old, &deps)?;
-            point(&self.trunk, id)?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('trunk', ?1), ('epoch_start', ?2)",
-            params![branch, seq.to_string()],
-        )?;
-        tx.commit()?;
-        self.load_settings()?;
-        Ok(Ok(()))
-    }
-
     /// The highest earlier-epoch position anything still depends on, as last stored
     /// for the current epoch (see [`Meta::set_old_needed`]).
     pub fn old_needed(&self) -> rusqlite::Result<Option<u64>> {
@@ -774,16 +835,6 @@ impl Meta {
                 .then(|| old.parse().ok())
                 .flatten()
         }))
-    }
-
-    /// Store what gc (or compaction) found: earlier-epoch positions `1..=old` are
-    /// needed. A hint: it goes stale when a ref that needed more goes away.
-    pub fn set_old_needed(&mut self, old: u64) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('old_needed', ?1)",
-            [format!("{} {old}", self.epoch_start)],
-        )?;
-        Ok(())
     }
 
     /// The first chain position after `seq` that still has a version row.
@@ -861,6 +912,18 @@ impl Meta {
                 })
             })?
             .collect()
+    }
+}
+
+impl Meta {
+    /// Store what gc (or compaction) found: earlier-epoch positions `1..=old` are
+    /// needed. A hint: it goes stale when a ref that needed more goes away.
+    pub fn set_old_needed(&mut self, old: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('old_needed', ?1)",
+            [format!("{} {old}", self.epoch_start)],
+        )?;
+        Ok(())
     }
 
     /// First step of recording a cover: store it as pending, with its pack's
@@ -999,4 +1062,148 @@ impl Meta {
         )?;
         tx.commit()
     }
+}
+
+/// A newly stored pack, as [`Meta::push`] records it: its dependencies, and where each
+/// of its objects, commits and tags lives.
+pub struct PackRows<'a> {
+    pub hash: Oid,
+    pub deps: &'a Deps,
+    pub objects: &'a [Oid],
+    pub commits: &'a std::collections::HashMap<Oid, Vec<Oid>>,
+    pub tags: &'a std::collections::HashMap<Oid, Oid>,
+}
+
+/// Index a pack. Objects already stored elsewhere keep their first location.
+fn index_pack(conn: &Connection, p: &PackRows) -> rusqlite::Result<()> {
+    let hex = p.hash.hex();
+    // Pushed again after gc marked it: it is wanted after all.
+    conn.execute(
+        "INSERT INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)
+         ON CONFLICT (hash) DO UPDATE SET dead_since = NULL",
+        params![hex, p.deps.trunk, join_oids(&p.deps.packs)],
+    )?;
+    let mut obj =
+        conn.prepare_cached("INSERT OR IGNORE INTO objects (oid, pack) VALUES (?1, ?2)")?;
+    for oid in p.objects {
+        obj.execute(params![oid.hex(), hex])?;
+    }
+    let mut com = conn
+        .prepare_cached("INSERT OR IGNORE INTO commits (oid, pack, parents) VALUES (?1, ?2, ?3)")?;
+    for (oid, parents) in p.commits {
+        com.execute(params![oid.hex(), hex, join_oids(parents)])?;
+    }
+    let mut tag =
+        conn.prepare_cached("INSERT OR IGNORE INTO tags (oid, target) VALUES (?1, ?2)")?;
+    for (oid, target) in p.tags {
+        tag.execute(params![oid.hex(), target.hex()])?;
+    }
+    Ok(())
+}
+
+/// Apply ref updates inside an open transaction: for each, compare-and-swap the ref
+/// pointer and append the new version; on trunk, mark what the new tip reaches. Stops
+/// at the first pointer that moved since the caller looked and returns the reason; the
+/// caller rolls back. `epoch` is the current epoch start, advanced by a rewrite.
+fn update_refs(
+    tx: &Connection,
+    trunk: &str,
+    epoch: &mut u64,
+    updates: &[&RefUpdate],
+) -> rusqlite::Result<Result<Vec<Option<Version>>, String>> {
+    let mut out = Vec::with_capacity(updates.len());
+    for u in updates {
+        let current: Option<i64> = tx
+            .prepare_cached("SELECT version FROM refs WHERE name = ?1")?
+            .query_row([u.refname], |r| r.get(0))
+            .optional()?;
+        if current != u.expect {
+            return Ok(Err("ref moved during push (retry)".into()));
+        }
+        let Some(new) = &u.new else {
+            tx.execute("DELETE FROM refs WHERE name = ?1", [u.refname])?;
+            out.push(None);
+            continue;
+        };
+        let on_trunk = u.refname == trunk;
+        let vref = if on_trunk { CHAIN } else { u.refname };
+        let seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM versions WHERE ref = ?1",
+            [vref],
+            |r| r.get(0),
+        )?;
+        if on_trunk && new.rewrite {
+            *epoch = seq;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('epoch_start', ?1)",
+                [seq.to_string()],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO versions (ref, seq, tip, pack, trunk_dep, side_deps, pack_complete, peeled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                vref,
+                seq,
+                new.tip.hex(),
+                new.pack.map(|p| p.hex()),
+                new.deps.trunk,
+                join_oids(&new.deps.packs),
+                new.pack_complete,
+                new.peeled.map(|p| p.hex())
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO refs (name, version) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET version = excluded.version",
+            params![u.refname, id],
+        )?;
+        if on_trunk && let Some(pack) = new.pack {
+            // Trunk now reaches these: they get a trunk position (and move to this
+            // pack, which holds them) unless an earlier version of this epoch had
+            // them.
+            let pack = pack.hex();
+            let mut obj = tx.prepare_cached(
+                "UPDATE objects SET trunk_seq = ?1, pack = ?2
+                 WHERE oid = ?3 AND (trunk_seq IS NULL OR trunk_seq < ?4)",
+            )?;
+            let mut com = tx.prepare_cached(
+                "UPDATE commits SET trunk_seq = ?1
+                 WHERE oid = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
+            )?;
+            for oid in new.reached {
+                let hex = oid.hex();
+                obj.execute(params![seq, pack, hex, *epoch])?;
+                com.execute(params![seq, hex, *epoch])?;
+            }
+        }
+        if on_trunk {
+            for pack in new.reached_packs {
+                let hex = pack.hex();
+                tx.execute(
+                    "UPDATE objects SET trunk_seq = ?1
+                     WHERE pack = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
+                    params![seq, hex, *epoch],
+                )?;
+                tx.execute(
+                    "UPDATE commits SET trunk_seq = ?1
+                     WHERE pack = ?2 AND (trunk_seq IS NULL OR trunk_seq < ?3)",
+                    params![seq, hex, *epoch],
+                )?;
+            }
+        }
+        out.push(Some(Version {
+            id,
+            refname: u.refname.to_string(),
+            on_trunk,
+            seq,
+            tip: new.tip,
+            pack: new.pack,
+            deps: new.deps.clone(),
+            pack_complete: new.pack_complete,
+            peeled: new.peeled,
+            merged: false,
+        }));
+    }
+    Ok(Ok(out))
 }

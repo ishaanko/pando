@@ -134,7 +134,7 @@ fn list_json(server: &Server, names: &[String]) -> anyhow::Result<String> {
         let Some(repo) = server.repo(name)? else {
             continue;
         };
-        let meta = repo.meta.lock().unwrap();
+        let meta = repo.read()?;
         let refs = meta.refs(&[])?.len();
         items.push(format!(
             r#"{{"name":{},"head":{},"refs":{refs}}}"#,

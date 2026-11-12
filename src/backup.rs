@@ -131,10 +131,10 @@ pub fn verify(data: &Path, full: bool) -> anyhow::Result<Vec<String>> {
     let mut problems = Vec::new();
     for name in repo_names(data)? {
         let dir = data.join("repos").join(format!("{name}.git"));
-        let meta = Meta::open(dir.join("meta.db"), "refs/heads/main")?;
+        let mut meta = Meta::open(dir.join("meta.db"), "refs/heads/main")?;
         let store = BlobStore::open(dir.join("blobs"))?;
         let mut known: Vec<Oid> = meta
-            .conn
+            .conn()
             .prepare("SELECT hash FROM packs")?
             .query_map([], |r| r.get::<_, String>(0))?
             .filter_map(|h| h.ok().and_then(|h| Oid::from_hex(&h)))

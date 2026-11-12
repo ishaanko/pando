@@ -67,6 +67,10 @@ pub static REFS_UPDATED: Counter =
     Counter::new("pando_refs_updated_total", "Ref updates accepted.");
 pub static REFS_REJECTED: Counter =
     Counter::new("pando_refs_rejected_total", "Ref updates rejected.");
+pub static PUSH_COMMITS: Counter = Counter::new(
+    "pando_push_commits_total",
+    "Metadata transactions committed for pushes (pushes queued together share one).",
+);
 pub static PUSH_BYTES: Counter = Counter::new("pando_push_bytes_total", "Pack bytes received.");
 pub static PACK_BYTES_SERVED: Counter = Counter::new(
     "pando_pack_bytes_served_total",
@@ -118,6 +122,7 @@ pub fn render() -> String {
         &PUSHES,
         &REFS_UPDATED,
         &REFS_REJECTED,
+        &PUSH_COMMITS,
         &PUSH_BYTES,
         &PACK_BYTES_SERVED,
         &SSH_SESSIONS,
