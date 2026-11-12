@@ -8,7 +8,7 @@
 //! - `POST /<repo>.git/git-receive-pack`       push (see `receive.rs`)
 //! - `GET  /<repo>.git/pack/<hash>.pack`       stored packs (the local Express origin)
 
-use crate::auth::{Access, Auth, UrlSigner};
+use crate::auth::{Access, LiveAuth, UrlSigner};
 use crate::express::{self, Express};
 use crate::meta::Meta;
 use crate::store::BlobStore;
@@ -50,8 +50,11 @@ pub struct Config {
     pub public_url: String,
     pub express: Vec<String>,
     pub advertise: Advertise,
-    /// `None` leaves the server open to anyone who can reach it.
-    pub auth: Option<Auth>,
+    /// `None` leaves the server open to anyone who can reach it. Whether auth is on is
+    /// fixed; an auth file's contents reload while serving.
+    pub auth: Option<LiveAuth>,
+    /// How often to check the auth file for changes.
+    pub auth_poll: Duration,
     /// With auth on, let unauthenticated clients fetch.
     pub public_read: bool,
     /// Background compaction period. `None` disables the background compactor.
@@ -77,6 +80,7 @@ impl Config {
             express: Vec::new(),
             advertise: Advertise::All,
             auth: None,
+            auth_poll: Duration::from_secs(2),
             public_read: false,
             compact_every: Some(Duration::from_secs(30)),
             gc_every: Some(Duration::from_secs(3600)),
@@ -127,13 +131,28 @@ impl Server {
             Some(s) => UrlSigner::new(s.as_bytes()),
             None => UrlSigner::random()?,
         };
-        Ok(Arc::new(Server {
+        let server = Arc::new(Server {
             cfg,
             repos: Mutex::new(HashMap::new()),
             local,
             signer,
             http: crate::http_client(),
-        }))
+        });
+        if server.cfg.auth.is_some() {
+            // A thread rather than a task: tests build servers outside a runtime.
+            let weak = Arc::downgrade(&server);
+            let every = server.cfg.auth_poll;
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let Some(server) = weak.upgrade() else { break };
+                    if let Some(auth) = &server.cfg.auth {
+                        auth.reload(false);
+                    }
+                }
+            });
+        }
+        Ok(server)
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -165,6 +184,7 @@ impl Server {
         let Some(auth) = &self.cfg.auth else {
             return Ok(None);
         };
+        let auth = auth.get();
         match auth.check(headers) {
             Some(id) if id.allows(repo, need) => Ok(Some(id.name.clone())),
             Some(id) if id.can_see(repo) => {
@@ -438,12 +458,11 @@ async fn dispatch(State(server): State<Arc<Server>>, req: Request) -> Response {
         let query = req.uri().query().unwrap_or("");
         let allowed = !server.packs_need_auth()
             || server.signer.verify(repo, &hash, query)
-            || server
-                .cfg
-                .auth
-                .as_ref()
-                .and_then(|a| a.check(req.headers()))
-                .is_some_and(|i| i.allows(repo, Access::Read));
+            || server.cfg.auth.as_ref().is_some_and(|a| {
+                a.get()
+                    .check(req.headers())
+                    .is_some_and(|i| i.allows(repo, Access::Read))
+            });
         if !allowed {
             return (
                 StatusCode::UNAUTHORIZED,

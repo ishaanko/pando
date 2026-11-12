@@ -1,6 +1,6 @@
 use axum::serve::ListenerExt;
 use clap::{Parser, Subcommand};
-use pando::auth::{Auth, UrlSigner};
+use pando::auth::{LiveAuth, UrlSigner};
 use pando::express::{self, Express, Origin};
 use pando::server::{Advertise, Config, Server};
 use std::path::PathBuf;
@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
             webhook,
             webhook_secret,
         } => {
-            let auth = auth_file.as_deref().map(Auth::load).transpose()?;
+            let auth = auth_file.as_deref().map(LiveAuth::open).transpose()?;
             if auth.is_none() {
                 tracing::warn!("no --auth-file: anyone who can reach {listen} can read and push");
             }
@@ -157,6 +157,9 @@ async fn main() -> anyhow::Result<()> {
             cfg.webhooks = webhook;
             cfg.webhook_secret = webhook_secret;
             let server = Server::new(cfg)?;
+            if server.cfg.auth.is_some() {
+                tokio::spawn(reload_on_hangup(server.clone()));
+            }
             let router = server.router();
             if let Some(addr) = ssh_listen {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -242,6 +245,19 @@ fn parse_size(s: &str) -> Result<u64, String> {
     num.parse::<u64>()
         .map(|n| n.saturating_mul(scale))
         .map_err(|_| format!("bad size {s:?}"))
+}
+
+/// Re-read the auth file on every SIGHUP, without waiting for the next poll.
+async fn reload_on_hangup(server: Arc<Server>) {
+    let kind = tokio::signal::unix::SignalKind::hangup();
+    let Ok(mut hup) = tokio::signal::unix::signal(kind) else {
+        return;
+    };
+    while hup.recv().await.is_some() {
+        if let Some(auth) = &server.cfg.auth {
+            auth.reload(true);
+        }
+    }
 }
 
 /// Resolves on SIGINT or SIGTERM. In-flight pushes and fetches finish first; a push

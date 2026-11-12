@@ -16,11 +16,16 @@
 //! field limits the entry to repositories matching comma-separated patterns, where `*`
 //! matches any run of characters. With HTTP Basic, the token goes in the password field
 //! and the username is ignored.
+//!
+//! The server re-reads the file when it changes (see [`LiveAuth`]), so tokens and keys
+//! can be added or revoked without a restart.
 
 use axum::http::{HeaderMap, header};
 use base64::Engine;
 use russh::keys::PublicKey;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
@@ -75,9 +80,10 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn load(path: &Path) -> anyhow::Result<Auth> {
-        Auth::parse(&std::fs::read_to_string(path)?)
-            .map_err(|(n, e)| anyhow::anyhow!("{}:{n}: {e}", path.display()))
+    fn load(path: &Path) -> anyhow::Result<Auth> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Auth::parse(&text).map_err(|(n, e)| anyhow::anyhow!("{}:{n}: {e}", path.display()))
     }
 
     /// Parse auth file contents. Errors carry the 1-based line number.
@@ -170,6 +176,96 @@ impl Auth {
             Credential::Key(k) => k.key_data() == key.key_data(),
             Credential::Token(_) => false,
         })
+    }
+}
+
+/// The auth entries the server currently enforces. Opened from a path, it reloads when
+/// [`LiveAuth::reload`] finds the file changed (the server polls it, and `serve` also
+/// reloads on SIGHUP). Built from an [`Auth`], it never changes.
+///
+/// A reload that fails (bad line, missing file) logs the error and keeps the last good
+/// entries, so a broken edit neither locks everyone out nor opens the server up.
+pub struct LiveAuth {
+    path: Option<PathBuf>,
+    current: RwLock<Arc<Auth>>,
+    /// The file's stamp at the last load attempt, so each version is tried (and a bad
+    /// one reported) once. `None` while the file is missing.
+    seen: Mutex<Option<Stamp>>,
+}
+
+/// Inode, length and mtime: a rename (how editors save) changes the inode, an in-place
+/// write changes the rest.
+type Stamp = (u64, u64, i64, i64);
+
+fn stamp(path: &Path) -> std::io::Result<Stamp> {
+    let m = std::fs::metadata(path)?;
+    Ok((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+}
+
+impl LiveAuth {
+    /// Load the auth file at `path`. Unlike a reload, failing here is an error.
+    pub fn open(path: &Path) -> anyhow::Result<LiveAuth> {
+        let seen = stamp(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(LiveAuth {
+            current: RwLock::new(Arc::new(Auth::load(path)?)),
+            path: Some(path.into()),
+            seen: Mutex::new(Some(seen)),
+        })
+    }
+
+    /// The current entries. Callers hold the snapshot for one request or command.
+    pub fn get(&self) -> Arc<Auth> {
+        self.current.read().unwrap().clone()
+    }
+
+    /// Re-read the file if it changed since the last attempt, or regardless with `force`.
+    pub fn reload(&self, force: bool) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let mut seen = self.seen.lock().unwrap();
+        let before = match stamp(path) {
+            Ok(s) => s,
+            Err(e) => {
+                if seen.take().is_some() || force {
+                    tracing::error!(
+                        "auth file {}: {e}; keeping the last good auth entries",
+                        path.display()
+                    );
+                }
+                return;
+            }
+        };
+        if !force && *seen == Some(before) {
+            return;
+        }
+        let loaded = Auth::load(path);
+        // Changed while we read it: still being written, so take it on the next poll.
+        if stamp(path).ok() != Some(before) {
+            return;
+        }
+        *seen = Some(before);
+        match loaded {
+            Ok(auth) => {
+                tracing::info!(
+                    entries = auth.identities.len(),
+                    "reloaded auth file {}",
+                    path.display()
+                );
+                *self.current.write().unwrap() = Arc::new(auth);
+            }
+            Err(e) => tracing::error!("{e:#}; keeping the last good auth entries"),
+        }
+    }
+}
+
+impl From<Auth> for LiveAuth {
+    fn from(auth: Auth) -> LiveAuth {
+        LiveAuth {
+            path: None,
+            current: RwLock::new(Arc::new(auth)),
+            seen: Mutex::new(None),
+        }
     }
 }
 

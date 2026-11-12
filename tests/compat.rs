@@ -73,7 +73,8 @@ impl Env {
         cfg.gc_every = None;
         cfg.auth = Some(
             pando::auth::Auth::parse(&format!("u {TOKEN} write\nu {} write\n", public.trim()))
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         let server = Server::new(cfg).unwrap();
         let router = server.router();
