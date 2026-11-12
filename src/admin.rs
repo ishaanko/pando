@@ -112,8 +112,8 @@ pub async fn handle(server: Arc<Server>, req: Request) -> Response {
                 };
                 let r = crate::gc::run(&repo, grace)?;
                 Ok(Some(format!(
-                    r#"{{"live":{},"marked":{},"deleted":{},"bytes":{}}}"#,
-                    r.live, r.marked, r.deleted, r.bytes
+                    r#"{{"live":{},"marked":{},"deleted":{},"bytes":{},"trimmed":{}}}"#,
+                    r.live, r.marked, r.deleted, r.bytes, r.trimmed
                 )))
             })
             .await
