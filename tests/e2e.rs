@@ -1187,7 +1187,7 @@ fn tokens_gate_reads_and_writes() {
         "# name token access\nci sekrit-read read\nme sekrit-write write\n",
     )
     .unwrap();
-    let auth = pando::auth::Auth::load(&file).unwrap();
+    let auth = pando::auth::LiveAuth::open(&file).unwrap();
     let s = Server::start_configured(|c| c.auth = Some(auth));
     let with = |token: &str| {
         s.url
@@ -1228,7 +1228,7 @@ fn public_read_allows_anonymous_fetch_only() {
     let tokens = TempDir::new().unwrap();
     let file = tokens.path().join("tokens");
     std::fs::write(&file, "me sekrit-write write\n").unwrap();
-    let auth = pando::auth::Auth::load(&file).unwrap();
+    let auth = pando::auth::LiveAuth::open(&file).unwrap();
     let s = Server::start_configured(|c| {
         c.auth = Some(auth);
         c.public_read = true;
@@ -1425,7 +1425,7 @@ fn pack_urls_are_signed_when_auth_is_on() {
     let tokens = TempDir::new().unwrap();
     let file = tokens.path().join("tokens");
     std::fs::write(&file, "me sekrit write\n").unwrap();
-    let auth = pando::auth::Auth::load(&file).unwrap();
+    let auth = pando::auth::LiveAuth::open(&file).unwrap();
     let s = Server::start_configured(|c| c.auth = Some(auth));
     let authed = s.url.replacen("http://", "http://me:sekrit@", 1);
     let a = s.path("a");
@@ -1653,7 +1653,7 @@ fn ssh_clones_fetches_and_pushes_with_keys() {
     let (_, as_stranger) = ssh_key(keys.path(), "stranger");
     let auth = format!("w {writer} write\nr {reader} read\nx {scoped} write other/*\n");
     let s = Server::start_configured(|cfg| {
-        cfg.auth = Some(pando::auth::Auth::parse(&auth).unwrap());
+        cfg.auth = Some(pando::auth::Auth::parse(&auth).unwrap().into());
     });
     let base = start_ssh(&s.server);
     let url = format!("{base}/team/app.git");
@@ -1895,7 +1895,11 @@ fn hooks_guard_pushes_and_webhooks_report_them() {
     serve_in_background(listener, app);
 
     let s = Server::start_configured(|cfg| {
-        cfg.auth = Some(pando::auth::Auth::parse("boss tb write\ndev td write\n").unwrap());
+        cfg.auth = Some(
+            pando::auth::Auth::parse("boss tb write\ndev td write\n")
+                .unwrap()
+                .into(),
+        );
         cfg.webhooks = vec![format!("{hook_url}/push")];
         cfg.webhook_secret = Some("shh".into());
     });
@@ -1974,7 +1978,9 @@ fn hooks_guard_pushes_and_webhooks_report_them() {
 fn admin_api_manages_repositories() {
     let s = Server::start_configured(|cfg| {
         cfg.auth = Some(
-            pando::auth::Auth::parse("root ta admin\nlead tl admin team/*\nw tw write\n").unwrap(),
+            pando::auth::Auth::parse("root ta admin\nlead tl admin team/*\nw tw write\n")
+                .unwrap()
+                .into(),
         );
     });
     assert_eq!(
@@ -2511,4 +2517,50 @@ fn only_branches_can_become_the_default() {
     let mut meta = repo.meta.lock().unwrap();
     assert!(meta.set_trunk("refs/tags/v1").unwrap().is_err());
     assert!(meta.set_trunk("refs/heads/nope").unwrap().is_err());
+}
+
+#[test]
+fn auth_file_edits_apply_without_a_restart() {
+    use std::time::{Duration, Instant};
+    let tokens = TempDir::new().unwrap();
+    let file = tokens.path().join("tokens");
+    std::fs::write(&file, "old tok-old write\n").unwrap();
+    let auth = pando::auth::LiveAuth::open(&file).unwrap();
+    let s = Server::start_configured(|c| {
+        c.auth = Some(auth);
+        c.auth_poll = Duration::from_millis(50);
+    });
+    let a = s.path("a");
+    init(&a);
+    commit(&a, "f", "x");
+    let with = |token: &str| s.url.replacen("http://", &format!("http://u:{token}@"), 1);
+    let works = |token: &str| git_cmd(&a, &["ls-remote", &with(token)]).status.success();
+    let eventually = |what: &str, cond: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    git(&a, &["push", "-q", &with("tok-old"), "main"]);
+
+    // Replace the file the way editors do: write elsewhere, then rename over it.
+    let tmp = tokens.path().join("tokens.tmp");
+    std::fs::write(&tmp, "new tok-new write\n").unwrap();
+    std::fs::rename(&tmp, &file).unwrap();
+    eventually("old token refused", &|| !works("tok-old"));
+    assert!(works("tok-new"));
+
+    // A broken edit, then a deleted file: the last good entries stay in force.
+    std::fs::write(&file, "new tok-new write\nthis line is garbage\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::remove_file(&file).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(works("tok-new"));
+    assert!(!works("tok-old"));
+
+    // Fixing the file loads it again.
+    std::fs::write(&file, "new tok-new write\nfixed tok-fixed read\n").unwrap();
+    eventually("fixed file loaded", &|| works("tok-fixed"));
+    assert!(works("tok-new"));
 }

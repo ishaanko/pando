@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
 pub async fn handle(server: Arc<Server>, req: Request) -> Response {
-    let Some(auth) = &server.cfg.auth else {
+    let Some(auth) = server.cfg.auth.as_ref().map(|a| a.get()) else {
         return (
             StatusCode::FORBIDDEN,
             "the admin API needs an auth file with an admin entry\n",

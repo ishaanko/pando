@@ -94,7 +94,7 @@ impl Conn {
             .cfg
             .auth
             .as_ref()
-            .is_none_or(|a| a.check_key(key).is_some())
+            .is_none_or(|a| a.get().check_key(key).is_some())
     }
 }
 
@@ -223,6 +223,7 @@ fn run(
     let user = match (&server.cfg.auth, key) {
         (None, _) => None,
         (Some(auth), Some(key)) => {
+            let auth = auth.get();
             let id = auth
                 .check_key(key)
                 .ok_or_else(|| anyhow::anyhow!("unknown key"))?;
