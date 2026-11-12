@@ -6,11 +6,13 @@
 //! change once written, so they are hard-linked (or copied across filesystems) after
 //! the snapshot. A pack that gc deletes in between was already unreachable in the
 //! snapshot, so it is skipped and forgotten in the copy, as gc forgot it.
+//!
+//! Both commands fsync everything they wrote before reporting success.
 
 use crate::meta::Meta;
 use crate::object::Oid;
 use crate::server::repo_names;
-use crate::store::{BlobStore, map_file};
+use crate::store::{BlobStore, map_file, sync_dir};
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::path::Path;
@@ -79,6 +81,7 @@ pub fn backup(data: &Path, out: &Path) -> anyhow::Result<Summary> {
     if key.exists() {
         fs::copy(&key, out.join("ssh_host_ed25519_key"))?;
     }
+    sync_tree(out)?;
     let problems = verify(out, false)?;
     anyhow::ensure!(
         problems.is_empty(),
@@ -99,6 +102,7 @@ pub fn restore(from: &Path, data: &Path) -> anyhow::Result<Summary> {
     );
     let mut summary = Summary::default();
     copy_tree(from, data, &mut summary)?;
+    sync_tree(data)?;
     summary.repos = names.len();
     let problems = verify(data, true)?;
     anyhow::ensure!(
@@ -159,6 +163,24 @@ fn check_pack(store: &BlobStore, hash: &Oid) -> anyhow::Result<()> {
         idx.len()
     );
     Ok(())
+}
+
+/// Fsync every file and directory under `dir`, and `dir`'s own entry in its parent.
+fn sync_tree(dir: &Path) -> anyhow::Result<()> {
+    fn walk(dir: &Path) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path())?;
+            } else {
+                fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+        sync_dir(dir)
+    }
+    walk(dir)?;
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    Ok(sync_dir(parent.unwrap_or(Path::new(".")))?)
 }
 
 fn ensure_empty(dir: &Path) -> anyhow::Result<()> {

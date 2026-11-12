@@ -139,7 +139,9 @@ impl Express {
         Ok(filled.then_some(path))
     }
 
-    /// Copy one pack from the origin into the cache, verifying its trailer hash.
+    /// Copy one pack from the origin into the cache, verifying its trailer hash. The
+    /// file is synced before it is renamed into place: from then on it is served
+    /// without checking, so it must never be torn by a power loss.
     async fn fill(
         &self,
         repo: &str,
@@ -189,6 +191,7 @@ impl Express {
             }
         }
         file.flush().await?;
+        file.sync_all().await?;
         if sha.finalize().as_slice() != tail.as_slice() || tail != hash.0 {
             tokio::fs::remove_file(&tmp).await.ok();
             anyhow::bail!("pack {hash} from origin failed verification");

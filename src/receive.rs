@@ -20,8 +20,6 @@ use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
 const ANCESTRY_WALK_LIMIT: usize = 100_000;
-/// Largest pushed pack accepted.
-const MAX_PUSH_BYTES: u64 = 2 << 30;
 
 /// The ref advertisement for pushers, plus `.have` lines for older trunk tips at
 /// exponentially spaced distances, so even a stale client finds a base it has.
@@ -178,7 +176,7 @@ fn push(
     let mut parsed: Option<ParsedPack> = None;
     let mut staged: Option<Staged> = None;
     if commands.iter().any(|c| !c.new.is_zero()) {
-        match receive_pack_data(&repo.store, r, delimited) {
+        match receive_pack_data(&repo.store, r, delimited, server.cfg.max_push_bytes) {
             Ok((p, s)) => {
                 parsed = Some(p);
                 staged = Some(s);
@@ -346,7 +344,6 @@ fn choose_trunk<'a>(preferred: &str, commands: &'a [Command]) -> Option<&'a str>
         .copied()
 }
 
-/// Stream the pack into staging, decode it once, and publish it to blob storage.
 /// A received pack waiting in staging. The file is removed on every exit path
 /// (panics included) unless it was published.
 struct Staged(std::path::PathBuf);
@@ -357,25 +354,47 @@ impl Drop for Staged {
     }
 }
 
-/// Stream the pack into staging and decode it. Publishing happens later, under the
-/// metadata lock, so gc never deletes a pack between its publication and its index.
+/// Stream the pack into staging, sync it, and decode it. Publishing happens later,
+/// under the metadata lock, so gc never deletes a pack between its publication and its
+/// index. Syncing here keeps the slow part of making the pack durable out of that lock.
 fn receive_pack_data(
     store: &BlobStore,
     r: &mut dyn BufRead,
     delimited: bool,
+    limit: u64,
 ) -> anyhow::Result<(ParsedPack, Staged)> {
     let staged = Staged(store.staging_path());
     let mut file = std::fs::File::create(&staged.0)?;
+    let too_large = || {
+        anyhow::anyhow!(
+            "pack is larger than this server's push limit of {} (pando serve --max-push-size)",
+            human_size(limit)
+        )
+    };
     if delimited {
-        pack::copy_stream(r, &mut file, MAX_PUSH_BYTES)?;
-    } else if io::copy(&mut r.take(MAX_PUSH_BYTES + 1), &mut file)? > MAX_PUSH_BYTES {
-        anyhow::bail!("pack larger than {MAX_PUSH_BYTES} bytes");
+        match pack::copy_stream(r, &mut file, limit) {
+            Err(pack::PackError::TooLarge) => return Err(too_large()),
+            res => res?,
+        };
+    } else if io::copy(&mut r.take(limit + 1), &mut file)? > limit {
+        return Err(too_large());
     }
+    file.sync_all()?;
     drop(file);
     let map = map_file(&staged.0)?;
     metrics::PUSH_BYTES.add(map.len() as u64);
     let parsed = pack::parse(&map)?;
     Ok((parsed, staged))
+}
+
+/// `2G`, `500M`, or bytes: the form `--max-push-size` takes.
+fn human_size(bytes: u64) -> String {
+    [(40, "T"), (30, "G"), (20, "M"), (10, "K")]
+        .into_iter()
+        .find(|(shift, _)| bytes >= 1 << shift && bytes.is_multiple_of(1 << shift))
+        .map_or(format!("{bytes} bytes"), |(shift, unit)| {
+            format!("{}{unit}", bytes >> shift)
+        })
 }
 
 /// What a validated command will do.
