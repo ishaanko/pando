@@ -5,8 +5,22 @@
 //! index; that both rejects packs with missing objects and records exactly which trunk
 //! range and which other packs the new versions depend on. Each ref then moves by a
 //! compare-and-swap on its pointer.
+//!
+//! Order, and what is durable when:
+//! 1. No lock: stream the pack to staging and fsync it; run `pre-receive`; publish it
+//!    into `packs/` (hard-linked, so the staged copy stays) and fsync the directory.
+//! 2. Metadata lock, via `Repo::write`: validate the commands against current
+//!    metadata, and record the pack and every ref update in one savepoint of a
+//!    transaction shared with the other pushes queued for the lock. If anything was
+//!    deleted from the store since step 1 (gc deletes only under this lock), publish
+//!    the pack again from staging first. The transaction commits (one WAL fsync,
+//!    `synchronous = FULL`) before any push in it is acknowledged.
+//! 3. No lock: drop the staged copy, run `post-receive` and webhooks, report.
+//!
+//! So metadata only ever commits naming a pack that is durably stored and that gc
+//! cannot delete until the lock is released, by which time the pack is live.
 
-use crate::meta::{CommitRow, Deps, Meta, NewVersion, RefUpdate, Version};
+use crate::meta::{CommitRow, Deps, Meta, NewVersion, PackRows, RefUpdate, Version, View};
 use crate::object::Oid;
 use crate::pack::{self, ParsedPack};
 use crate::pktline::{self, Packet};
@@ -23,7 +37,7 @@ const ANCESTRY_WALK_LIMIT: usize = 100_000;
 
 /// The ref advertisement for pushers, plus `.have` lines for older trunk tips at
 /// exponentially spaced distances, so even a stale client finds a base it has.
-pub fn advertisement(server: &Server, meta: &Meta) -> anyhow::Result<Vec<u8>> {
+pub fn advertisement(server: &Server, meta: &View) -> anyhow::Result<Vec<u8>> {
     let caps = format!(
         "report-status delete-refs side-band-64k quiet atomic ofs-delta push-options no-thin \
          object-format=sha1 agent={AGENT}"
@@ -66,7 +80,7 @@ pub async fn advertise(server: Arc<Server>, repo: Arc<Repo>) -> anyhow::Result<R
         let mut out = Vec::new();
         pktline::line(&mut out, "# service=git-receive-pack\n");
         pktline::flush(&mut out);
-        out.extend(advertisement(&server, &repo.meta.lock().unwrap())?);
+        out.extend(advertisement(&server, &*repo.read()?)?);
         Ok(out)
     })
     .await?;
@@ -107,7 +121,8 @@ pub fn serve_stream(
     r: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    out.write_all(&advertisement(server, &repo.meta.lock().unwrap())?)?;
+    let refs = advertisement(server, &*repo.read()?)?;
+    out.write_all(&refs)?;
     out.flush()?;
     let (report, trunk_moved) = push(server, repo, user, r, true)?;
     out.write_all(&report)?;
@@ -118,6 +133,7 @@ pub fn serve_stream(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Command {
     old: Oid,
     new: Oid,
@@ -235,47 +251,27 @@ fn push(
             .map(|_| Err("repository was moved or deleted".to_string()))
             .collect(),
         (Ok(()), None) => {
-            let mut meta = repo.meta.lock().unwrap();
-            if !meta.trunk_fixed()?
-                && let Some(trunk) = choose_trunk(&server.cfg.trunk, &commands)
-            {
-                meta.fix_trunk(trunk)?;
+            // Make the pack durable before taking the lock, so only metadata work is
+            // serialized. The staged file stays (linked, not moved) until the end of the
+            // push, in case gc deletes the published copy before the metadata names it.
+            let deletions = repo.store.deletions();
+            let stored = parsed.filter(|p| !p.entries.is_empty());
+            if let (Some(p), Some(s)) = (&stored, &staged) {
+                repo.store.publish_linked(&s.0, &p.hash, &p.entries)?;
             }
-            match plan_updates(
-                &meta,
-                server.cfg.advertise,
-                &commands,
-                parsed.as_ref(),
+            let job = Job {
+                trunk: server.cfg.trunk.clone(),
+                advertise: server.cfg.advertise,
+                commands: commands.clone(),
+                pack: stored.zip(staged.as_ref().map(|s| s.0.clone())),
+                deletions,
                 force,
-            ) {
-                Err(e) => {
-                    unpack = Err(e);
-                    commands
-                        .iter()
-                        .map(|_| Err("unpacker error".to_string()))
-                        .collect()
-                }
-                Ok((pack_deps, planned)) => {
-                    if let (Some(p), Some(s)) = (&parsed, &staged)
-                        && !p.entries.is_empty()
-                    {
-                        repo.store.publish(&s.0, &p.hash, &p.entries)?;
-                    }
-                    let statuses = apply(
-                        &mut meta,
-                        &commands,
-                        parsed.as_ref(),
-                        &pack_deps,
-                        &planned,
-                        caps.contains("atomic"),
-                    )?;
-                    trunk_moved = commands
-                        .iter()
-                        .zip(&statuses)
-                        .any(|(c, s)| s.is_ok() && meta.is_trunk(&c.refname));
-                    statuses
-                }
-            }
+                atomic: caps.contains("atomic"),
+            };
+            let done = repo.write(move |meta, store| job.run(meta, store))?;
+            unpack = done.unpack;
+            trunk_moved = done.trunk_moved;
+            done.statuses
         }
     };
 
@@ -328,6 +324,81 @@ fn push(
     Ok((report, trunk_moved))
 }
 
+/// The part of a push that runs under the metadata lock, inside a transaction it may
+/// share with other pushes (see `Repo::write`). It owns its inputs because whichever
+/// push holds the lock runs every queued job.
+struct Job {
+    trunk: String,
+    advertise: Advertise,
+    commands: Vec<Command>,
+    /// The pushed pack and its staged copy, already published.
+    pack: Option<(ParsedPack, std::path::PathBuf)>,
+    /// [`BlobStore::deletions`] before the pack was published.
+    deletions: u64,
+    force: bool,
+    atomic: bool,
+}
+
+/// What a [`Job`] decided.
+struct Done {
+    unpack: Result<(), String>,
+    statuses: Vec<Result<(), String>>,
+    trunk_moved: bool,
+}
+
+impl Job {
+    /// Validate the commands against current metadata and record the push. An `Err`
+    /// rolls back only this job's writes.
+    fn run(self, meta: &mut Meta, store: &BlobStore) -> anyhow::Result<Done> {
+        let commands = &self.commands;
+        let parsed = self.pack.as_ref().map(|(p, _)| p);
+        if !meta.trunk_fixed()?
+            && let Some(trunk) = choose_trunk(&self.trunk, commands)
+        {
+            meta.fix_trunk(trunk)?;
+        }
+        let (pack_deps, planned) =
+            match plan_updates(meta, self.advertise, commands, parsed, self.force) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    // Nothing will name the pack: take it back, unless it was stored
+                    // already. (Deleting under the lock is what gc does too.)
+                    if let Some(p) = parsed
+                        && meta.pack_deps(&p.hash)?.is_none()
+                    {
+                        store.delete(&p.hash)?;
+                    }
+                    return Ok(Done {
+                        unpack: Err(e),
+                        statuses: commands
+                            .iter()
+                            .map(|_| Err("unpacker error".to_string()))
+                            .collect(),
+                        trunk_moved: false,
+                    });
+                }
+            };
+        // gc deletes only under this lock. If anything was deleted since the pack was
+        // published, it may be gone (or back, put there by another push, but not yet
+        // durable): publish it again from staging.
+        if let Some((p, staged)) = &self.pack
+            && store.deletions() != self.deletions
+        {
+            store.publish_linked(staged, &p.hash, &p.entries)?;
+        }
+        let statuses = apply(meta, commands, parsed, &pack_deps, &planned, self.atomic)?;
+        let trunk_moved = commands
+            .iter()
+            .zip(&statuses)
+            .any(|(c, s)| s.is_ok() && meta.is_trunk(&c.refname));
+        Ok(Done {
+            unpack: Ok(()),
+            statuses,
+            trunk_moved,
+        })
+    }
+}
+
 /// Trunk for a repository's first push: the configured trunk if pushed, else
 /// `refs/heads/master`, else the first branch.
 fn choose_trunk<'a>(preferred: &str, commands: &'a [Command]) -> Option<&'a str> {
@@ -344,8 +415,8 @@ fn choose_trunk<'a>(preferred: &str, commands: &'a [Command]) -> Option<&'a str>
         .copied()
 }
 
-/// A received pack waiting in staging. The file is removed on every exit path
-/// (panics included) unless it was published.
+/// A received pack in staging. The file is removed on every exit path (panics
+/// included); once published it is a second link to the stored pack.
 struct Staged(std::path::PathBuf);
 
 impl Drop for Staged {
@@ -354,9 +425,8 @@ impl Drop for Staged {
     }
 }
 
-/// Stream the pack into staging, sync it, and decode it. Publishing happens later,
-/// under the metadata lock, so gc never deletes a pack between its publication and its
-/// index. Syncing here keeps the slow part of making the pack durable out of that lock.
+/// Stream the pack into staging, sync it, and decode it. It is published once the
+/// push has passed its hooks.
 fn receive_pack_data(
     store: &BlobStore,
     r: &mut dyn BufRead,
@@ -406,7 +476,7 @@ struct PlannedUpdate {
 }
 
 /// Where an object outside the pack lives, as a dependency.
-fn resolve(meta: &Meta, oid: &Oid) -> Result<Deps, String> {
+fn resolve(meta: &View, oid: &Oid) -> Result<Deps, String> {
     match meta.object(oid).map_err(db)? {
         Some(row) => Ok(match row.trunk_seq {
             Some(seq) if meta.in_epoch(seq) => Deps {
@@ -433,7 +503,7 @@ fn db(e: rusqlite::Error) -> String {
 /// a plan per command, or `Err` for the whole push when the pack references objects
 /// that exist nowhere.
 fn plan_updates(
-    meta: &Meta,
+    meta: &View,
     advertise: Advertise,
     commands: &[Command],
     pack: Option<&ParsedPack>,
@@ -554,15 +624,15 @@ fn apply(
             .collect());
     }
     let stored = pack.filter(|p| !p.entries.is_empty());
-    if let Some(p) = stored {
-        meta.index_pack(
-            &p.hash,
-            pack_deps,
-            p.entries.iter().map(|e| e.oid),
-            &p.commits,
-            &p.tags,
-        )?;
-    }
+    let objects: Vec<Oid> =
+        stored.map_or(Vec::new(), |p| p.entries.iter().map(|e| e.oid).collect());
+    let rows = stored.map(|p| PackRows {
+        hash: p.hash,
+        deps: pack_deps,
+        objects: &objects,
+        commits: &p.commits,
+        tags: &p.tags,
+    });
     // With a single ref pushed, every object in the pack is reachable from its tip.
     let complete = commands.iter().filter(|c| !c.new.is_zero()).count() == 1;
     // Trunk marks only what its new tip reaches; walk that once.
@@ -616,27 +686,35 @@ fn apply(
         })
         .collect();
 
+    // One transaction for the whole push. An atomic push is one group; otherwise each
+    // ref is its own group, so a failed compare-and-swap rejects only that ref.
+    let groups: Vec<Vec<&RefUpdate>> = if atomic {
+        vec![updates.iter().flatten().collect()]
+    } else {
+        updates.iter().flatten().map(|u| vec![u]).collect()
+    };
+    let mut results = meta.push(rows.as_ref(), &groups)?.into_iter();
     if atomic {
-        let all: Vec<&RefUpdate> = updates.iter().flatten().collect();
-        return Ok(match meta.update_all(&all)? {
-            Ok(_) => planned.iter().map(|_| Ok(())).collect(),
-            Err(e) => planned.iter().map(|_| Err(e.clone())).collect(),
-        });
+        let result = results.next().expect("one group");
+        return Ok(planned
+            .iter()
+            .map(|_| result.as_ref().map(|_| ()).map_err(Clone::clone))
+            .collect());
     }
-    let mut out = Vec::new();
-    for (u, p) in updates.iter().zip(planned) {
-        out.push(match (u, p) {
-            (Some(u), _) => meta.update_all(&[u])?.map(|_| ()),
+    Ok(updates
+        .iter()
+        .zip(planned)
+        .map(|(u, p)| match (u, p) {
+            (Some(_), _) => results.next().expect("one group per update").map(|_| ()),
             (None, Err(e)) => Err(e.clone()),
             (None, Ok(_)) => unreachable!(),
-        });
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
 /// Follow annotated tags from `tip`, through this pack and tags stored earlier, to the
 /// first non-tag object. `None` if `tip` is not a tag.
-fn peel(meta: &Meta, pack: Option<&ParsedPack>, tip: &Oid) -> rusqlite::Result<Option<Oid>> {
+fn peel(meta: &View, pack: Option<&ParsedPack>, tip: &Oid) -> rusqlite::Result<Option<Oid>> {
     let mut cur = *tip;
     let mut peeled = None;
     for _ in 0..64 {
@@ -659,7 +737,7 @@ fn peel(meta: &Meta, pack: Option<&ParsedPack>, tip: &Oid) -> rusqlite::Result<O
 /// freely; at most `ANCESTRY_WALK_LIMIT` commits come from the index, and `skip`
 /// prunes indexed commits that cannot lead to an answer.
 fn reach(
-    meta: &Meta,
+    meta: &View,
     pack: Option<&ParsedPack>,
     from: &Oid,
     targets: &HashSet<Oid>,
@@ -696,7 +774,7 @@ fn reach(
 
 /// Is the current tip of a ref an ancestor of `new`?
 fn is_ancestor(
-    meta: &Meta,
+    meta: &View,
     pack: Option<&ParsedPack>,
     current: &Version,
     new: &Oid,
@@ -713,7 +791,7 @@ fn is_ancestor(
 /// Packs among `deps` (and their dependencies) whose objects are all reachable from
 /// a new trunk tip: those holding a complete version whose tip the new tip reaches.
 fn absorbed_packs(
-    meta: &Meta,
+    meta: &View,
     pack: Option<&ParsedPack>,
     tip: &Oid,
     deps: &[Oid],

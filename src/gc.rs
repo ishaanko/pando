@@ -102,7 +102,7 @@ pub fn collect(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
 
         let mut packs: Vec<(Oid, Option<i64>)> = Vec::new();
         {
-            let mut stmt = meta.conn.prepare("SELECT hash, dead_since FROM packs")?;
+            let mut stmt = meta.conn().prepare("SELECT hash, dead_since FROM packs")?;
             for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))? {
                 let (hash, since) = row?;
                 if let Some(h) = Oid::from_hex(&hash) {
@@ -110,7 +110,7 @@ pub fn collect(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
                 }
             }
         }
-        let tx = meta.conn.transaction()?;
+        let tx = meta.conn().transaction()?;
         for (hash, since) in &packs {
             match (live.packs.contains(hash), since) {
                 (true, Some(_)) => {
@@ -154,7 +154,7 @@ pub fn collect(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
         // Pack files no metadata knows about (a push that failed after storing its
         // pack), once old enough.
         let known: HashSet<Oid> = {
-            let mut stmt = meta.conn.prepare("SELECT hash FROM packs")?;
+            let mut stmt = meta.conn().prepare("SELECT hash FROM packs")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .filter_map(|h| h.ok().and_then(|h| Oid::from_hex(&h)))
                 .collect()
@@ -329,20 +329,9 @@ impl Trim {
         if cover.level == 0 || cover.end <= cut || cover.end >= epoch {
             return Ok(None);
         }
-        let hex = pack.hex();
-        let conn = &meta.conn;
         // Anything that can still be revived needs nothing above `cut`.
-        let revivable: u64 = conn.query_row(
-            "SELECT COALESCE(MAX(trunk_dep), 0) FROM packs WHERE trunk_dep < ?1",
-            [epoch],
-            |r| r.get(0),
-        )?;
-        let named = live.named.contains(&pack)
-            || conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM packs WHERE instr(side_deps, ?1) > 0)",
-                [&hex],
-                |r| r.get(0),
-            )?;
+        let revivable = meta.max_trunk_dep_below(epoch)?;
+        let named = live.named.contains(&pack) || meta.pack_is_named(&pack)?;
         let pending = meta
             .pending_covers()?
             .iter()
@@ -350,12 +339,7 @@ impl Trim {
         if revivable > cut || named || pending {
             return Ok(None);
         }
-        let dropped: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM objects WHERE pack = ?1 AND trunk_seq > ?2 AND trunk_seq < ?3)",
-            params![hex, cut, epoch],
-            |r| r.get(0),
-        )?;
-        if !dropped {
+        if !meta.homes_positions_between(&pack, cut, epoch)? {
             return Ok(None);
         }
         let mut tips = Vec::new();
@@ -492,7 +476,7 @@ fn rehome(
     let mut orphans: HashSet<Oid> = HashSet::new();
     {
         let mut stmt = meta
-            .conn
+            .conn()
             .prepare_cached("SELECT oid FROM objects WHERE pack = ?1")?;
         for p in packs {
             for oid in stmt.query_map([p.hex()], |r| r.get::<_, String>(0))? {
@@ -516,7 +500,7 @@ fn rehome(
             }
         }
     }
-    let tx = meta.conn.transaction()?;
+    let tx = meta.conn().transaction()?;
     for (oid, pack) in &home {
         tx.execute(
             "UPDATE objects SET pack = ?1, trunk_seq = NULL WHERE oid = ?2",
@@ -538,7 +522,7 @@ fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> an
     let hexes: Vec<String> = doomed.iter().map(Oid::hex).collect();
     let orphans = rehome(meta, store, live, doomed)?;
 
-    let tx = meta.conn.transaction()?;
+    let tx = meta.conn().transaction()?;
     for oid in &orphans {
         tx.execute("DELETE FROM objects WHERE oid = ?1", [oid.hex()])?;
         tx.execute("DELETE FROM tags WHERE oid = ?1", [oid.hex()])?;

@@ -3398,8 +3398,16 @@ fn deep_trunk_clones_and_catch_ups_stay_small() {
         git(&fresh, &["fsck", "--strict", "--no-progress"]);
         assert_eq!(count(&fresh, "HEAD"), 200);
         if uris {
+            // The 8 largest of the 14 pieces by URI, the rest in one inline pack.
             let names = downloaded_pack_names(&fresh);
-            for p in trunk_pieces(&s, 0, 200).iter().filter_map(|p| p.pack) {
+            assert_eq!(names.len(), 9, "{names:?}");
+            let mut sized: Vec<(u64, Oid)> = trunk_pieces(&s, 0, 200)
+                .iter()
+                .filter_map(|p| p.pack)
+                .map(|p| (s.repo().store.pack_size(&p).unwrap(), p))
+                .collect();
+            sized.sort_unstable_by(|a, b| b.cmp(a));
+            for (_, p) in &sized[..8] {
                 assert!(names.contains(&p.hex()), "piece {p} not downloaded");
             }
         }
@@ -4020,4 +4028,325 @@ fn a_trim_interrupted_before_its_swap_is_redone() {
     assert_gone(&s, &secret, "by-id");
     catch_up(&fresh, &a, false);
     assert_clean(&s);
+}
+
+/// Run git on another thread, failing the test if it takes longer than `limit`.
+#[track_caller]
+fn git_within(limit: std::time::Duration, dir: &Path, args: &[&str]) -> String {
+    let (dir, args) = (
+        dir.to_path_buf(),
+        args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = tx.send(git_cmd(&dir, &args));
+    });
+    let out = rx.recv_timeout(limit).expect("git blocked");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn fetches_never_wait_for_a_push_holding_the_metadata_lock() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "1");
+    git(&a, &["push", "-q", "origin", "main"]);
+    commit(&a, "f", "2");
+
+    // Hold what a push holds while it commits: the writer lock, and an open write
+    // transaction on the database. A push queued meanwhile waits for both.
+    let repo = s.repo();
+    let held = repo.meta.lock().unwrap();
+    let db = rusqlite::Connection::open(s.dir.path().join("data/repos/repo.git/meta.db")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE; INSERT INTO settings VALUES ('held', '1')")
+        .unwrap();
+    let a2 = a.clone();
+    let pusher = std::thread::spawn(move || git_cmd(&a2, &["push", "-q", "origin", "main"]));
+
+    // Every read path still answers: v2 and v0 clones, a shallow (generated) clone, a
+    // clone by URI, and the pushers' ref advertisement.
+    let limit = std::time::Duration::from_secs(30);
+    let root = s.dir.path();
+    for (name, config, depth) in [
+        ("v2", "protocol.version=2", "0"),
+        ("v0", "protocol.version=0", "0"),
+        ("shallow", "protocol.version=2", "1"),
+        ("uri", "fetch.uriprotocols=http", "0"),
+    ] {
+        let dest = s.path(name);
+        let mut all = vec!["-c", config, "clone", "-q"];
+        if depth != "0" {
+            all.extend(["--depth", depth]);
+        }
+        all.extend([s.url.as_str(), dest.to_str().unwrap()]);
+        git_within(limit, root, &all);
+        assert_eq!(count(&dest, "HEAD"), 1, "{name} sees only committed pushes");
+    }
+    let refs = git_within(
+        limit,
+        &a,
+        &["push", "--dry-run", "--porcelain", "origin", "main"],
+    );
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+    assert!(!pusher.is_finished(), "the push waits for the lock");
+
+    db.execute_batch("ROLLBACK").unwrap();
+    drop(held);
+    assert!(pusher.join().unwrap().status.success());
+    let c = clone(&s, "after", false);
+    assert_eq!(count(&c, "HEAD"), 2);
+}
+
+#[test]
+fn a_stale_ref_in_a_concurrent_multi_ref_push_is_rejected_alone() {
+    let s = Server::start();
+    let x = s.path("x");
+    init(&x);
+    git(&x, &["remote", "add", "origin", &s.url]);
+    commit(&x, "f", "base");
+    git(
+        &x,
+        &[
+            "push", "-q", "origin", "main", "main:a", "main:b", "main:c", "main:d",
+        ],
+    );
+    let base = git(&x, &["rev-parse", "HEAD"]);
+    let y = clone(&s, "y", false);
+    let others: Vec<PathBuf> = (0..6).map(|i| clone(&s, &format!("o{i}"), false)).collect();
+
+    // Hold a multi-ref push in pre-receive (after it read the refs) while `b` moves
+    // under it and other clients push their own branches.
+    let sync = s.path("sync");
+    std::fs::create_dir_all(&sync).unwrap();
+    write_hook(
+        &s.dir.path().join("data/hooks/pre-receive"),
+        &format!(
+            "#!/bin/sh\nin=$(cat)\nif echo \"$in\" | grep -q ' refs/heads/[ac]$'; then n=$(ls {0} | wc -l); \
+             touch {0}/started-$n; while [ ! -f {0}/go-$n ]; do sleep 0.05; done; fi\nexit 0\n",
+            sync.display()
+        ),
+    );
+    git(&x, &["checkout", "-q", "-b", "work"]);
+    commit(&x, "g", "x");
+    let x_tip = git(&x, &["rev-parse", "HEAD"]);
+    let held = |args: &'static [&'static str], n: usize| {
+        let x = x.clone();
+        let push = std::thread::spawn(move || git_cmd(&x, args));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !sync.join(format!("started-{n}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "push {args:?} never reached its hook"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        push
+    };
+    let multi = held(&["push", "--porcelain", "origin", "work:a", "work:b"], 0);
+    git(&y, &["checkout", "-q", "-b", "yb", "origin/b"]);
+    commit(&y, "h", "y");
+    git(&y, &["push", "-q", "origin", "yb:b"]);
+    std::thread::scope(|scope| {
+        for (i, o) in others.iter().enumerate() {
+            scope.spawn(move || {
+                commit(o, "o", &format!("{i}"));
+                git(
+                    o,
+                    &["push", "-q", "origin", &format!("HEAD:refs/heads/o{i}")],
+                );
+            });
+        }
+        std::fs::write(sync.join("go-0"), "").unwrap();
+    });
+    let out = multi.join().unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{report}");
+    let remote = |r: &str| {
+        git(&x, &["ls-remote", &s.url, &format!("refs/heads/{r}")])
+            .split('\t')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(remote("a"), x_tip, "a landed: {report}");
+    assert_eq!(
+        remote("b"),
+        git(&y, &["rev-parse", "HEAD"]),
+        "b kept y's push"
+    );
+    for i in 0..6 {
+        assert_ne!(remote(&format!("o{i}")), "", "o{i} landed");
+    }
+
+    // Atomic: the same race rejects both refs. (`b` is forced: it no longer
+    // fast-forwards, but the old value the client sends is still checked.)
+    let atomic = held(&["push", "--atomic", "origin", "work:c", "+work:b"], 2);
+    commit(&y, "h", "y2");
+    git(&y, &["push", "-q", "origin", "yb:b"]);
+    std::fs::write(sync.join("go-2"), "").unwrap();
+    assert!(!atomic.join().unwrap().status.success());
+    assert_eq!(remote("c"), base);
+    assert_eq!(remote("b"), git(&y, &["rev-parse", "HEAD"]));
+
+    // Inside one transaction, each ref's compare-and-swap is its own savepoint.
+    let repo = s.repo();
+    let mut m = repo.meta.lock().unwrap();
+    let (c, d) = (
+        m.current("refs/heads/c").unwrap().unwrap(),
+        m.current("refs/heads/d").unwrap().unwrap(),
+    );
+    let delete = |refname, expect| pando::meta::RefUpdate {
+        refname,
+        expect: Some(expect),
+        new: None,
+    };
+    let (ok_c, stale_d) = (
+        delete("refs/heads/c", c.id),
+        delete("refs/heads/d", d.id + 1000),
+    );
+    let results = m.push(None, &[vec![&ok_c], vec![&stale_d]]).unwrap();
+    assert!(results[0].is_ok() && results[1].is_err(), "{results:?}");
+    let (ok_d, stale_c) = (delete("refs/heads/d", d.id), delete("refs/heads/c", c.id));
+    let results = m.push(None, &[vec![&ok_d, &stale_c]]).unwrap();
+    assert!(results[0].is_err(), "an atomic group fails whole");
+    assert!(m.current("refs/heads/c").unwrap().is_none());
+    assert!(m.current("refs/heads/d").unwrap().is_some());
+}
+
+#[test]
+fn a_pack_deleted_between_publishing_and_committing_is_published_again() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "1");
+    git(&a, &["push", "-q", "origin", "main"]);
+    let repo = s.repo();
+    let before: Vec<Oid> = repo
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect();
+
+    // Hold the lock so the push stops right after publishing its pack, then delete
+    // the pack the way gc does (under the lock): the worst moment for gc to run.
+    let held = repo.meta.lock().unwrap();
+    git(&a, &["checkout", "-qb", "b"]);
+    commit(&a, "g", "branch");
+    let a2 = a.clone();
+    let pusher = std::thread::spawn(move || git_cmd(&a2, &["push", "-q", "origin", "b"]));
+    let pack = loop {
+        let new = repo
+            .store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(h, _)| h)
+            .find(|h| !before.contains(h) && repo.store.has(h));
+        if let Some(p) = new {
+            break p;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    repo.store.delete(&pack).unwrap();
+    assert!(!repo.store.has(&pack));
+    drop(held);
+
+    assert!(pusher.join().unwrap().status.success());
+    assert!(repo.store.has(&pack), "published again from staging");
+    assert!(
+        pando::backup::verify(&s.dir.path().join("data"), true)
+            .unwrap()
+            .is_empty()
+    );
+    let c = clone(&s, "c", false);
+    git(&c, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&c, "origin/b"), 2);
+}
+
+#[test]
+fn clones_get_the_largest_packs_by_uri_and_the_rest_inline() {
+    let s = Server::start();
+    let a = s.path("a");
+    init(&a);
+    git(&a, &["remote", "add", "origin", &s.url]);
+    commit(&a, "f", "base");
+    git(&a, &["push", "-q", "origin", "main"]);
+    // A side branch pushed 12 times: a chain of 12 packs. Each push carries two
+    // versions of a large file, so its pack holds a delta against its own objects.
+    git(&a, &["checkout", "-qb", "side"]);
+    for i in 0..12u32 {
+        let mut big = noise(i, 20_000 + 1000 * i as usize);
+        std::fs::write(a.join("big"), &big).unwrap();
+        git(&a, &["add", "big"]);
+        git(&a, &["commit", "-qm", "one"]);
+        big.extend_from_slice(b"more");
+        std::fs::write(a.join("big"), &big).unwrap();
+        git(&a, &["commit", "-qam", "two"]);
+        git(&a, &["push", "-q", "origin", "side"]);
+    }
+    let repo = s.repo();
+    let side = repo
+        .read()
+        .unwrap()
+        .current("refs/heads/side")
+        .unwrap()
+        .unwrap();
+    let plan = planner::plan(&repo.read().unwrap(), &[side.tip], &[]).unwrap();
+    assert_eq!(plan.packs.len(), 13);
+
+    let c = clone(&s, "c", true);
+    git(&c, &["fsck", "--strict", "--no-progress"]);
+    assert_eq!(count(&c, "origin/side"), 25);
+    let names = downloaded_pack_names(&c);
+    let by_uri: Vec<Oid> = plan
+        .packs
+        .iter()
+        .filter(|p| names.contains(&p.hex()))
+        .copied()
+        .collect();
+    assert_eq!(by_uri.len(), 8, "{names:?}");
+    let smallest_by_uri = by_uri
+        .iter()
+        .map(|p| repo.store.pack_size(p).unwrap())
+        .min();
+    for p in plan.packs.iter().filter(|p| !by_uri.contains(p)) {
+        assert!(Some(repo.store.pack_size(p).unwrap()) <= smallest_by_uri);
+    }
+    // One more pack: the inline one, holding the other five packs' objects.
+    assert_eq!(names.len(), 9, "{names:?}");
+    let in_uri_packs: usize = by_uri
+        .iter()
+        .map(|p| repo.store.read_idx(p).unwrap().len())
+        .sum();
+    let all = git(&c, &["rev-list", "--objects", "--all"]).lines().count();
+    assert!(all > in_uri_packs, "inline pack is not empty");
+    let deltas = git(
+        &c,
+        &[
+            "verify-pack",
+            "-v",
+            &format!(
+                ".git/objects/pack/pack-{}.idx",
+                names
+                    .iter()
+                    .find(|n| !by_uri.iter().any(|p| &p.hex() == *n))
+                    .unwrap()
+            ),
+        ],
+    );
+    assert!(
+        deltas.contains(" 1 "),
+        "inline pack holds deltas:\n{deltas}"
+    );
 }

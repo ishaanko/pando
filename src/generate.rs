@@ -210,7 +210,7 @@ impl Answer {
     pub fn prepare(cache: &FetchCache, repo: &Repo, args: &FetchArgs) -> anyhow::Result<Answer> {
         let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
         let (not_tips, cacheable) = {
-            let meta = repo.meta.lock().unwrap();
+            let meta = repo.read()?;
             let not_tips = resolve_not(&meta, args)?;
             // Fresh clones of commits and tags. Not partial clones' on-demand fetches,
             // which want blobs and trees.
@@ -296,7 +296,7 @@ fn cache_key(args: &FetchArgs, filter: Option<&Filter>, not_tips: &[Oid]) -> Oid
 
 /// The commits `deepen-not` names stand for, resolved the way git resolves short
 /// names. They depend on the current refs, so they are resolved for every request.
-fn resolve_not(meta: &crate::meta::Meta, args: &FetchArgs) -> anyhow::Result<Vec<Oid>> {
+fn resolve_not(meta: &crate::meta::View, args: &FetchArgs) -> anyhow::Result<Vec<Oid>> {
     let mut not_tips = Vec::new();
     for name in args.deepen.iter().flat_map(|d| &d.not) {
         let candidates = [
@@ -338,7 +338,7 @@ impl Generated {
         filter: Option<Filter>,
         not_tips: &[Oid],
     ) -> anyhow::Result<Generated> {
-        let odb = open_odb(repo, &repo.meta.lock().unwrap(), args, not_tips)?;
+        let odb = open_odb(repo, &*repo.read()?, args, not_tips)?;
         let walk = Walk::new(&odb, args, not_tips)?;
         tracing::info!(
             repo = %repo.name,
@@ -373,7 +373,7 @@ impl Generated {
 /// partial clone filling in what it left out) reads just the packs holding them.
 fn open_odb(
     repo: &Repo,
-    meta: &crate::meta::Meta,
+    meta: &crate::meta::View,
     args: &FetchArgs,
     not_tips: &[Oid],
 ) -> anyhow::Result<Odb> {
