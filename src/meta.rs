@@ -15,6 +15,11 @@
 //!
 //! A version is complete given its pack plus its dependencies, transitively.
 //!
+//! Compaction (see `compact.rs`) merges trunk versions into covers. A merged chain
+//! version keeps its row (its tip, position and dependencies still map haves and
+//! wants to trunk positions) but is flagged `merged`: the cover holding its position
+//! now holds its objects, and its own pack may be gone.
+//!
 //! Epochs. Trunk versions form one chain (stored under the internal ref [`CHAIN`],
 //! whichever branch is trunk). Rewriting trunk (a force push, or making another branch
 //! the default) starts a new epoch at the next sequence number. Within the current
@@ -26,6 +31,7 @@
 //! small transactions, so it maps onto any horizontally scalable KV store.
 
 use crate::object::Oid;
+use crate::planner::{MAX_LEVEL, span};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
 
@@ -74,6 +80,9 @@ pub struct Version {
     pub pack_complete: bool,
     /// For annotated tags, the non-tag object the tag chain ends at.
     pub peeled: Option<Oid>,
+    /// A chain version whose pack was merged into a compaction cover: the cover
+    /// holding `seq` serves its objects, and `pack` names a pack that may be gone.
+    pub merged: bool,
 }
 
 /// Where a commit was stored.
@@ -95,12 +104,17 @@ pub struct ObjectRow {
     pub trunk_seq: Option<u64>,
 }
 
-/// A compaction cover over trunk versions.
-#[derive(Clone, Debug)]
-pub struct Cover {
+/// The stored unit holding trunk positions `start..=end`: one version that is not
+/// merged (`level` 0), or a compaction cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Piece {
+    pub level: u32,
+    pub start: u64,
+    pub end: u64,
+    /// `None` when none of the versions carried objects.
     pub pack: Option<Oid>,
-    /// Union of the covered versions' non-trunk dependencies.
-    pub packs: Vec<Oid>,
+    /// Non-trunk packs the versions depend on.
+    pub side: Vec<Oid>,
 }
 
 /// A ref change to apply atomically.
@@ -137,8 +151,8 @@ pub struct Meta {
     pub epoch_start: u64,
 }
 
-const VERSION_COLS: &str =
-    "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.side_deps, v.pack_complete, v.peeled";
+const VERSION_COLS: &str = "v.id, v.ref, v.seq, v.tip, v.pack, v.trunk_dep, v.side_deps, v.pack_complete, \
+     v.peeled, v.merged";
 
 fn oid_col(row: &Row, i: usize) -> rusqlite::Result<Oid> {
     let s: String = row.get(i)?;
@@ -175,18 +189,37 @@ fn version_row(row: &Row) -> rusqlite::Result<Version> {
         },
         pack_complete: row.get(7)?,
         peeled: opt_oid_col(row, 8)?,
+        merged: row.get(9)?,
     })
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
+        |r| r.get(0),
+    )
 }
 
 /// Bring databases written by older versions up to date.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    let has_dead: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('packs') WHERE name = 'dead_since'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_dead {
+    if !has_column(conn, "packs", "dead_since")? {
         conn.execute("ALTER TABLE packs ADD COLUMN dead_since INTEGER", [])?;
+    }
+    // Schema 3 (merging compaction). Covers written before it overlap at every level
+    // and merged nothing: they stay as plain rows, which compaction adopts when their
+    // range is due and gc reclaims otherwise.
+    if !has_column(conn, "versions", "merged")? {
+        conn.execute(
+            "ALTER TABLE versions ADD COLUMN merged INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "covers", "pending")? {
+        conn.execute(
+            "ALTER TABLE covers ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     let schema: Option<String> = conn
         .query_row("SELECT value FROM settings WHERE key = 'schema'", [], |r| {
@@ -199,11 +232,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             "UPDATE versions SET ref = ?1 WHERE ref = (SELECT value FROM settings WHERE key = 'trunk')",
             [CHAIN],
         )?;
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('schema', '2')",
-            [],
-        )?;
     }
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema', '3')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -228,9 +261,11 @@ impl Meta {
                side_deps TEXT NOT NULL,
                pack_complete INTEGER NOT NULL,
                peeled TEXT,
+               merged INTEGER NOT NULL DEFAULT 0,
                UNIQUE (ref, seq)
              );
              CREATE INDEX IF NOT EXISTS versions_by_tip ON versions (tip);
+             CREATE INDEX IF NOT EXISTS versions_by_pack ON versions (pack);
              CREATE TABLE IF NOT EXISTS refs (
                name TEXT PRIMARY KEY,
                version INTEGER NOT NULL REFERENCES versions (id)
@@ -260,6 +295,7 @@ impl Meta {
                start INTEGER NOT NULL,
                pack TEXT,
                side_deps TEXT NOT NULL,
+               pending INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (level, start)
              );",
         )?;
@@ -645,6 +681,7 @@ impl Meta {
                 deps: new.deps.clone(),
                 pack_complete: new.pack_complete,
                 peeled: new.peeled,
+                merged: false,
             }));
         }
         tx.commit()?;
@@ -728,49 +765,178 @@ impl Meta {
         Ok(Ok(()))
     }
 
-    pub fn cover(&self, level: u32, start: u64) -> rusqlite::Result<Option<Cover>> {
+    /// The highest earlier-epoch position anything still depends on, as last stored
+    /// for the current epoch (see [`Meta::set_old_needed`]).
+    pub fn old_needed(&self) -> rusqlite::Result<Option<u64>> {
+        Ok(self.setting("old_needed")?.and_then(|s| {
+            let (epoch, old) = s.split_once(' ')?;
+            (epoch.parse() == Ok(self.epoch_start))
+                .then(|| old.parse().ok())
+                .flatten()
+        }))
+    }
+
+    /// Store what gc found: earlier-epoch positions `1..=old` are needed.
+    pub fn set_old_needed(&mut self, old: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('old_needed', ?1)",
+            [format!("{} {old}", self.epoch_start)],
+        )?;
+        Ok(())
+    }
+
+    /// The first chain position after `seq` that still has a version row.
+    pub fn next_trunk_seq(&self, seq: u64) -> rusqlite::Result<Option<u64>> {
         self.conn
-            .prepare_cached("SELECT pack, side_deps FROM covers WHERE level = ?1 AND start = ?2")?
-            .query_row(params![level, start], |r| {
-                Ok(Cover {
-                    pack: opt_oid_col(r, 0)?,
-                    packs: oids_col(r, 1)?,
+            .prepare_cached("SELECT MIN(seq) FROM versions WHERE ref = ?1 AND seq > ?2")?
+            .query_row(params![CHAIN, seq], |r| r.get(0))
+    }
+
+    /// The highest trunk dependency below `below` among chain versions `from..=to`.
+    pub fn trunk_dep_below(&self, from: u64, to: u64, below: u64) -> rusqlite::Result<u64> {
+        self.conn
+            .prepare_cached(
+                "SELECT COALESCE(MAX(trunk_dep), 0) FROM versions
+                 WHERE ref = ?1 AND seq BETWEEN ?2 AND ?3 AND trunk_dep < ?4",
+            )?
+            .query_row(params![CHAIN, from, to, below], |r| r.get(0))
+    }
+
+    /// The finished cover holding a merged position: the lowest-level one containing
+    /// it (compaction deletes covers below a cover it records, so this is the piece).
+    pub fn cover_containing(&self, seq: u64) -> rusqlite::Result<Option<Piece>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT pack, side_deps FROM covers WHERE level = ?1 AND start = ?2 AND NOT pending",
+        )?;
+        for level in 1..=MAX_LEVEL {
+            let s = span(level);
+            let start = (seq - 1) / s * s + 1;
+            let found = stmt
+                .query_row(params![level, start], |r| {
+                    Ok((opt_oid_col(r, 0)?, oids_col(r, 1)?))
                 })
+                .optional()?;
+            if let Some((pack, side)) = found {
+                return Ok(Some(Piece {
+                    level,
+                    start,
+                    end: start + s - 1,
+                    pack,
+                    side,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The cover row at `(level, start)`, if any: its pack and whether it is pending.
+    pub fn cover_row(
+        &self,
+        level: u32,
+        start: u64,
+    ) -> rusqlite::Result<Option<(Option<Oid>, bool)>> {
+        self.conn
+            .prepare_cached("SELECT pack, pending FROM covers WHERE level = ?1 AND start = ?2")?
+            .query_row(params![level, start], |r| {
+                Ok((opt_oid_col(r, 0)?, r.get(1)?))
             })
             .optional()
     }
 
-    pub fn last_cover_start(&self, level: u32) -> rusqlite::Result<Option<u64>> {
-        self.conn.query_row(
-            "SELECT MAX(start) FROM covers WHERE level = ?1",
-            [level],
-            |r| r.get(0),
-        )
+    /// Covers recorded but not finished (see [`Meta::record_cover`]).
+    pub fn pending_covers(&self) -> rusqlite::Result<Vec<Piece>> {
+        self.conn
+            .prepare(
+                "SELECT level, start, pack, side_deps FROM covers WHERE pending ORDER BY level",
+            )?
+            .query_map([], |r| {
+                let (level, start): (u32, u64) = (r.get(0)?, r.get(1)?);
+                Ok(Piece {
+                    level,
+                    start,
+                    end: start + span(level) - 1,
+                    pack: opt_oid_col(r, 2)?,
+                    side: oids_col(r, 3)?,
+                })
+            })?
+            .collect()
     }
 
-    /// Record a cover and, if it produced a new pack, that pack's dependencies.
-    pub fn put_cover(
-        &mut self,
-        level: u32,
-        start: u64,
-        cover: &Cover,
-        trunk_dep: u64,
-    ) -> rusqlite::Result<()> {
+    /// First step of recording a cover: store it as pending, with its pack's
+    /// dependencies. A pending cover changes nothing the planner sees, and gc keeps
+    /// its pack, so index rows can move to it before [`Meta::finish_cover`].
+    pub fn record_cover(&mut self, piece: &Piece, trunk_dep: u64) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
-        if let Some(pack) = cover.pack {
+        let side = join_oids(&piece.side);
+        if let Some(pack) = piece.pack {
+            // The pack may exist already (a single-part cover reuses its part, or a
+            // cover rebuilt after gc marked it). Either set of dependencies is enough;
+            // keep the smaller trunk range.
             tx.execute(
-                "INSERT OR IGNORE INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)",
-                params![pack.hex(), trunk_dep, join_oids(&cover.packs)],
+                "INSERT INTO packs (hash, trunk_dep, side_deps) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (hash) DO UPDATE
+                 SET dead_since = NULL, trunk_dep = MIN(trunk_dep, excluded.trunk_dep)",
+                params![pack.hex(), trunk_dep, side],
             )?;
         }
         tx.execute(
-            "INSERT OR IGNORE INTO covers (level, start, pack, side_deps) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                level,
-                start,
-                cover.pack.map(|p| p.hex()),
-                join_oids(&cover.packs)
-            ],
+            "INSERT INTO covers (level, start, pack, side_deps, pending) VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT (level, start) DO UPDATE
+             SET pack = excluded.pack, side_deps = excluded.side_deps, pending = 1",
+            params![piece.level, piece.start, piece.pack.map(|p| p.hex()), side],
+        )?;
+        tx.commit()
+    }
+
+    /// Move up to `limit` index rows of trunk objects and commits homed in `from` to
+    /// `to`, which holds the same objects. Returns the most rows moved in either table. Rows of
+    /// objects off trunk stay: `from` is still their smallest home, and whatever
+    /// depends on them names it (see `compact.rs`).
+    pub fn repoint(&mut self, from: &Oid, to: &Oid, limit: usize) -> rusqlite::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut moved = 0;
+        for table in ["objects", "commits"] {
+            moved = moved.max(tx.execute(
+                &format!(
+                    "UPDATE {table} SET pack = ?2 WHERE rowid IN
+                     (SELECT rowid FROM {table} WHERE pack = ?1 AND trunk_seq IS NOT NULL LIMIT ?3)"
+                ),
+                params![from.hex(), to.hex(), limit],
+            )?);
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Second step: the pending cover becomes the piece for its range. Its members
+    /// (`members`: the packs of the pieces it replaces) stop being pieces in the same
+    /// transaction: covers below it are deleted, versions in it are marked merged, and
+    /// any trunk index row still homed in a member moves to the cover.
+    pub fn finish_cover(&mut self, piece: &Piece, members: &[Oid]) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        if let Some(pack) = piece.pack {
+            for m in members.iter().filter(|m| **m != pack) {
+                for table in ["objects", "commits"] {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET pack = ?2 WHERE pack = ?1 AND trunk_seq IS NOT NULL"
+                        ),
+                        params![m.hex(), pack.hex()],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE versions SET merged = 1 WHERE ref = ?1 AND seq BETWEEN ?2 AND ?3",
+            params![CHAIN, piece.start, piece.end],
+        )?;
+        tx.execute(
+            "DELETE FROM covers WHERE level < ?1 AND start BETWEEN ?2 AND ?3",
+            params![piece.level, piece.start, piece.end],
+        )?;
+        tx.execute(
+            "UPDATE covers SET pending = 0 WHERE level = ?1 AND start = ?2",
+            params![piece.level, piece.start],
         )?;
         tx.commit()
     }

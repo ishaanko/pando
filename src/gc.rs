@@ -1,20 +1,26 @@
 //! Garbage collection: delete packs that nothing can reach anymore (deleted branches,
-//! history dropped by a force push, rejected pushes).
+//! history dropped by a force push, rejected pushes, and pieces compaction replaced).
 //!
-//! Live data starts at the refs: each current version's pack and dependencies, every
-//! chain version of the current trunk epoch, and earlier-epoch chain versions up to the
-//! highest position anything live still depends on. Pack dependencies are followed
-//! transitively, and covers are live when they lie entirely inside a live trunk range.
+//! Live data starts at the refs: each current version's pack and dependencies, the
+//! current trunk epoch, and earlier-epoch trunk positions up to the highest one
+//! anything live still depends on (`old_max`). Trunk ranges are live as the pieces
+//! the planner serves them with (`planner::pieces`), so a cover that holds even one
+//! live position is live: once compaction has merged a version, its cover holds the
+//! only copy. A merged version's own pack is live only if something names it as a
+//! dependency. Pending covers (being recorded by compaction) are live. Pack
+//! dependencies are followed transitively, and may raise `old_max`.
 //!
 //! A pack found dead is deleted only once it has stayed dead for `grace`, because
 //! fetches in flight and signed pack URLs may still use it. Until then it stays fully
 //! indexed, so a push that references it simply makes it live again. When it goes,
 //! index rows that pointed into it move to another live pack holding the same object,
-//! or are dropped along with versions that can no longer be served.
+//! or are dropped along with versions that can no longer be served. Compaction moves
+//! trunk rows off the packs it replaces before they can die, so that search is only
+//! needed for history that really became unreachable.
 
 use crate::meta::{CHAIN, Meta};
 use crate::object::Oid;
-use crate::planner::span;
+use crate::planner;
 use crate::server::Repo;
 use crate::store::BlobStore;
 use rusqlite::{OptionalExtension, params};
@@ -39,6 +45,8 @@ pub fn run(repo: &Repo, grace: Duration) -> anyhow::Result<Report> {
         let mut meta = repo.meta.lock().unwrap();
         let live = Live::compute(&meta)?;
         report.live = live.packs.len();
+        // Compaction merges earlier epochs up to here.
+        meta.set_old_needed(live.old_max)?;
 
         let mut packs: Vec<(Oid, Option<i64>)> = Vec::new();
         {
@@ -126,11 +134,11 @@ fn orphan_age(grace: Duration) -> Duration {
 /// What is reachable from the refs.
 struct Live {
     packs: HashSet<Oid>,
-    /// Chain versions `1..=old_max` of earlier epochs are live.
+    /// Chain positions `1..=old_max` of earlier epochs are live.
     old_max: u64,
     epoch: u64,
-    head: u64,
-    /// Live covers, by (level, start).
+    /// Live cover rows (pieces of live trunk ranges, and pending covers), by (level,
+    /// start).
     covers: HashSet<(u32, u64)>,
 }
 
@@ -142,7 +150,6 @@ impl Live {
             packs: HashSet::new(),
             old_max: 0,
             epoch,
-            head,
             covers: HashSet::new(),
         };
         let mut work: Vec<Oid> = Vec::new();
@@ -158,12 +165,13 @@ impl Live {
                 need(&mut live, v.deps.trunk);
             }
         }
-        for seq in epoch..=head {
-            if let Some(v) = meta.trunk_version(seq)? {
-                work.extend(v.pack);
-                work.extend(v.deps.packs);
-                need(&mut live, v.deps.trunk);
-            }
+        // The current epoch, and what its first version needed from earlier ones.
+        live.add_pieces(meta, epoch - 1, head, &mut work)?;
+        need(&mut live, meta.trunk_dep_below(epoch, head, epoch)?);
+        for cover in meta.pending_covers()? {
+            live.covers.insert((cover.level, cover.start));
+            work.extend(cover.pack);
+            work.extend(cover.side);
         }
         let mut old_done = 0;
         loop {
@@ -178,49 +186,44 @@ impl Live {
             if live.old_max <= old_done {
                 break;
             }
-            for seq in old_done + 1..=live.old_max {
-                if let Some(v) = meta.trunk_version(seq)? {
-                    work.extend(v.pack);
-                    work.extend(v.deps.packs);
-                    need(&mut live, v.deps.trunk);
-                }
-            }
+            // Earlier epochs: every chain position up to the needed one, as served.
+            live.add_pieces(meta, old_done, live.old_max, &mut work)?;
             old_done = live.old_max;
-        }
-        // Covers inside live ranges. Their own packs need nothing beyond the
-        // versions they cover, which are live already.
-        let covers: Vec<(u32, u64, Option<String>, String)> = {
-            let mut stmt = meta
-                .conn
-                .prepare("SELECT level, start, pack, side_deps FROM covers")?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for (level, start, pack, side) in covers {
-            let end = start + span(level) - 1;
-            if live.trunk_range_live(start, end) {
-                live.covers.insert((level, start));
-                live.packs.extend(pack.as_deref().and_then(Oid::from_hex));
-                work.extend(side.split_whitespace().filter_map(Oid::from_hex));
-            }
-        }
-        while let Some(p) = work.pop() {
-            if live.packs.insert(p)
-                && let Some(deps) = meta.pack_deps(&p)?
-            {
-                work.extend(deps.packs);
-            }
         }
         Ok(live)
     }
 
-    fn trunk_range_live(&self, start: u64, end: u64) -> bool {
-        end <= self.old_max || (start >= self.epoch && end <= self.head)
+    /// Mark the pieces holding positions `(have, want]` live.
+    fn add_pieces(
+        &mut self,
+        meta: &Meta,
+        have: u64,
+        want: u64,
+        work: &mut Vec<Oid>,
+    ) -> anyhow::Result<()> {
+        for piece in planner::pieces(meta, have, want)? {
+            if piece.level > 0 {
+                self.covers.insert((piece.level, piece.start));
+            }
+            work.extend(piece.pack);
+            work.extend(piece.side);
+        }
+        Ok(())
     }
 
     fn trunk_position_live(&self, seq: u64) -> bool {
         seq == 0 || seq <= self.old_max || seq >= self.epoch
     }
+}
+
+/// The highest earlier-epoch trunk position anything still depends on.
+pub fn old_needed(meta: &Meta) -> anyhow::Result<u64> {
+    Ok(Live::compute(meta)?.old_max)
+}
+
+/// Packs the refs need, the way gc sees them. `pando verify` checks these are stored.
+pub fn needed_packs(meta: &Meta) -> anyhow::Result<HashSet<Oid>> {
+    Ok(Live::compute(meta)?.packs)
 }
 
 /// Drop `doomed` packs from the metadata, re-homing objects that live packs also hold.
@@ -324,31 +327,26 @@ fn forget(meta: &mut Meta, store: &BlobStore, live: &Live, doomed: &[Oid]) -> an
         .prepare("SELECT version FROM refs")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let rows: Vec<(i64, String, u64, Option<String>, u64, String)> = tx
-        .prepare("SELECT id, ref, seq, pack, trunk_dep, side_deps FROM versions")?
+    let gone = |h: &str| Oid::from_hex(h).is_some_and(|o| dead.contains(&o));
+    let unservable: Vec<i64> = tx
+        .prepare("SELECT id, ref, seq, pack, trunk_dep, side_deps, merged FROM versions")?
         .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
+            let (id, vref, seq): (i64, String, u64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            let (pack, trunk_dep, side): (Option<String>, u64, String) =
+                (r.get(3)?, r.get(4)?, r.get(5)?);
+            let merged: bool = r.get(6)?;
+            // A merged version is served by its cover, which is live with its position.
+            let servable = (merged
+                || !pack.as_deref().is_some_and(gone) && !side.split_whitespace().any(gone))
+                && live.trunk_position_live(trunk_dep)
+                && (vref != CHAIN || live.trunk_position_live(seq));
+            Ok((id, servable))
         })?
+        .filter(|row| !matches!(row, Ok((id, servable)) if *servable || current.contains(id)))
+        .map(|row| row.map(|(id, _)| id))
         .collect::<rusqlite::Result<_>>()?;
-    for (id, vref, seq, pack, trunk_dep, side) in rows {
-        if current.contains(&id) {
-            continue;
-        }
-        let gone = |h: &str| Oid::from_hex(h).is_some_and(|o| dead.contains(&o));
-        let servable = !pack.as_deref().is_some_and(gone)
-            && !side.split_whitespace().any(gone)
-            && live.trunk_position_live(trunk_dep)
-            && (vref != CHAIN || live.trunk_position_live(seq));
-        if !servable {
-            tx.execute("DELETE FROM versions WHERE id = ?1", [id])?;
-        }
+    for id in unservable {
+        tx.execute("DELETE FROM versions WHERE id = ?1", [id])?;
     }
     let covers: Vec<(u32, u64)> = tx
         .prepare("SELECT level, start FROM covers")?
