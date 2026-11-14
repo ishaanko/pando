@@ -844,13 +844,13 @@ pub fn concat<W: Write>(
                     let j = idx
                         .binary_search_by_key(&base_off, |e| e.offset)
                         .map_err(|_| io::Error::other("dangling ofs-delta"))?;
-                    // Written from this pack, or else from an earlier one.
+                    // A dropped base was written as its first copy: earlier in this
+                    // pack, or in an earlier one.
                     let base_new = match offsets[j] {
                         u64::MAX => {
                             let (bp, bi) = first[&idx[j].oid];
-                            new_offsets
-                                .get(bp as usize)
-                                .map_or(u64::MAX, |o| o[bi as usize])
+                            let from = new_offsets.get(bp as usize).unwrap_or(&offsets);
+                            from[bi as usize]
                         }
                         o => o,
                     };
@@ -922,6 +922,37 @@ mod tests {
         encode_type_size(REF_DELTA, 5, &mut obj);
         obj.extend_from_slice(&[1, 2, 3, 4, 5]);
         assert!(parse(Format::Sha1, &wrap(1, &obj)).is_err());
+    }
+
+    /// A delta may sit on the second copy of an object its own pack holds twice.
+    #[test]
+    fn concat_follows_a_delta_to_the_kept_copy_of_its_base() {
+        let deflate = |data: &[u8]| {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), Default::default());
+            z.write_all(data).unwrap();
+            z.finish().unwrap()
+        };
+        let mut objects = Vec::new();
+        for _ in 0..2 {
+            encode_type_size(3, 6, &mut objects);
+            objects.extend_from_slice(&deflate(b"hello\n"));
+        }
+        let second = 12 + objects.len() as u64 / 2;
+        let delta_at = 12 + objects.len() as u64;
+        // Copy the base's 6 bytes, then insert "!".
+        let delta = [6, 7, 0x90, 6, 1, b'!'];
+        encode_type_size(OFS_DELTA, delta.len() as u64, &mut objects);
+        encode_ofs(delta_at - second, &mut objects);
+        objects.extend_from_slice(&deflate(&delta));
+
+        let pack = wrap(3, &objects);
+        let parsed = parse(Format::Sha1, &pack).unwrap();
+        assert_eq!(parsed.entries[0].oid, parsed.entries[1].oid);
+        let (_, entries, out) =
+            concat(Format::Sha1, &[(&pack, &parsed.entries)], Vec::new()).unwrap();
+        assert_eq!(entries.len(), 2);
+        let spliced = parse(Format::Sha1, &out).unwrap();
+        assert_eq!(spliced.entries[1].oid, parsed.entries[2].oid);
     }
 
     #[test]
