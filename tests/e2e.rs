@@ -137,6 +137,10 @@ impl Server {
     }
 }
 
+/// Keeps the client from repacking in the background after a fetch or commit.
+/// A detached repack races the `git fsck` and pack listings the tests run next.
+const QUIET_CLIENT: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
 fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args([
@@ -149,6 +153,7 @@ fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
             "-c",
             "protocol.version=2",
         ])
+        .args(QUIET_CLIENT)
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1629,6 +1634,7 @@ fn ssh_key(dir: &Path, name: &str) -> (String, String) {
 fn git_ssh(dir: &Path, ssh: &str, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(QUIET_CLIENT)
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
